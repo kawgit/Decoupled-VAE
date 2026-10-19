@@ -8,7 +8,7 @@ import argparse
 
 import torch
 
-from dvae.common import add_common_args, add_train_args, fit, get_device, save_checkpoint
+from dvae.common import add_common_args, add_train_args, fit, get_device, parse_train_args
 from dvae.data import batches, load_mnist, to_float
 from dvae.models import Encoder
 from dvae.objective import encoder_objective, k_weights
@@ -28,8 +28,7 @@ def main():
     p.add_argument("--n-img-layers", type=int, default=2)
     p.add_argument("--n-tok-layers", type=int, default=2)
     p.add_argument("--n-heads", type=int, default=4)
-    p.add_argument("--max-steps-per-epoch", type=int, default=None, help="for smoke tests")
-    args = p.parse_args()
+    args = parse_train_args(p)
     args.batch_size = args.batch_size or args.num_refs  # B anchors, taken from the D-image pool
     assert args.batch_size <= args.num_refs, "anchors are a subset of the pool, so --batch-size <= --num-refs"
 
@@ -46,11 +45,11 @@ def main():
         x = to_float(images)
         return encoder_objective(model.prefix_logprobs(x), x.flatten(1), n_anchors, weights)
 
-    def train_epoch(epoch):
-        for i, idx in enumerate(batches(len(train), args.num_refs, True, device, gen)):
-            if args.max_steps_per_epoch and i >= args.max_steps_per_epoch:
-                break
-            yield step(train[idx], args.batch_size)[0]
+    def epoch_batches(epoch):
+        return batches(len(train), args.num_refs, True, device, gen)
+
+    def step_loss(idx):
+        return step(train[idx], args.batch_size)[0]
 
     def evaluate():
         # Fixed pools of D val images, every image an anchor, so numbers are comparable across epochs/runs.
@@ -64,11 +63,7 @@ def main():
         totals = (totals / n).tolist()
         return {"loss": totals[0], "k0": totals[1], "per_k": totals[2:]}
 
-    def save(metrics, history):
-        save_checkpoint(args.out, "encoder", model, args=vars(args), metrics=metrics, history=history)
-
-    fit(model, args, train_epoch, evaluate, save)
-    print(f"saved best encoder to {args.out}")
+    fit(model, "encoder", args, epoch_batches, step_loss, evaluate, gen)
 
 
 if __name__ == "__main__":

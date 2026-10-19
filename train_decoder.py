@@ -9,7 +9,7 @@ import math
 
 import torch
 
-from dvae.common import add_common_args, add_mode_args, add_train_args, fit, get_device, load_checkpoint, save_checkpoint
+from dvae.common import add_common_args, add_mode_args, add_train_args, fit, get_device, load_checkpoint, parse_train_args
 from dvae.data import NUM_PIXELS, batches, binary_target, gray_target, load_mnist, to_float
 from dvae.models import Decoder
 
@@ -25,8 +25,7 @@ def main():
     p.add_argument("--n-layers", type=int, default=2)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--channels", type=int, default=128)
-    p.add_argument("--max-steps-per-epoch", type=int, default=None, help="for smoke tests")
-    args = p.parse_args()
+    args = parse_train_args(p)
     args.out = args.out or f"checkpoints/decoder_{args.likelihood}.pt"
 
     torch.manual_seed(args.seed)
@@ -51,23 +50,18 @@ def main():
 
     gen = torch.Generator().manual_seed(args.seed)
 
-    def train_epoch(epoch):
-        for i, idx in enumerate(batches(len(train), args.batch_size, True, device, gen)):
-            if args.max_steps_per_epoch and i >= args.max_steps_per_epoch:
-                break
-            codes = encoder.sample(to_float(train[idx]), **mode)
-            yield -model.log_prob(model(codes), target(train[idx])).mean() / NUM_PIXELS
+    def epoch_batches(epoch):
+        return batches(len(train), args.batch_size, True, device, gen)
+
+    def step_loss(idx):
+        codes = encoder.sample(to_float(train[idx]), **mode)
+        return -model.log_prob(model(codes), target(train[idx])).mean() / NUM_PIXELS
 
     def evaluate():
         nll = sum(-model.log_prob(model(c), t).sum().item() for c, t in zip(val_codes, val_targets)) / len(val)
         return {"loss": nll / NUM_PIXELS, "nats_per_image": nll, "bits_per_dim": nll / (NUM_PIXELS * math.log(2))}
 
-    def save(metrics, history):
-        save_checkpoint(args.out, "decoder", model, encoder_path=args.encoder, args=vars(args), metrics=metrics,
-                        history=history)
-
-    fit(model, args, train_epoch, evaluate, save)
-    print(f"saved best decoder to {args.out}")
+    fit(model, "decoder", args, epoch_batches, step_loss, evaluate, gen, encoder_path=args.encoder)
 
 
 if __name__ == "__main__":

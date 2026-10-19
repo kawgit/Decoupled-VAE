@@ -48,7 +48,16 @@ python benchmark.py --decoder checkpoints/decoder_gray.pt checkpoints/decoder_bi
 ```
 
 - **Training:** every training script early-stops on its val loss (a fixed 5k split of the MNIST
-  train set) and keeps the best checkpoint.
+  train set) and keeps the best checkpoint at `--out`. Set the learning rate with `--lr`.
+- **Stopping and resuming:**
+  - Ctrl-C stops at the end of the current step and saves `*_latest.pt` next to `--out`. A second
+    Ctrl-C aborts without saving. `*_latest.pt` is also rewritten after every epoch.
+  - Both checkpoints hold the full training state: model, optimizer, scheduler, counters, RNG and
+    shuffle state, and the original args. A resumed run matches an uninterrupted one step for step,
+    even mid-epoch.
+  - To resume, pass the checkpoint alone: `python train_encoder.py --resume checkpoints/encoder_latest.pt`.
+  - Flags you add when resuming override the saved ones, e.g. `--epochs 50 --lr 1e-4`. Don't change
+    architecture flags.
 - **Token sampling:** `--encoder-mode` and `--prior-mode` pick how tokens are drawn:
   - `actual`: the model's own distribution;
   - `greedy`: the most likely token at each step;

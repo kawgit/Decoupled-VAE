@@ -5,7 +5,7 @@ import math
 
 import torch
 
-from dvae.common import add_common_args, add_mode_args, add_train_args, fit, get_device, load_checkpoint, save_checkpoint
+from dvae.common import add_common_args, add_mode_args, add_train_args, fit, get_device, load_checkpoint, parse_train_args
 from dvae.data import batches, load_mnist, to_float
 from dvae.models import Prior
 
@@ -19,8 +19,7 @@ def main():
     p.add_argument("--d-model", type=int, default=128)
     p.add_argument("--n-layers", type=int, default=3)
     p.add_argument("--n-heads", type=int, default=4)
-    p.add_argument("--max-steps-per-epoch", type=int, default=None, help="for smoke tests")
-    args = p.parse_args()
+    args = parse_train_args(p)
 
     torch.manual_seed(args.seed)
     device = get_device(args.device)
@@ -37,23 +36,18 @@ def main():
 
     gen = torch.Generator().manual_seed(args.seed)
 
-    def train_epoch(epoch):
-        for i, idx in enumerate(batches(len(train), args.batch_size, True, device, gen)):
-            if args.max_steps_per_epoch and i >= args.max_steps_per_epoch:
-                break
-            codes = encoder.sample(to_float(train[idx]), **mode)
-            yield -model.log_prob(codes).sum(1).mean()
+    def epoch_batches(epoch):
+        return batches(len(train), args.batch_size, True, device, gen)
+
+    def step_loss(idx):
+        codes = encoder.sample(to_float(train[idx]), **mode)
+        return -model.log_prob(codes).sum(1).mean()
 
     def evaluate():
         nll = -model.log_prob(val_codes).sum(1).mean().item()
         return {"loss": nll, "nats_per_code": nll, "bits_per_code": nll / math.log(2)}
 
-    def save(metrics, history):
-        save_checkpoint(args.out, "prior", model, encoder_path=args.encoder, args=vars(args), metrics=metrics,
-                        history=history)
-
-    fit(model, args, train_epoch, evaluate, save)
-    print(f"saved best prior to {args.out}")
+    fit(model, "prior", args, epoch_batches, step_loss, evaluate, gen, encoder_path=args.encoder)
 
 
 if __name__ == "__main__":
