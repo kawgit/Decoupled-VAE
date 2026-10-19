@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Decoupled-VAE outputs
+data/
+checkpoints/
+outputs/
+results/
