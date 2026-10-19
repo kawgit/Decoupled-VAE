@@ -41,7 +41,8 @@ def add_train_args(parser, out, batch_size, lr, epochs, patience):
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--epochs", type=int, default=epochs, help="max epochs")
     parser.add_argument("--patience", type=int, default=patience, help="early-stop after this many epochs without val improvement")
-    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--log-interval", type=float, default=0.5,
+                        help="print each step's loss, at most once per this many seconds (0.5 = 2 Hz)")
 
 
 def save_checkpoint(path, kind, model, **extra):
@@ -77,7 +78,7 @@ def fit(model, args, train_epoch, evaluate, save):
     best, bad_epochs, history, step = math.inf, 0, [], 0
     for epoch in range(1, args.epochs + 1):
         model.train()
-        t0, running = time.time(), []
+        t0, running, last_log = time.time(), [], -math.inf
         for loss in train_epoch(epoch):
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -86,9 +87,12 @@ def fit(model, args, train_epoch, evaluate, save):
             sched.step()
             step += 1
             running.append(loss.item())
-            if step % args.log_every == 0:
-                rate = len(running) / (time.time() - t0)
-                print(f"epoch {epoch} step {step} loss {sum(running[-args.log_every:]) / min(len(running), args.log_every):.5f} ({rate:.1f} it/s)", flush=True)
+            now = time.time()
+            if now - last_log >= args.log_interval:
+                last_log = now
+                rate = len(running) / (now - t0)
+                print(f"epoch {epoch} step {step} loss {running[-1]:.5f} (epoch avg {sum(running) / len(running):.5f}, "
+                      f"{rate:.1f} it/s)", flush=True)
         model.eval()
         with torch.no_grad():
             metrics = evaluate()
