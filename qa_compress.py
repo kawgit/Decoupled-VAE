@@ -12,6 +12,12 @@ from dvae.data import load_mnist, to_float
 from dvae.viz import code_str, save_grid
 
 
+def default_ks(k_max):
+    if k_max <= 10:
+        return list(range(1, k_max + 1))
+    return sorted({2**i for i in range(k_max.bit_length()) if 2**i < k_max} | {k_max})
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     add_common_args(p)
@@ -19,7 +25,8 @@ def main():
     p.add_argument("--prior", default="checkpoints/prior.pt")
     p.add_argument("--decoder", default="checkpoints/decoder_gray.pt")
     p.add_argument("-n", type=int, default=16, help="number of test images")
-    p.add_argument("-k", type=int, nargs="+", default=[1, 2, 4, 6, 8, 10], help="prefix lengths to keep")
+    p.add_argument("-k", type=int, nargs="+", default=None,
+                   help="prefix lengths to keep (default: every k up to k_max=10, else powers of 2 and k_max)")
     p.add_argument("-m", type=int, default=8, help="prior completions per image")
     add_mode_args(p, "encoder", default="greedy")
     add_mode_args(p, "prior")
@@ -35,14 +42,19 @@ def main():
     check_same_codes(encoder.config, prior.config, "encoder vs prior")
     check_same_codes(encoder.config, decoder.config, "encoder vs decoder")
     k_max = encoder.config["k_max"]
+    ks = args.k or default_ks(k_max)
+    if any(k < 0 or k > k_max for k in ks):
+        print(f"skipping k outside 0..{k_max}: {[k for k in ks if k < 0 or k > k_max]}")
+        ks = [k for k in ks if 0 <= k <= k_max]
+        if not ks:
+            raise SystemExit("no valid -k left")
 
     test = load_mnist("test", args.data_root, device)
     pick = torch.randperm(len(test), generator=torch.Generator().manual_seed(args.seed))[: args.n].to(device)
     x = to_float(test[pick])
     with torch.no_grad():
         codes = encoder.sample(x, mode=args.encoder_mode, top_p=args.encoder_top_p)
-        for k in args.k:
-            assert 0 <= k <= k_max, f"k must be in 0..{k_max}"
+        for k in ks:
             prefix = codes[:, :k].repeat_interleave(args.m, 0)
             full = prior.sample(len(prefix), prefix=prefix, mode=args.prior_mode, top_p=args.prior_top_p)
             recon = decoder.render(decoder(full), args.render).view(args.n, args.m, 1, 28, 28)

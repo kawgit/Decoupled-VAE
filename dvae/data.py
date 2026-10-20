@@ -8,7 +8,7 @@ NUM_VAL = 5000
 SPLIT_SEED = 0  # fixed so every stage sees the same train/val split
 
 
-def load_mnist(split, root="data", device="cpu"):
+def load_mnist(split, root="data", device: str | torch.device = "cpu"):
     """Return uint8 images [N, 28, 28] for split in {"train", "val", "test"}."""
     if split == "test":
         images = MNIST(root, train=False, download=True).data

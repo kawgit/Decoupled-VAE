@@ -20,6 +20,8 @@ def k_weights(k_max, dist="uniform", geom_ratio=0.7, custom=None):
     elif dist == "geometric":
         w = torch.tensor([geom_ratio**k for k in range(k_max)])
     elif dist == "custom":
+        if custom is None:
+            raise ValueError("--k-dist custom needs --k-weights")
         w = torch.tensor([float(v) for v in custom.split(",")])
         assert len(w) == k_max, f"--k-weights needs {k_max} values"
     else:

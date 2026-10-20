@@ -53,14 +53,11 @@ def main():
 
     def evaluate():
         # Fixed pools of D val images, every image an anchor, so numbers are comparable across epochs/runs.
-        totals = None
-        n = 0
+        rows = []
         for idx in batches(len(val), args.num_refs, False, device):
             loss, per_k, k0 = step(val[idx], args.num_refs)
-            vals = torch.cat([loss[None], k0[None], per_k])
-            totals = vals if totals is None else totals + vals
-            n += 1
-        totals = (totals / n).tolist()
+            rows.append(torch.cat([loss[None], k0[None], per_k]))
+        totals = torch.stack(rows).mean(0).tolist()
         return {"loss": totals[0], "k0": totals[1], "per_k": totals[2:]}
 
     fit(model, "encoder", args, epoch_batches, step_loss, evaluate, gen)

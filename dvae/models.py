@@ -5,6 +5,7 @@ prefix node j at depth t are nodes j*V .. j*V+V-1 at depth t+1.
 """
 
 import math
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -116,8 +117,12 @@ class TokenTransformer(nn.Module):
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size)
 
+    @property
+    def block_list(self) -> list[Block]:
+        return cast(list[Block], list(self.blocks))
+
     def memory_kvs(self, memory):
-        return [b.memory_kv(memory) if memory is not None else None for b in self.blocks]
+        return [b.memory_kv(memory) if memory is not None else None for b in self.block_list]
 
     def logits(self, prefix, memory_kvs):
         """Next-token logits after BOS and each token of prefix [N, T], T < k_max -> [N, T+1, V]."""
@@ -159,7 +164,7 @@ class TokenTransformer(nn.Module):
             width = self.V**t
             tok = torch.full((1,), self.bos, device=device) if t == 0 else torch.arange(width, device=device) % self.V
             x = (self.tok_emb(tok) + self.pos_emb[t]).expand(n, width, -1)
-            for block, cache, kv in zip(self.blocks, caches, kvs):
+            for block, cache, kv in zip(self.block_list, caches, kvs):
                 x, k, v = block.forward_tree(x, cache, kv)
                 cache.append((k, v))
             logp = apply_mode(self.head(self.ln_f(x)), mode, top_p)  # [n, width, V]

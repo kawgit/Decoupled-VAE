@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import time
+from typing import Any
 
 import torch
 
@@ -110,7 +111,7 @@ class _GracefulInterrupt:
 
 
 def _rng_states():
-    states = {"torch": torch.get_rng_state()}
+    states: dict[str, Any] = {"torch": torch.get_rng_state()}
     if torch.cuda.is_available():
         states["cuda"] = torch.cuda.get_rng_state_all()
     if torch.backends.mps.is_available():
@@ -140,7 +141,7 @@ def fit(model, kind, args, epoch_batches, step_loss, evaluate, gen, **extra):
     sched = torch.optim.lr_scheduler.LambdaLR(opt, warmup)
     # epoch / steps_in_epoch: where to pick up. gen_state: the shuffle generator at the start of that epoch.
     # epoch_losses: this epoch's step losses so far, so a mid-epoch resume still reports the full epoch average.
-    state = dict(epoch=1, steps_in_epoch=0, step=0, best=math.inf, bad_epochs=0, history=[], gen_state=gen.get_state(),
+    state: dict[str, Any] = dict(epoch=1, steps_in_epoch=0, step=0, best=math.inf, bad_epochs=0, history=[], gen_state=gen.get_state(),
                  epoch_losses=[])
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
