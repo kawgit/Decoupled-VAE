@@ -8,15 +8,24 @@ NUM_VAL = 5000
 SPLIT_SEED = 0  # fixed so every stage sees the same train/val split
 
 
+def _load(split, root):
+    dataset = MNIST(root, train=split != "test", download=True)
+    images, labels = dataset.data, dataset.targets
+    if split != "test":
+        perm = torch.randperm(len(images), generator=torch.Generator().manual_seed(SPLIT_SEED))
+        keep = perm[NUM_VAL:] if split == "train" else perm[:NUM_VAL]
+        images, labels = images[keep], labels[keep]
+    return images, labels
+
+
 def load_mnist(split, root="data", device: str | torch.device = "cpu"):
     """Return uint8 images [N, 28, 28] for split in {"train", "val", "test"}."""
-    if split == "test":
-        images = MNIST(root, train=False, download=True).data
-    else:
-        images = MNIST(root, train=True, download=True).data
-        perm = torch.randperm(len(images), generator=torch.Generator().manual_seed(SPLIT_SEED))
-        images = images[perm[NUM_VAL:]] if split == "train" else images[perm[:NUM_VAL]]
-    return images.to(device)
+    return _load(split, root)[0].to(device)
+
+
+def load_labels(split, root="data", device: str | torch.device = "cpu"):
+    """Digit labels [N] aligned with load_mnist(split)."""
+    return _load(split, root)[1].to(device)
 
 
 def to_float(images):
