@@ -15,6 +15,13 @@ import torch
 from .models import MODELS, MODES
 
 
+# Cap what the MPS allocator may take (relative to macOS's recommended GPU working set, ~13 GB on an
+# 18 GB machine). PyTorch's default of 1.7 lets it grow far past physical memory, so the system swaps
+# and freezes instead of raising an out-of-memory error. Must be set before the first MPS allocation.
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.8")
+os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.6")  # must not exceed the high ratio
+
+
 def get_device(name=None):
     if name:
         return torch.device(name)
@@ -131,7 +138,8 @@ def fit(model, kind, args, epoch_batches, step_loss, evaluate, gen, **extra):
     """Generic loop: AdamW + linear warmup, early stopping on evaluate()["loss"].
 
     epoch_batches(epoch) yields the epoch's batches, drawing its shuffle from gen; step_loss(batch)
-    returns the scalar loss to minimize; evaluate() returns a dict of metrics with a "loss" key.
+    returns the scalar loss to minimize, or (loss, logs) where logs is a dict of floats/lists averaged
+    over the epoch into metrics["train_logs"]; evaluate() returns a dict of metrics with a "loss" key.
 
     Saves args.out whenever val improves and *_latest.pt after every epoch and on Ctrl-C. Both hold
     the full training state, so either can be passed to --resume, including mid-epoch.
@@ -141,8 +149,8 @@ def fit(model, kind, args, epoch_batches, step_loss, evaluate, gen, **extra):
     sched = torch.optim.lr_scheduler.LambdaLR(opt, warmup)
     # epoch / steps_in_epoch: where to pick up. gen_state: the shuffle generator at the start of that epoch.
     # epoch_losses: this epoch's step losses so far, so a mid-epoch resume still reports the full epoch average.
-    state: dict[str, Any] = dict(epoch=1, steps_in_epoch=0, step=0, best=math.inf, bad_epochs=0, history=[], gen_state=gen.get_state(),
-                 epoch_losses=[])
+    state: dict[str, Any] = dict(epoch=1, steps_in_epoch=0, step=0, best=math.inf, bad_epochs=0, history=[],
+                                 gen_state=gen.get_state(), epoch_losses=[], epoch_logs=[])
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         if ckpt["kind"] != kind or "train_state" not in ckpt:
@@ -173,6 +181,9 @@ def fit(model, kind, args, epoch_batches, step_loss, evaluate, gen, **extra):
             running = state["epoch_losses"]
             for batch in itertools.islice(epoch_batches(epoch), state["steps_in_epoch"], args.max_steps_per_epoch):
                 loss = step_loss(batch)
+                if isinstance(loss, tuple):
+                    loss, logs = loss
+                    state.setdefault("epoch_logs", []).append(logs)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -198,13 +209,15 @@ def fit(model, kind, args, epoch_batches, step_loss, evaluate, gen, **extra):
             with torch.no_grad():
                 metrics = evaluate()
             metrics.update(epoch=epoch, train_loss=sum(running) / max(1, len(running)), seconds=time.time() - t0)
+            if state.get("epoch_logs"):
+                metrics["train_logs"] = _average_logs(state["epoch_logs"])
             state["history"].append(metrics)
             improved = metrics["loss"] < state["best"]
             if improved:
                 state["best"], state["bad_epochs"] = metrics["loss"], 0
             else:
                 state["bad_epochs"] += 1
-            state.update(epoch=epoch + 1, steps_in_epoch=0, gen_state=gen.get_state(), epoch_losses=[])
+            state.update(epoch=epoch + 1, steps_in_epoch=0, gen_state=gen.get_state(), epoch_losses=[], epoch_logs=[])
             print(f"== epoch {epoch} val {json.dumps(_round(metrics))}{'  *saved*' if improved else ''}", flush=True)
             if improved:
                 save(args.out, metrics)
@@ -217,6 +230,18 @@ def fit(model, kind, args, epoch_batches, step_loss, evaluate, gen, **extra):
                 break
     print(f"best {kind} (val loss {state['best']:.5f}) is at {args.out}")
     return state["best"], state["history"]
+
+
+def _average_logs(logs):
+    """Average a list of {name: float | list[float]} dicts key by key (lists elementwise)."""
+    out = {}
+    for key in logs[0]:
+        values = [entry[key] for entry in logs]
+        if isinstance(values[0], list):
+            out[key] = [sum(col) / len(col) for col in zip(*values)]
+        else:
+            out[key] = sum(values) / len(values)
+    return out
 
 
 def _round(obj):

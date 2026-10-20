@@ -164,13 +164,13 @@ class TokenTransformer(nn.Module):
         return logp.gather(-1, codes[:, None, :, None].expand(-1, D, -1, 1)).squeeze(-1)
 
     @torch.no_grad()
-    def sample(self, n, memory=None, prefix=None, mode="actual", top_p=0.9, generator=None):
-        """Complete prefix [n, T] (or start empty) to full codes [n, k_max]."""
+    def sample(self, n, memory=None, prefix=None, mode="actual", top_p=0.9, generator=None, temperature=1.0):
+        """Complete prefix [n, T] (or start empty) to full codes [n, k_max]. Logits are divided by temperature."""
         device = self.pos_emb.device
         codes = prefix if prefix is not None else torch.zeros(n, 0, dtype=torch.long, device=device)
         kvs = self.memory_kvs(memory)
         while codes.shape[1] < self.k_max:
-            logp = apply_mode(self.logits(codes, kvs)[:, -1], mode, top_p)
+            logp = apply_mode(self.logits(codes, kvs)[:, -1] / temperature, mode, top_p)
             nxt = torch.multinomial(logp.exp(), 1, generator=generator)
             codes = torch.cat([codes, nxt], 1)
         return codes
@@ -197,13 +197,46 @@ class TokenTransformer(nn.Module):
         return out
 
 
-class Encoder(nn.Module):
-    """q(z|x): CNN + transformer over 7x7 image patches, then an autoregressive token transformer."""
+class TwoTowers(nn.Module):
+    """Cheap stand-in for log q(z_1:k | y): image_vec(y) . prefix_vecs(z)[k-1], one vector per prefix length.
 
-    def __init__(self, vocab_size=2, k_max=10, d_model=64, n_img_layers=2, n_tok_layers=2, n_heads=4):
+    Used only to propose reference images.
+    """
+
+    def __init__(self, vocab_size, k_max, dim):
+        super().__init__()
+        self.image = nn.Sequential(
+            nn.Conv2d(1, 32, 4, stride=2, padding=1), nn.GELU(),  # 14x14
+            nn.Conv2d(32, 64, 4, stride=2, padding=1), nn.GELU(),  # 7x7
+            nn.Flatten(), nn.Linear(64 * 49, dim),
+        )
+        self.code_emb = nn.Embedding(vocab_size, dim)
+        self.code_pos = nn.Parameter(torch.randn(k_max, dim) * 0.02)
+        self.code_rnn = nn.GRU(dim, dim, batch_first=True)  # causal, so output k only sees z_1:k
+        self.code_out = nn.Sequential(nn.GELU(), nn.Linear(dim, dim))
+
+    def image_vec(self, x):
+        """x: float [N, 1, 28, 28] -> [N, dim]."""
+        return self.image(x - 0.5)
+
+    def prefix_vecs(self, codes):
+        """codes [B, k_max] -> [B, k_max, dim]; entry k-1 depends only on the prefix z_1:k."""
+        h, _ = self.code_rnn(self.code_emb(codes) + self.code_pos)
+        return self.code_out(h)
+
+
+class Encoder(nn.Module):
+    """q(z|x): CNN + transformer over 7x7 image patches, then an autoregressive token transformer.
+
+    towers_dim adds a TwoTowers reference proposal that trains alongside (it doesn't affect q).
+    """
+
+    def __init__(self, vocab_size=2, k_max=10, d_model=64, n_img_layers=2, n_tok_layers=2, n_heads=4,
+                 towers_dim=None):
         super().__init__()
         self.config = dict(vocab_size=vocab_size, k_max=k_max, d_model=d_model, n_img_layers=n_img_layers,
-                           n_tok_layers=n_tok_layers, n_heads=n_heads)
+                           n_tok_layers=n_tok_layers, n_heads=n_heads, towers_dim=towers_dim)
+        self.towers = TwoTowers(vocab_size, k_max, towers_dim) if towers_dim else None
         self.stem = nn.Sequential(
             nn.Conv2d(1, 32, 3, padding=1), nn.GELU(),
             nn.Conv2d(32, 64, 4, stride=2, padding=1), nn.GELU(),  # 14x14

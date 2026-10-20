@@ -4,39 +4,63 @@ A discrete VAE with a 1-D autoregressive latent of `k_max` tokens over a vocab o
 three separate stages. The encoder is trained alone, against an ideal decoder. Then the decoder and
 the prior are each trained on the frozen encoder's codes.
 
-Default latent: `V=2`, `k_max=10`, i.e. 1024 codes. That's small enough to enumerate, so:
-
-- the encoder objective and its gradient are exact given the reference pool (no REINFORCE);
-- the benchmark reports the exact test log-likelihood, not just a bound.
-
-Larger code spaces (e.g. `V=8`, `k_max=8`) train with a sampled estimator instead; see below.
-`analyze_encoder.py` and `benchmark.py` still require a code space small enough to enumerate.
+Default latent: `V=2`, `k_max=10`, i.e. 1024 codes. `analyze_encoder.py` and `benchmark.py`
+enumerate every code, so they need a code space that small; training works at any size.
 
 ## Encoder objective
 
 ```
-L(φ) = E_x E_{k~p(k)} E_{z~q(z_{1:k}|x)} E_{y~p(y|z,k)} [ d(x, y) ]
-p(y | z, k) ∝ q(z_{1:k} | y) p_data(y)
+L(φ) = E_x Σ_k p(k) E_{z~q(z_{1:k}|x)} F_k(x, z)
+F_k(x, z) = E_{y~p(y|z_{1:k})} d(x, y),     p(y | z_{1:k}) ∝ q(z_{1:k} | y) p_data(y)
 ```
 
-- `d` is mean squared pixel distance.
-- The posterior is estimated over `D = --num-refs` reference images, with the anchor image itself
-  left out.
-- `p(k)` is set by `--k-dist uniform|geometric|custom`.
+`d` is mean squared pixel distance and `p(k)` is set by `--k-dist uniform|geometric|custom`.
 
-`--estimator` picks how the expectation over codes is computed. The default, `auto`, uses exact
-whenever its estimated memory fits under `--max-mem-gb`:
+Each step takes `B = --batch-size` anchors and a pool of `D = --num-refs` reference images: the
+anchors themselves plus D − B extras. Each anchor is left out of its own posterior. For each anchor
+and k, the loss is Σₙ ωₙ Fₙ over a set of codes n:
 
-| | `exact` | `sampled` |
+- **Enumerated**, when `--num-samples` ≥ Vᵏᵐᵃˣ: every prefix, with ω = q(prefix | x). Exact given the
+  pool; cost D × (Vᵏᵐᵃˣ − 1)/(V − 1) tree positions.
+- **Sampled**, otherwise: S = `--num-samples` codes per anchor (default 16), drawn from q′ (q at
+  `--temperature`, default 1), with ω = (q / q′)(prefix) / S. Unbiased; cost B × S × D × k_max
+  positions, independent of V.
+
+There are two proposals, each corrected with importance weights:
+
+- **q′:** what codes are drawn from.
+- **posterior′:** what the extra references are drawn from, chosen by `--ref-ranking`:
+  - `uniform` (default);
+  - `two-towers`: a learned score, image vector · prefix vector, with one prefix vector per prefix
+    length. posterior′ is the softmax over training images, mixed over k by p(k), so it matches the
+    posterior's breadth at every prefix length. The towers train alongside the encoder, against the
+    posteriors each step already computes, so their scores track log q(z₁:ₖ | y) and the softmax needs
+    no extra temperature.
+
+  `--ref-uniform-frac` (default 0.25) of the extras stay uniform so every image stays reachable. The
+  posterior is self-normalized with weights p_data / s, where s is the mixture the pool was drawn
+  from. That makes it consistent, with a bias that shrinks as the number of effective references grows.
+
+`--estimator` picks the gradient terms:
+
+| | own-choice (REINFORCE) term | pathwise term |
 |---|---|---|
-| per step | a pool of D images; the first `B = --batch-size` (default: all D) are anchors | B anchors (default 32) and D separate random references |
-| codes | every prefix of every code, weighted by q | `S = --samples` codes drawn from each anchor's q |
-| gradient | exact, by backprop | backprop through the posterior + REINFORCE for the sampling (reward-to-go per token, leave-one-out baseline over the S samples) |
-| cost | D × (Vᵏᵐᵃˣ − 1)/(V − 1) tree positions | B × S × D × k_max positions, independent of V |
-- The val log reports `per_k`, the expected distance at each prefix length, next to `k0`, the
-  distance with no code.
+| `full` (default) | ✓ | ✓ |
+| `reinforce` | ✓ | ✗ (reference scoring runs without gradient, much less memory) |
+| `pathwise` | ✗ | ✓ |
 
-See `dvae/objective.py`.
+In sampled mode the REINFORCE term uses a leave-one-out baseline over the S samples
+(`--baseline loo|none`).
+
+- **Batch size:** if `--batch-size` is unset, B is the largest that fits in `--max-mem-gb`. When
+  enumerating with uniform references, B = D, which is the original exact setup.
+- **Validation:** always uses fixed pools of D uniform val images and codes drawn from q, so runs
+  with different settings are comparable.
+- **Val log:** reports `per_k` (the expected distance at each prefix length), `k0` (the distance with
+  no code) and `ess` (the effective number of references behind each posterior, per k).
+  `train_logs` holds the same for the training pools.
+
+See `dvae/objective.py` and `dvae/references.py`.
 
 ## Setup
 
@@ -99,8 +123,7 @@ dvae/viz.py         image grids
 
 ## Speed (M3 Pro, MPS)
 
-- **Exact**, at the defaults (`V=2`, `k_max=10`, `D=256`, `d_model=64`, 2 token layers): about
-  1.1 s/step, or about 4 min/epoch, using about 5.5 GB.
-- **Sampled**, at `V=8`, `k_max=8`, `B=32`, `S=4`, `D=256`: about 0.5 s/step, or about 15 min/epoch
-  (each training image is an anchor once per epoch), using about 5.5 GB.
+- **Enumerated** at `V=2`, `k_max=10`, `D=256` (`--num-samples 1024`): about 1.1 s/step, or about
+  4 min/epoch, using about 5.5 GB.
+- **Sampled:** the cost scales with B × S × D × k_max. The defaults pick B to fit `--max-mem-gb`.
 - Decoder and prior epochs take about a minute.
