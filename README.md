@@ -9,6 +9,9 @@ Default latent: `V=2`, `k_max=10`, i.e. 1024 codes. That's small enough to enume
 - the encoder objective and its gradient are exact given the reference pool (no REINFORCE);
 - the benchmark reports the exact test log-likelihood, not just a bound.
 
+Larger code spaces (e.g. `V=8`, `k_max=8`) train with a sampled estimator instead; see below.
+`analyze_encoder.py` and `benchmark.py` still require a code space small enough to enumerate.
+
 ## Encoder objective
 
 ```
@@ -17,10 +20,19 @@ p(y | z, k) ∝ q(z_{1:k} | y) p_data(y)
 ```
 
 - `d` is mean squared pixel distance.
-- Each step draws a pool of `D = --num-refs` training images. The posterior is estimated over the
-  pool, with the anchor image itself left out.
-- The first `B = --batch-size` pool images (default: all of them) are the anchors.
+- The posterior is estimated over `D = --num-refs` reference images, with the anchor image itself
+  left out.
 - `p(k)` is set by `--k-dist uniform|geometric|custom`.
+
+`--estimator` picks how the expectation over codes is computed. The default, `auto`, uses exact
+whenever its estimated memory fits under `--max-mem-gb`:
+
+| | `exact` | `sampled` |
+|---|---|---|
+| per step | a pool of D images; the first `B = --batch-size` (default: all D) are anchors | B anchors (default 32) and D separate random references |
+| codes | every prefix of every code, weighted by q | `S = --samples` codes drawn from each anchor's q |
+| gradient | exact, by backprop | backprop through the posterior + REINFORCE for the sampling (reward-to-go per token, leave-one-out baseline over the S samples) |
+| cost | D × (Vᵏᵐᵃˣ − 1)/(V − 1) tree positions | B × S × D × k_max positions, independent of V |
 - The val log reports `per_k`, the expected distance at each prefix length, next to `k0`, the
   distance with no code.
 
@@ -45,6 +57,7 @@ python qa_generate.py -n 64                              # -> outputs/generate.p
 python qa_compress.py -n 16 -k 1 2 4 10 -m 8             # -> outputs/compress/k01.png ...
 python benchmark.py --decoder checkpoints/decoder_gray.pt checkpoints/decoder_binary.pt \
                     --encoder checkpoints/encoder.pt     # -> results/benchmark.{json,md}
+python analyze_encoder.py --encoder checkpoints/encoder.pt # -> results/usage_encoder.json
 ```
 
 - **Training:** every training script early-stops on its val loss (a fixed 5k split of the MNIST
@@ -69,6 +82,11 @@ python benchmark.py --decoder checkpoints/decoder_gray.pt checkpoints/decoder_bi
   the test set binarized with a fixed seed. It reports exact NLL, plus −ELBO and rate when you pass
   `--encoder`, in both nats/image and bits/dim.
 
+- **Latent usage:** `analyze_encoder.py` reports, for each prefix length k, how many of the
+  k·log₂V bits carry information about the image, as I(x; z₁:ₖ). It also shows how much each extra
+  token adds, how many codes are used, and how many bits about the digit label each prefix
+  carries. Everything is computed exactly over a split; use `--split test` for final numbers.
+
 ## Layout
 
 ```
@@ -81,6 +99,8 @@ dvae/viz.py         image grids
 
 ## Speed (M3 Pro, MPS)
 
-Encoder training at the defaults (`D=256`, `d_model=64`, 2 token layers) is about 1.1 s/step, or
-about 4 min/epoch, using about 5.5 GB. The cost scales with D × (number of tree nodes). Decoder and
-prior epochs take about a minute.
+- **Exact**, at the defaults (`V=2`, `k_max=10`, `D=256`, `d_model=64`, 2 token layers): about
+  1.1 s/step, or about 4 min/epoch, using about 5.5 GB.
+- **Sampled**, at `V=8`, `k_max=8`, `B=32`, `S=4`, `D=256`: about 0.5 s/step, or about 15 min/epoch
+  (each training image is an anchor once per epoch), using about 5.5 GB.
+- Decoder and prior epochs take about a minute.

@@ -69,3 +69,34 @@ def encoder_objective(prefix_logp, images, n_anchors, weights):
     k0 = dist.sum(1).mean() / (D - 1)
     loss = (weights.to(per_k.device) * per_k).sum()
     return loss, per_k, k0
+
+
+def sampled_encoder_objective(logq_self, logq_refs, anchors, refs, self_mask, weights):
+    """Monte Carlo version for code spaces too large to enumerate.
+
+    logq_self: [B, S, K] per-token log q(z_t | z_<t, x_i) of S codes sampled from each anchor's q.
+    logq_refs: [B, S, D, K] per-token log-probs of those same codes under each reference image.
+    anchors [B, P], refs [D, P]: pixels. self_mask [B, D]: True where a reference is the anchor itself.
+    weights: p(k) [K].
+
+    The loss for code z is V(z) = sum_k p(k) F_k(z), F_k = E_{y~p(y|z_1:k)} d(x, y) over the references.
+    Its gradient has two parts: backprop through the posterior weights (pathwise), and REINFORCE for
+    the sampling of z. Token t only affects F_k for k >= t, so it is credited with sum_{k>=t} p(k) F_k,
+    minus the same quantity averaged over the anchor's other S-1 samples as a baseline.
+
+    Returns (surrogate, per_k [K], k0): surrogate's value is the estimated objective and its gradient
+    is the unbiased gradient estimate.
+    """
+    dist = pairwise_sq_dist(anchors, refs)  # [B, D]
+    log_post = logq_refs.cumsum(-1).masked_fill(self_mask[:, None, :, None], -math.inf)
+    posterior = log_post.softmax(2)  # p(y_j | z_1:k) over references, [B, S, D, K]
+    F = (posterior * dist[:, None, :, None]).sum(2)  # [B, S, K]
+    weighted = F * weights.to(F.device)
+    value = weighted.sum(-1)  # [B, S]
+    reward_to_go = weighted.flip(-1).cumsum(-1).flip(-1).detach()
+    S = reward_to_go.shape[1]
+    baseline = (reward_to_go.sum(1, keepdim=True) - reward_to_go) / (S - 1) if S > 1 else 0.0
+    reinforce = ((reward_to_go - baseline) * logq_self).sum(-1)
+    surrogate = value.mean() + reinforce.mean() - reinforce.mean().detach()
+    k0 = (dist.masked_fill(self_mask, 0).sum(1) / (~self_mask).sum(1)).mean()
+    return surrogate, F.detach().mean((0, 1)), k0

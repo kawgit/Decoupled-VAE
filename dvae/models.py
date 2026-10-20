@@ -39,8 +39,9 @@ def apply_mode(logits, mode="actual", top_p=0.9):
 class Block(nn.Module):
     """Pre-norm transformer block: causal self-attention, optional cross-attention, MLP.
 
-    Runs either on ordinary sequences (forward) or one depth of the code tree at a time with
-    the ancestors' keys/values cached (forward_tree).
+    Runs on ordinary sequences (forward), on one depth of the code tree at a time with the
+    ancestors' keys/values cached (forward_tree), or on every (code, reference image) pair without
+    copying the image keys/values (forward_pairwise).
     """
 
     def __init__(self, d_model, n_heads, cross):
@@ -73,11 +74,24 @@ class Block(nn.Module):
             x = x + self.proj_x(out.transpose(1, 2).flatten(-2))
         return x + self.mlp(self.ln3(x))
 
-    def forward(self, x, memory_kv=None):
+    def _self_attn(self, x):
         q, k, v = (self._heads(t).transpose(1, 2) for t in self.qkv(self.ln1(x)).chunk(3, -1))
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        x = x + self.proj(out.transpose(1, 2).flatten(-2))
-        return self._cross_and_mlp(x, memory_kv)
+        return x + self.proj(out.transpose(1, 2).flatten(-2))
+
+    def forward(self, x, memory_kv=None):
+        return self._cross_and_mlp(self._self_attn(x), memory_kv)
+
+    def forward_pairwise(self, x, memory_kv):
+        """x: [M, D, T, d], one sequence per (code m, reference image j). memory_kv: [D, H, S, dh] each."""
+        M, D, T, d = x.shape
+        x = self._self_attn(x.reshape(M * D, T, d)).reshape(M, D, T, d)
+        q = self._heads(self.q_x(self.ln2(x))).transpose(2, 3)  # [M, D, H, T, dh]
+        k, v = memory_kv
+        att = (torch.einsum("mdhtc,dhsc->mdhts", q, k) / math.sqrt(self.d_head)).softmax(-1)
+        out = torch.einsum("mdhts,dhsc->mdhtc", att, v).transpose(2, 3).flatten(-2)
+        x = x + self.proj_x(out)
+        return x + self.mlp(self.ln3(x))
 
     def forward_tree(self, x, cache, memory_kv=None):
         """x: [N, n, d], every node at depth t = len(cache). cache[s] = (k, v) of depth s, [N, V**s, H, dh].
@@ -137,6 +151,17 @@ class TokenTransformer(nn.Module):
         """Per-token log-probs of full codes [N, k_max] -> [N, k_max]."""
         logp = apply_mode(self.logits(codes[:, :-1], self.memory_kvs(memory)), mode, top_p)
         return logp.gather(-1, codes.unsqueeze(-1)).squeeze(-1)
+
+    def log_prob_pairwise(self, codes, memory):
+        """Per-token log-probs of every code [M, k_max] under every image's features [D, S, d] -> [M, D, k_max]."""
+        D = memory.shape[0]
+        bos = codes.new_full((codes.shape[0], 1), self.bos)
+        tokens = torch.cat([bos, codes[:, :-1]], 1)
+        x = (self.tok_emb(tokens) + self.pos_emb).unsqueeze(1).expand(-1, D, -1, -1)
+        for block, kv in zip(self.block_list, self.memory_kvs(memory)):
+            x = block.forward_pairwise(x, kv)
+        logp = self.head(self.ln_f(x)).float().log_softmax(-1)  # [M, D, k_max, V]
+        return logp.gather(-1, codes[:, None, :, None].expand(-1, D, -1, 1)).squeeze(-1)
 
     @torch.no_grad()
     def sample(self, n, memory=None, prefix=None, mode="actual", top_p=0.9, generator=None):
