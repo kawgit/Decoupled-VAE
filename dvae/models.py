@@ -1,4 +1,4 @@
-"""Encoder q(z|x), prior p(z) and decoder p(x|z) for a discrete 1-D latent of k_max tokens over a vocab of V.
+"""Prior p(z) and decoder p(x|z) for a discrete 1-D latent of k_max tokens over a vocab of V (encoder: dvae/staged.py).
 
 Codes are indexed as base-V numbers with z_1 as the most significant digit, so the children of
 prefix node j at depth t are nodes j*V .. j*V+V-1 at depth t+1.
@@ -39,9 +39,8 @@ def apply_mode(logits, mode="actual", top_p=0.9):
 class Block(nn.Module):
     """Pre-norm transformer block: causal self-attention, optional cross-attention, MLP.
 
-    Runs on ordinary sequences (forward), on one depth of the code tree at a time with the
-    ancestors' keys/values cached (forward_tree), or on every (code, reference image) pair without
-    copying the image keys/values (forward_pairwise).
+    Runs on ordinary sequences (forward) or on one depth of the code tree at a time with the
+    ancestors' keys/values cached (forward_tree).
     """
 
     def __init__(self, d_model, n_heads, cross):
@@ -81,17 +80,6 @@ class Block(nn.Module):
 
     def forward(self, x, memory_kv=None):
         return self._cross_and_mlp(self._self_attn(x), memory_kv)
-
-    def forward_pairwise(self, x, memory_kv):
-        """x: [M, D, T, d], one sequence per (code m, reference image j). memory_kv: [D, H, S, dh] each."""
-        M, D, T, d = x.shape
-        x = self._self_attn(x.reshape(M * D, T, d)).reshape(M, D, T, d)
-        q = self._heads(self.q_x(self.ln2(x))).transpose(2, 3)  # [M, D, H, T, dh]
-        k, v = memory_kv
-        att = (torch.einsum("mdhtc,dhsc->mdhts", q, k) / math.sqrt(self.d_head)).softmax(-1)
-        out = torch.einsum("mdhts,dhsc->mdhtc", att, v).transpose(2, 3).flatten(-2)
-        x = x + self.proj_x(out)
-        return x + self.mlp(self.ln3(x))
 
     def forward_tree(self, x, cache, memory_kv=None):
         """x: [N, n, d], every node at depth t = len(cache). cache[s] = (k, v) of depth s, [N, V**s, H, dh].
@@ -152,17 +140,6 @@ class TokenTransformer(nn.Module):
         logp = apply_mode(self.logits(codes[:, :-1], self.memory_kvs(memory)), mode, top_p)
         return logp.gather(-1, codes.unsqueeze(-1)).squeeze(-1)
 
-    def log_prob_pairwise(self, codes, memory):
-        """Per-token log-probs of every code [M, k_max] under every image's features [D, S, d] -> [M, D, k_max]."""
-        D = memory.shape[0]
-        bos = codes.new_full((codes.shape[0], 1), self.bos)
-        tokens = torch.cat([bos, codes[:, :-1]], 1)
-        x = (self.tok_emb(tokens) + self.pos_emb).unsqueeze(1).expand(-1, D, -1, -1)
-        for block, kv in zip(self.block_list, self.memory_kvs(memory)):
-            x = block.forward_pairwise(x, kv)
-        logp = self.head(self.ln_f(x)).float().log_softmax(-1)  # [M, D, k_max, V]
-        return logp.gather(-1, codes[:, None, :, None].expand(-1, D, -1, 1)).squeeze(-1)
-
     @torch.no_grad()
     def sample(self, n, memory=None, prefix=None, mode="actual", top_p=0.9, generator=None, temperature=1.0):
         """Complete prefix [n, T] (or start empty) to full codes [n, k_max]. Logits are divided by temperature."""
@@ -195,74 +172,6 @@ class TokenTransformer(nn.Module):
             logp = apply_mode(self.head(self.ln_f(x)), mode, top_p)  # [n, width, V]
             out.append((out[-1].unsqueeze(-1) + logp).flatten(1))
         return out
-
-
-class TwoTowers(nn.Module):
-    """Cheap stand-in for log q(z_1:k | y): image_vec(y) . prefix_vecs(z)[k-1], one vector per prefix length.
-
-    Used only to propose reference images.
-    """
-
-    def __init__(self, vocab_size, k_max, dim):
-        super().__init__()
-        self.image = nn.Sequential(
-            nn.Conv2d(1, 32, 4, stride=2, padding=1), nn.GELU(),  # 14x14
-            nn.Conv2d(32, 64, 4, stride=2, padding=1), nn.GELU(),  # 7x7
-            nn.Flatten(), nn.Linear(64 * 49, dim),
-        )
-        self.code_emb = nn.Embedding(vocab_size, dim)
-        self.code_pos = nn.Parameter(torch.randn(k_max, dim) * 0.02)
-        self.code_rnn = nn.GRU(dim, dim, batch_first=True)  # causal, so output k only sees z_1:k
-        self.code_out = nn.Sequential(nn.GELU(), nn.Linear(dim, dim))
-
-    def image_vec(self, x):
-        """x: float [N, 1, 28, 28] -> [N, dim]."""
-        return self.image(x - 0.5)
-
-    def prefix_vecs(self, codes):
-        """codes [B, k_max] -> [B, k_max, dim]; entry k-1 depends only on the prefix z_1:k."""
-        h, _ = self.code_rnn(self.code_emb(codes) + self.code_pos)
-        return self.code_out(h)
-
-
-class Encoder(nn.Module):
-    """q(z|x): CNN + transformer over 7x7 image patches, then an autoregressive token transformer.
-
-    towers_dim adds a TwoTowers reference proposal that trains alongside (it doesn't affect q).
-    """
-
-    def __init__(self, vocab_size=2, k_max=10, d_model=64, n_img_layers=2, n_tok_layers=2, n_heads=4,
-                 towers_dim=None):
-        super().__init__()
-        self.config = dict(vocab_size=vocab_size, k_max=k_max, d_model=d_model, n_img_layers=n_img_layers,
-                           n_tok_layers=n_tok_layers, n_heads=n_heads, towers_dim=towers_dim)
-        self.towers = TwoTowers(vocab_size, k_max, towers_dim) if towers_dim else None
-        self.stem = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1), nn.GELU(),
-            nn.Conv2d(32, 64, 4, stride=2, padding=1), nn.GELU(),  # 14x14
-            nn.Conv2d(64, d_model, 4, stride=2, padding=1),  # 7x7
-        )
-        self.img_pos = nn.Parameter(torch.randn(49, d_model) * 0.02)
-        layer = nn.TransformerEncoderLayer(d_model, n_heads, 4 * d_model, dropout=0.0, activation="gelu",
-                                           batch_first=True, norm_first=True)
-        self.img_tf = nn.TransformerEncoder(layer, n_img_layers, enable_nested_tensor=False)
-        self.img_ln = nn.LayerNorm(d_model)
-        self.tokens = TokenTransformer(vocab_size, k_max, d_model, n_tok_layers, n_heads, cross=True)
-
-    def memory(self, x):
-        """x: float [N, 1, 28, 28] in [0, 1] -> patch features [N, 49, d]."""
-        h = self.stem(x - 0.5).flatten(2).transpose(1, 2) + self.img_pos
-        return self.img_ln(self.img_tf(h))
-
-    def prefix_logprobs(self, x, mode="actual", top_p=0.9):
-        return self.tokens.prefix_logprobs(x.shape[0], self.memory(x), mode, top_p)
-
-    def log_prob(self, x, codes, mode="actual", top_p=0.9):
-        return self.tokens.log_prob(codes, self.memory(x), mode, top_p)
-
-    @torch.no_grad()
-    def sample(self, x, mode="actual", top_p=0.9, generator=None):
-        return self.tokens.sample(x.shape[0], self.memory(x), mode=mode, top_p=top_p, generator=generator)
 
 
 class Prior(nn.Module):
@@ -343,4 +252,4 @@ class Decoder(nn.Module):
         return img.view(-1, 1, 28, 28)
 
 
-MODELS = {"encoder": Encoder, "prior": Prior, "decoder": Decoder}
+MODELS = {"prior": Prior, "decoder": Decoder}  # the encoder lives in dvae/staged.py

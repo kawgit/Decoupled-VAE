@@ -1,66 +1,53 @@
-# Decoupled VAE — MNIST MVP
+# Decoupled VAE — MNIST MVP (partition-encoder branch)
 
 A discrete VAE with a 1-D autoregressive latent of `k_max` tokens over a vocab of `V`, trained in
-three separate stages. The encoder is trained alone, against an ideal decoder. Then the decoder and
+three separate stages. The encoder is built first, against an ideal decoder. Then the decoder and
 the prior are each trained on the frozen encoder's codes.
 
 Default latent: `V=2`, `k_max=10`, i.e. 1024 codes. `analyze_encoder.py` and `benchmark.py`
-enumerate every code, so they need a code space that small; training works at any size.
+enumerate every code, so they need a code space that small.
 
-## Encoder objective
+## The objective
 
 ```
-L(φ) = E_x Σ_k p(k) E_{z~q(z_{1:k}|x)} F_k(x, z)
+L = E_x Σ_k p(k) E_{z~q(z_{1:k}|x)} F_k(x, z)
 F_k(x, z) = E_{y~p(y|z_{1:k})} d(x, y),     p(y | z_{1:k}) ∝ q(z_{1:k} | y) p_data(y)
 ```
 
-`d` is mean squared pixel distance and `p(k)` is set by `--k-dist uniform|geometric|custom`.
+`d` is mean squared pixel distance.
 
-Each step takes `B = --batch-size` anchors and a pool of `D = --num-refs` reference images: the
-anchors themselves plus D − B extras. Each anchor is left out of its own posterior. For each anchor
-and k, the loss is Σₙ ωₙ Fₙ over a set of codes n:
+## How the encoder is built
 
-- **Enumerated**, when `--num-samples` ≥ Vᵏᵐᵃˣ: every prefix, with ω = q(prefix | x). Exact given the
-  pool; cost D × (Vᵏᵐᵃˣ − 1)/(V − 1) tree positions.
-- **Sampled**, otherwise: S = `--num-samples` codes per anchor (default 16), drawn from q′ (q at
-  `--temperature`, default 1), with ω = (q / q′)(prefix) / S. Unbiased; cost B × S × D × k_max
-  positions, independent of V.
+On this branch the encoder isn't trained by descending L directly. That objective is non-convex in the
+encoder's outputs, much like k-means. Instead `build_encoder.py` builds the code one token at a time,
+and at each position it *chooses* a partition and trains a classifier to reproduce it:
 
-There are two proposals, each corrected with importance weights:
+1. **Prefixes.** Sample a prefix z₁..z_t for every training image, using the models of earlier
+   positions on images they weren't trained on (out-of-fold).
+2. **Candidates.** Generate candidate partitions for the next token (`dvae/partition.py`):
+   - `node`: V-means inside each prefix group;
+   - `node-balanced`: each group split evenly along its own top principal direction;
+   - `shared`: one V-word codebook for every group, applied to the image minus its group's mean;
+   - `shared-balanced`: one shared direction, with each group split evenly along it;
+   - `node-unaligned`: `node` with random labels per group, to test whether label alignment matters.
 
-- **q′:** what codes are drawn from.
-- **posterior′:** what the extra references are drawn from, chosen by `--ref-ranking`:
-  - `uniform` (default);
-  - `two-towers`: a learned score, image vector · prefix vector, with one prefix vector per prefix
-    length. posterior′ is the softmax over training images, mixed over k by p(k), so it matches the
-    posterior's breadth at every prefix length. The towers train alongside the encoder, against the
-    posteriors each step already computes, so their scores track log q(z₁:ₖ | y) and the softmax needs
-    no extra temperature.
+   Labels are aligned across groups by ranking children along one shared direction. That's a
+   heuristic, not a guarantee. Candidates whose partitions coincide (ARI > `--dedup-ari`) are dropped.
+3. **Training.** Train `--folds` + 1 copies of a `StageNet` with one head per candidate, by
+   cross-entropy: fold model f on the images outside fold f, and a final model on all of them.
+   Prefixes are resampled from the out-of-fold models every batch, so each position learns from the
+   mistakes earlier positions really make on unseen images. Those next-token distributions are
+   memoized (`--memo-cap`), since earlier positions are frozen.
+4. **Scoring and selection.** After every epoch, every head is scored on each fold's held-out images
+   with the decompression objective. The score is exact, with all training images as references,
+   from per-prefix sums. The best head is picked *per prefix*, and the epoch with the best total is
+   kept. The fold models and the final model share that epoch count and that selection.
+5. **The stage.** The final model plus its per-prefix head selector becomes this position. The log
+   reports its honest score on the separate val split, for the per-prefix selection and for the single
+   best head.
 
-  `--ref-uniform-frac` (default 0.25) of the extras stay uniform so every image stays reachable. The
-  posterior is self-normalized with weights p_data / s, where s is the mixture the pool was drawn
-  from. That makes it consistent, with a bias that shrinks as the number of effective references grows.
-
-`--estimator` picks the gradient terms:
-
-| | own-choice (REINFORCE) term | pathwise term |
-|---|---|---|
-| `full` (default) | ✓ | ✓ |
-| `reinforce` | ✓ | ✗ (reference scoring runs without gradient, much less memory) |
-| `pathwise` | ✗ | ✓ |
-
-In sampled mode the REINFORCE term uses a leave-one-out baseline over the S samples
-(`--baseline loo|none`).
-
-- **Batch size:** if `--batch-size` is unset, B is the largest that fits in `--max-mem-gb`. When
-  enumerating with uniform references, B = D, which is the original exact setup.
-- **Validation:** always uses fixed pools of D uniform val images and codes drawn from q, so runs
-  with different settings are comparable.
-- **Val log:** reports `per_k` (the expected distance at each prefix length), `k0` (the distance with
-  no code) and `ess` (the effective number of references behind each posterior, per k).
-  `train_logs` holds the same for the training pools.
-
-See `dvae/objective.py` and `dvae/references.py`.
+The ground truth for every choice is the decompression objective of a trained model on held-out images.
+Pixel-space criteria (k-means fit, alignment) only generate the candidates.
 
 ## Setup
 
@@ -73,7 +60,7 @@ The device is picked automatically (cuda → mps → cpu); override it with `--d
 ## Pipeline
 
 ```bash
-python train_encoder.py                                  # -> checkpoints/encoder.pt
+python build_encoder.py                                  # -> checkpoints/encoder.pt (+ encoder_build.pt)
 python train_decoder.py                                  # -> checkpoints/decoder_gray.pt   (8-bit pixels)
 python train_decoder.py --likelihood binary              # -> checkpoints/decoder_binary.pt (binarized)
 python train_prior.py                                    # -> checkpoints/prior.pt
@@ -84,46 +71,37 @@ python benchmark.py --decoder checkpoints/decoder_gray.pt checkpoints/decoder_bi
 python analyze_encoder.py --encoder checkpoints/encoder.pt # -> results/usage_encoder.json
 ```
 
-- **Training:** every training script early-stops on its val loss (a fixed 5k split of the MNIST
-  train set) and keeps the best checkpoint at `--out`. Set the learning rate with `--lr`.
-- **Stopping and resuming:**
-  - Ctrl-C stops at the end of the current step and saves `*_latest.pt` next to `--out`. A second
-    Ctrl-C aborts without saving. `*_latest.pt` is also rewritten after every epoch.
-  - Both checkpoints hold the full training state: model, optimizer, scheduler, counters, RNG and
-    shuffle state, and the original args. A resumed run matches an uninterrupted one step for step,
-    even mid-epoch.
-  - To resume, pass the checkpoint alone: `python train_encoder.py --resume checkpoints/encoder_latest.pt`.
-  - Flags you add when resuming override the saved ones, e.g. `--epochs 50 --lr 1e-4`. Don't change
-    architecture flags.
+- **Building the encoder:**
+  - `checkpoints/encoder.pt` is rewritten after every position, so the other scripts can use a
+    partly built encoder.
+  - `checkpoints/encoder_build.pt` keeps every fold model. Continue with `--resume` (and a larger
+    `--k-max` to add positions). Ctrl-C loses only the position in progress.
+  - For quick tests, `--limit-train` and `--limit-val` use fewer images.
+- **Decoder and prior training:**
+  - They early-stop on their val loss (a fixed 5k split of the MNIST train set) and keep the best
+    checkpoint at `--out`. Set the learning rate with `--lr`.
+  - Ctrl-C saves `*_latest.pt`. Continue with `--resume checkpoints/<name>_latest.pt`; flags you add
+    override the saved ones.
 - **Token sampling:** `--encoder-mode` and `--prior-mode` pick how tokens are drawn:
   - `actual`: the model's own distribution;
   - `greedy`: the most likely token at each step;
   - `topp`: nucleus sampling, with `--*-top-p`.
-- **Compression QA:** `qa_compress.py` encodes greedily by default, so it acts as a deterministic
-  codec. Each output row is the original image followed by `m` decodings, each with the rest of
-  the code filled in by the prior.
+- **Compression QA:** `qa_compress.py` encodes greedily by default. Each output row is the original
+  image followed by `m` decodings, each with the rest of the code filled in by the prior.
 - **Benchmark:** `benchmark.py` scores each decoder on the data it was trained for: 8-bit MNIST, or
   the test set binarized with a fixed seed. It reports exact NLL, plus −ELBO and rate when you pass
-  `--encoder`, in both nats/image and bits/dim.
-
-- **Latent usage:** `analyze_encoder.py` reports, for each prefix length k, how many of the
-  k·log₂V bits carry information about the image, as I(x; z₁:ₖ). It also shows how much each extra
-  token adds, how many codes are used, and how many bits about the digit label each prefix
-  carries. Everything is computed exactly over a split; use `--split test` for final numbers.
+  `--encoder`.
+- **Latent usage:** `analyze_encoder.py` reports, for each prefix length k, how many bits carry
+  information about the image and about the digit label, and how many codes are used.
 
 ## Layout
 
 ```
-dvae/data.py        MNIST tensors, train/val split, binarization
-dvae/models.py      Encoder, Prior, Decoder; tree enumeration of all code prefixes
-dvae/objective.py   decoupled encoder objective (leave-one-out, numerically stable)
+build_encoder.py    builds the staged encoder (folds, multi-head training, per-prefix head selection)
+dvae/staged.py      StageNet (one per position) and StagedEncoder (sample, log_prob, tree enumeration)
+dvae/partition.py   candidate partitions, alignment, dedup, exact per-prefix objective
+dvae/models.py      Prior, Decoder; tree enumeration of all code prefixes
+dvae/data.py        MNIST tensors, train/val split, labels, binarization
 dvae/common.py      device, checkpoints, CLI flags, early-stopping loop
 dvae/viz.py         image grids
 ```
-
-## Speed (M3 Pro, MPS)
-
-- **Enumerated** at `V=2`, `k_max=10`, `D=256` (`--num-samples 1024`): about 1.1 s/step, or about
-  4 min/epoch, using about 5.5 GB.
-- **Sampled:** the cost scales with B × S × D × k_max. The defaults pick B to fit `--max-mem-gb`.
-- Decoder and prior epochs take about a minute.

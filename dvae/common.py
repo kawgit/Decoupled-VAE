@@ -12,7 +12,11 @@ from typing import Any
 
 import torch
 
-from .models import MODELS, MODES
+from .models import MODELS as _MODELS
+from .models import MODES
+from .staged import StagedEncoder
+
+MODELS = {**_MODELS, "encoder": StagedEncoder}
 
 
 # Cap what the MPS allocator may take (relative to macOS's recommended GPU working set, ~13 GB on an
@@ -84,6 +88,9 @@ def save_checkpoint(path, kind, model, **extra):
 
 
 def load_checkpoint(path, kind, device):
+    if not os.path.exists(path) and os.path.exists(latest_path(path)):
+        print(f"{path} doesn't exist yet (no epoch finished); using {latest_path(path)}")
+        path = latest_path(path)
     ckpt = torch.load(path, map_location=device, weights_only=False)
     if ckpt["kind"] != kind:
         raise ValueError(f"{path} is a {ckpt['kind']} checkpoint, expected {kind}")
@@ -197,8 +204,11 @@ def fit(model, kind, args, epoch_batches, step_loss, evaluate, gen, **extra):
                 if now - last_log >= args.log_interval:
                     last_log = now
                     rate = steps_this_run / (now - t0)
+                    last_logs = state["epoch_logs"][-1] if state.get("epoch_logs") else {}
+                    diag_text = "".join(f", {key} {last_logs[key]:.3f}" for key in ("code_entropy_bits", "distinct_frac")
+                                        if key in last_logs)
                     print(f"epoch {epoch} step {state['step']} loss {running[-1]:.5f} "
-                          f"(epoch avg {sum(running) / len(running):.5f}, lr {sched.get_last_lr()[0]:.2e}, "
+                          f"(epoch avg {sum(running) / len(running):.5f}, lr {sched.get_last_lr()[0]:.2e}{diag_text}, "
                           f"{rate:.1f} it/s)", flush=True)
                 if interrupt.requested:
                     save(latest, None)
