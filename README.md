@@ -19,7 +19,7 @@ F_k(x, z) = E_{y~p(y|z_{1:k})} d(x, y),     p(y | z_{1:k}) ∝ q(z_{1:k} | y) p_
 ## How the encoder is built
 
 On this branch the encoder isn't trained by descending L directly. That objective is non-convex in the
-encoder's outputs, much like k-means. Instead `build_encoder.py` builds the code one token at a time,
+encoder's outputs, much like k-means. Instead `train_encoder.py` builds the code one token at a time,
 and at each position it *chooses* a partition and trains a classifier to reproduce it:
 
 1. **Prefixes.** Sample a prefix z₁..z_t for every training image, using the models of earlier
@@ -60,7 +60,7 @@ The device is picked automatically (cuda → mps → cpu); override it with `--d
 ## Pipeline
 
 ```bash
-python build_encoder.py                                  # -> checkpoints/encoder.pt (+ encoder_build.pt)
+python train_encoder.py                                  # -> checkpoints/encoder.pt (+ encoder_build.pt)
 python train_decoder.py                                  # -> checkpoints/decoder_gray.pt   (8-bit pixels)
 python train_decoder.py --likelihood binary              # -> checkpoints/decoder_binary.pt (binarized)
 python train_prior.py                                    # -> checkpoints/prior.pt
@@ -97,7 +97,7 @@ python analyze_encoder.py --encoder checkpoints/encoder.pt # -> results/usage_en
 ## Layout
 
 ```
-build_encoder.py    builds the staged encoder (folds, multi-head training, per-prefix head selection)
+train_encoder.py    builds the staged encoder (folds, multi-head training, per-prefix head selection)
 dvae/staged.py      StageNet (one per position) and StagedEncoder (sample, log_prob, tree enumeration)
 dvae/partition.py   candidate partitions, alignment, dedup, exact per-prefix objective
 dvae/models.py      Prior, Decoder; tree enumeration of all code prefixes

@@ -2,7 +2,7 @@
 
 Stage t (t = 0 .. k_max-1) predicts token z_{t+1} from the image and the prefix z_1..z_t. Each stage has
 several output heads, one per candidate partition it was trained on, and a selector that picks a head
-per prefix (falling back to a default head for prefixes it never saw). Built by build_encoder.py.
+per prefix (falling back to a default head for prefixes it never saw). Built by train_encoder.py.
 
 Codes are indexed as base-V numbers with z_1 most significant, so node j at depth t has children
 j*V .. j*V+V-1 at depth t+1.
