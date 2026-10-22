@@ -1,19 +1,23 @@
-"""Anchor partitions for one code position, and the decompression objective evaluated exactly per prefix.
+"""Anchor partitions for one code position, and the exact marginal decompression loss (see README).
 
-Decompression loss, second definition: for a partition of a set of (image, code) pairs into V classes, the
-(first-definition) loss of the new token for an encoder that exactly reproduces (image, code + class): each
-image's expected squared distance to the other images with the same code and class.
+A partition's implied marginal decompression loss: for a partition of a set of (image, code) pairs into V
+classes, the marginal decompression loss of an encoder that exactly reproduces (image, code + class):
+each pair's expected squared distance to the other pairs with the same code and class.
 
 For anchor image a with code z_a, every reference's code is truncated to s+1 tokens, where s is the length
 of the prefix it shares with z_a (the whole code when it matches z_a entirely). References are thereby
 grouped finely around the anchor's own code and ever more coarsely further from it. Within each group,
-Hartigan's method assigns references to V classes to minimise the second-definition loss: moves are taken
-only when they lower it, so it decreases strictly until no single move helps. Moves are applied in batches
-for speed, halving a batch until the total loss drops (a single best move always does).
+Hartigan's method assigns references to V classes to minimise the implied marginal decompression loss:
+moves are taken only when they lower it, so it decreases strictly until no single move helps. Moves are
+applied in batches for speed, halving a batch until the total loss drops (a single best move always does).
 
 Any image is then labelled by truncating its code against z_a and choosing the class whose total loss rises
 least if the image joins it; codes whose truncated group has no references get class 0. Distances are mean
 squared pixel distance; pass centered pixels for precision.
+
+References may carry weights, equal within each group (independent draws from that group, each standing
+for the group's mass over the number of draws). A weight only scales its group's loss, so it leaves
+Hartigan's moves and the labels unchanged; it puts total_loss() on the scale of the whole population.
 """
 
 import torch
@@ -52,7 +56,7 @@ def truncated_group(codes, anchor_code, V):
 
 
 def cluster_cost(n, S, Q, ng, Sg, Qg, P):
-    """Second-definition loss of one (group, class) cluster from its sufficient statistics.
+    """Implied marginal decompression loss of one (group, class) cluster from its sufficient statistics.
 
     n members with pixel sum S [.., P] and squared-norm sum Q, in a group with ng members, sum Sg, sum Qg.
     n >= 2: each member's mean distance to the others, summed = 2 n/(n-1) * SSE.
@@ -71,7 +75,7 @@ def cluster_cost(n, S, Q, ng, Sg, Qg, P):
 class AnchorPartition:
     """A partition built around one anchor code with Hartigan's method (see the module docstring)."""
 
-    def __init__(self, anchor_code, ref_x, ref_codes, V, generator, max_rounds=200):
+    def __init__(self, anchor_code, ref_x, ref_codes, V, generator, max_rounds=200, ref_w=None):
         self.anchor_code, self.V, self.P = anchor_code, V, ref_x.shape[1]
         device = ref_x.device
         gid = truncated_group(ref_codes, anchor_code, V)
@@ -79,6 +83,8 @@ class AnchorPartition:
         self.table, G = NodeTable(groups), len(groups)
         sq = ref_x.pow(2).sum(1)
         self.ng = torch.bincount(ginv, minlength=G)
+        w = torch.ones(len(ref_x), device=device) if ref_w is None else ref_w
+        self.group_w = torch.zeros(G, device=device).index_add_(0, ginv, w) / self.ng  # each group's (equal) weight
         self.Sg = torch.zeros(G, self.P, device=device).index_add_(0, ginv, ref_x)
         self.Qg = torch.zeros(G, device=device).index_add_(0, ginv, sq)
         labels = torch.randint(V, (len(ref_x),), generator=generator).to(device)
@@ -124,7 +130,7 @@ class AnchorPartition:
         return cluster_cost(n, S, Q, self.ng[:, None], self.Sg[:, None, :], self.Qg[:, None], self.P)
 
     def total_loss(self):
-        return float(self.cost.sum())
+        return float((self.cost.sum(1) * self.group_w).sum())
 
     def labels(self, x, codes):
         """Class for each image x [n, P] with code [n, t]: the class whose total loss rises least if the image
@@ -149,7 +155,7 @@ class AnchorPartition:
 
 def node_costs(anchor_table, anchor_img, anchor_ids, anchor_p, ref_table, ref_img, ref_ids, ref_p, ref_w,
                anchor_ref, min_weight=1e-5):
-    """Exact decompression objective at this position, per anchor.
+    """Exact marginal decompression loss at this position: each anchor's term.
 
     For an anchor with prefix z, the posterior over references for prefix (z, t) weights each reference
     entry by ref_w * 1[its prefix is z] * ref_p[t]. The anchor's expected distance is

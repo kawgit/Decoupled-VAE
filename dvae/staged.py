@@ -67,7 +67,7 @@ class StageNet(nn.Module):
 
 
 class SelectorNet(nn.Module):
-    """Predicts, from the prefix z alone, the new token's decompression loss under each of n_heads partitions.
+    """Predicts, from the prefix z alone, an image's marginal decompression loss under each of n_heads partitions.
 
     The encoder uses the partition with the lowest prediction, so every image with the same prefix uses the
     same partition and the new token means the same thing for all of them.

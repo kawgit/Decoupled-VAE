@@ -1,24 +1,27 @@
 """Stage 1: build the staged encoder (dvae/staged.py) one code position at a time.
 
 For each position k (prefix length t = k-1):
-  1. Partitions. Sample P anchor images and R reference images, each with one out-of-fold code (from the
-     positions built so far, on images they weren't trained on). For every anchor, build a partition of
-     the references with Hartigan's method on the second-definition decompression loss, with each
-     reference's code truncated against the anchor's (dvae/partition.py). Each partition labels any
-     (image, code) by the class whose loss rises least if the image joins it.
+  1. Partitions. Sample P anchor images, each with one out-of-fold code (from the positions built so far,
+     on images they weren't trained on). Every anchor gets R reference draws, split evenly over its t+1
+     groups by the length of the prefix a code shares with the anchor's: each image is drawn in proportion
+     to its exact out-of-fold probability of landing in the group, and each draw weighs the group's mass
+     over its draws. For every anchor, build a partition of its references with Hartigan's method on the
+     partition's implied marginal decompression loss, with each reference's code truncated against the
+     anchor's (dvae/partition.py). Each partition labels any (image, code) by the class whose loss rises
+     least if the image joins it.
   2. Encoders. Train num_folds + 1 StageNets with one head per partition, by cross-entropy against the
      partitions' labels: fold model f on the training images outside fold f, the final model on all of
      them. Each minibatch draws one fresh out-of-fold code per image (memoized). All copies share the
      epoch count, chosen by the pooled held-out cross-entropy.
-  3. Costs. For every training image, with its held-out encoder, the new token's decompression loss
-     under each partition (exact, all training images as references).
+  3. Costs. For every training image, with its held-out encoder, its term of the marginal decompression
+     loss under each partition (exact, all training images as references).
   4. Selectors. Train num_folds + 1 SelectorNets to predict those costs from the code alone (MSE), with
-     the same fold split and shared epochs, early-stopped on the held-out decompression loss of the fold
-     copies' choices (the cost of the partition each picks, pooled over images). Afterwards
-     every copy uses the final selector, so each token means the same thing in every copy. The encoder
-     uses the partition with the lowest predicted cost.
-  5. Report the new token's loss on the val split: per the selector's choices, for the single best
-     partition, and with no code.
+     the same fold split and shared epochs, early-stopped on the held-out marginal decompression loss of
+     the fold copies' choices (the cost of the partition each picks, pooled over images). Afterwards every
+     copy uses the final selector, so each token means the same thing in every copy. The encoder uses the
+     partition with the lowest predicted cost.
+  5. Report the marginal decompression loss on the val split: per the selector's choices, for the single
+     best partition, and with no code.
 
 Saves the encoder after every position (--out, usable by the decoder/prior/QA scripts) and the full build
 state (--state, every fold model) so --resume can continue with the next position.
@@ -157,6 +160,23 @@ class CodeSampler:
         return torch.cat(out)
 
     @torch.no_grad()
+    def stage_probs(self, t, prefixes):
+        """Position t's next-token distributions [n, N, V] of every training image (out-of-fold models) after
+        each of the prefixes [n, t]. Each image's features are computed once and shared by all the prefixes."""
+        encoders, selectors = self.positions[t]
+        device = self.images.device
+        out = torch.empty(len(prefixes), len(self.images), self.V, device=device)
+        for m in range(self.n_folds):
+            rows = (self.fold_of == m).nonzero().squeeze(1).to(device)
+            heads = selectors[m].choose(prefixes).tolist()
+            for i in range(0, len(rows), FORWARD_CHUNK):
+                r = rows[i:i + FORWARD_CHUNK]
+                feats = encoders[m].features(self.images[r])
+                for j, head in enumerate(heads):
+                    out[j, r] = encoders[m].logits(feats, prefixes[j:j + 1])[:, head].softmax(-1)
+        return out
+
+    @torch.no_grad()
     def sample_final(self, x, depth, generator):
         """Codes [N, depth] for other images, through the final models."""
         prefix = torch.zeros(len(x), 0, dtype=torch.long, device=x.device)
@@ -167,6 +187,52 @@ class CodeSampler:
         return prefix
 
 
+@torch.no_grad()
+def draw_references(sampler, anchor_codes, R, generator, progress):
+    """Reference draws for every anchor, split evenly over its t+1 truncated groups by shared prefix length.
+
+    Group s < t holds the codes that share exactly s tokens with the anchor; group t holds the full match.
+    An image's mass in group s is its exact out-of-fold probability of landing there,
+    q(a[:s] | y) * (1 - q(a_s | y, a[:s])), so each group gets R/(t+1) draws however small its mass. Images
+    are drawn with replacement in proportion to their mass, a mismatch group's token at position s among the
+    non-anchor tokens in proportion to q, and every draw weighs (group mass) / (draws in the group).
+    Returns, per anchor, (image indices, codes [n, t], weights), and the group masses [P, t+1].
+    """
+    P, t = anchor_codes.shape
+    device, N = sampler.images.device, len(sampler.images)
+    reach = torch.ones(P, N, device=device)  # q(a[:u] | y): the probability of following the anchor so far
+    masses = torch.zeros(P, t + 1)
+    refs: list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = [[] for _ in range(P)]
+    for u in range(t + 1):
+        n_draws = R // (t + 1) + (u < R % (t + 1))
+        if u < t:
+            progress(f"  group probabilities at prefix length {u}/{t}")
+            prefixes = anchor_codes[:, :u].cpu()
+            if u == 0:
+                uniq, inv = prefixes[:1], torch.zeros(P, dtype=torch.long)
+            else:
+                uniq, inv = torch.unique(prefixes, dim=0, return_inverse=True)
+            probs = sampler.stage_probs(u, uniq.to(device))  # [n_unique, N, V]
+        for a in range(P):
+            if u < t:
+                other = probs[inv[a]].clone()
+                other[:, anchor_codes[a, u]] = 0.0  # leaving the anchor's path at position u
+                mass = reach[a] * other.sum(1)
+            else:
+                other, mass = None, reach[a]
+            masses[a, u] = mass.sum().item()
+            if masses[a, u] > 0:
+                idx = torch.multinomial(mass.cpu(), n_draws, replacement=True, generator=generator).to(device)
+                codes = anchor_codes[a].expand(n_draws, t).clone()
+                if other is not None:
+                    codes[:, u] = torch.multinomial(other[idx].cpu(), 1, generator=generator).squeeze(1).to(device)
+                refs[a].append((idx, codes, torch.full((n_draws,), masses[a, u].item() / n_draws, device=device)))
+            if u < t:
+                reach[a] *= probs[inv[a], :, anchor_codes[a, u]]
+    out = [tuple(torch.cat(parts) for parts in zip(*r)) for r in refs]
+    return out, masses
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common_args(p)
@@ -174,7 +240,8 @@ def main():
     p.add_argument("--k-max", type=int, default=10)
     p.add_argument("--folds", type=int, default=8)
     p.add_argument("--anchors", type=int, default=32, help="P: anchor images, one partition each")
-    p.add_argument("--references", type=int, default=8192, help="R: reference images the partitions are built on")
+    p.add_argument("--references", type=int, default=8192,
+                   help="R: reference draws per anchor, split evenly over its truncated groups")
     p.add_argument("--hartigan-rounds", type=int, default=200, help="cap on batched Hartigan move rounds per partition")
     p.add_argument("--width", type=int, default=128)
     p.add_argument("--batch-size", type=int, default=256)
@@ -204,9 +271,9 @@ def main():
     mean = X.flatten(1).mean(0)
     Xc, Xvc = X.flatten(1) - mean, Xv.flatten(1) - mean  # centered pixels, for the objective's precision
     N, Nv, V, Fo, P = len(X), len(Xv), args.vocab_size, args.folds, args.anchors
-    R = min(args.references, N)
+    R = args.references
     log(f"device {device}, {N} training images in {Fo} folds, {Nv} val images, V={V}, k_max={args.k_max}, "
-        f"{P} anchors, {R} references")
+        f"{P} anchors, {R} reference draws per anchor")
 
     state: dict[str, Any] = {"args": vars(args), "stages": [], "history": []}
     if args.resume:
@@ -249,20 +316,23 @@ def main():
             tick = Ticker(args.log_interval)
 
             # 1. anchor partitions
-            with timed(f"sampling {P} anchors and {R} references with out-of-fold codes"):
+            with timed(f"sampling {P} anchors with out-of-fold codes"):
                 anchor_idx = torch.randperm(N, generator=gen)[:P].to(device)
-                ref_idx = torch.randperm(N, generator=gen)[:R].to(device)
                 anchor_codes = sampler.sample_train(anchor_idx, t, gen)
-                ref_codes = sampler.sample_train(ref_idx, t, gen)
-            with timed(f"building {P} anchor partitions (Hartigan on {R} references)"):
+            with timed(f"drawing {R} references per anchor, evenly over its {t + 1} groups by shared prefix length"):
+                refs, masses = draw_references(sampler, anchor_codes, R, gen, tick)
+            log("group masses in images (mean over anchors, shared prefix length 0.." + f"{t}, last = full match): "
+                + " ".join(f"{m:.1f}" for m in masses.mean(0).tolist()))
+            with timed(f"building {P} anchor partitions (Hartigan on {R} references each)"):
                 parts = []
-                for a in range(P):
+                for a, (ref_idx, ref_codes, ref_w) in enumerate(refs):
                     tick(f"  partition {a + 1}/{P}")
-                    parts.append(AnchorPartition(anchor_codes[a], Xc[ref_idx], ref_codes, V, gen, args.hartigan_rounds))
-            losses_per_ref = [pt.total_loss() / R for pt in parts]
+                    parts.append(AnchorPartition(anchor_codes[a], Xc[ref_idx], ref_codes, V, gen, args.hartigan_rounds,
+                                                 ref_w))
+            losses = [pt.total_loss() / masses[a].sum().item() for a, pt in enumerate(parts)]
             log(f"partitions: {sum(len(pt.table.nodes) for pt in parts) / P:.1f} groups on average, "
-                f"{sum(pt.rounds for pt in parts) / P:.1f} Hartigan rounds on average, loss per reference "
-                f"{min(losses_per_ref):.5f}..{max(losses_per_ref):.5f}")
+                f"{sum(pt.rounds for pt in parts) / P:.1f} Hartigan rounds on average, estimated loss per image "
+                f"{min(losses):.5f}..{max(losses):.5f}")
 
             def targets(idx, codes):
                 return torch.stack([pt.labels(Xc[idx], codes) for pt in parts], 1)
@@ -314,8 +384,9 @@ def main():
                 m.eval()
             encoder_epochs = best["epoch"]
 
-            # 3. held-out decompression loss of every training image under every partition
-            with torch.no_grad(), timed(f"held-out decompression loss of every training image under each of {P} partitions"):
+            # 3. held-out marginal decompression loss of every training image under every partition
+            with torch.no_grad(), timed(f"held-out marginal decompression loss of every training image under each of {P} "
+                                        "partitions"):
                 q = torch.empty(N, P, V, device=device)
                 for f in range(Fo):
                     q[held_out[f]] = forward_chunked(encoders[f], X[held_out[f]], eval_codes[held_out[f]]).softmax(-1)
