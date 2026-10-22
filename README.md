@@ -312,6 +312,7 @@ python train_decoder.py --likelihood binary              # -> checkpoints/decode
 python train_prior.py                                    # -> checkpoints/prior.pt
 python qa_generate.py -n 64                              # -> outputs/generate.png
 python qa_compress.py -n 16 -k 1 2 4 10 -m 8             # -> outputs/compress/k01.png ...
+python qa_compress_analytically.py -n 16 -m 8            # -> outputs/compress_analytically/k01.png ...
 python benchmark.py --decoder checkpoints/decoder_gray.pt checkpoints/decoder_binary.pt \
                     --encoder checkpoints/encoder.pt     # -> results/benchmark.{json,md}
 python analyze_encoder.py --encoder checkpoints/encoder.pt # -> results/usage_encoder.json
@@ -334,6 +335,9 @@ python analyze_encoder.py --encoder checkpoints/encoder.pt # -> results/usage_en
   - `topp`: nucleus sampling, with `--*-top-p`.
 - **Compression QA:** `qa_compress.py` encodes greedily by default. Each output row is the original
   image followed by `m` decodings, each with the rest of the code filled in by the prior.
+  `qa_compress_analytically.py` needs only the encoder: it decompresses by drawing `m` training images
+  from the ideal decoder's posterior $\pi(y \mid z_{1:k}) \propto q(z_{1:k} \mid y)$ (`--posterior-mode`
+  picks the $q$ used), and reports how many training images the posterior spreads over.
 - **Benchmark:** `benchmark.py` scores each decoder on the data it was trained for: 8-bit MNIST, or
   the test set binarized with a fixed seed. It reports exact NLL, plus −ELBO and rate when you pass
   `--encoder`.
