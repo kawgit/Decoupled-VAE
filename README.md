@@ -120,7 +120,7 @@ At position $k$ (prefix length $t = k - 1$):
 
 Every step logs when it starts, its progress and its duration.
 
-## Encoder training in pseudo-code
+## Encoder training
 
 **Notation** (on top of the objective's).
 - Training images $x_1, \dots, x_N$, each in one of $F$ (`--folds`) folds, $f(i) \in \{1, \dots, F\}$.
@@ -131,6 +131,87 @@ Every step logs when it starts, its progress and its duration.
   $h$'s head) and selector copies $\sigma_k^m(z) \in \mathbb{R}^P$ (predicted loss per partition). Once
   position $k$ is built, every copy codes with the final selector $\sigma_k^\star$.
 - $\mathrm{CE}(\text{logits}, c)$ is cross-entropy against class $c$.
+
+**Truncation against an anchor.** For an anchor code $a$ and a code $z$ (both of length $t$), let
+$s(z, a)$ be the length of their shared prefix. Truncation keeps one token past it:
+
+```math
+\hat z_a \;=\; \tau_a(z) \;=\; z_{1 : \min(s(z, a) + 1,\; t)} .
+```
+
+Two versions follow: a concise one in equations, and the detailed pseudo-code the code follows.
+
+### In equations
+
+At position $k$ (prefix length $t = k-1$), positions $1, \dots, t$ are built. Copy $m$ of the encoder so
+far, $q^m$, uses copy $m$'s encoder nets and the shared final selectors:
+
+```math
+q^m(z_u \mid x, z_{1:u-1}) \;=\; \mathrm{softmax}\big(e_u^m(x, z_{1:u-1})_{\,\eta_u(z_{1:u-1})}\big),
+\qquad
+\eta_u(z) \;=\; \arg\min_h \sigma_u^\star(z)_h .
+```
+
+A training image's out-of-fold code is $z \sim q^{f(i)}(\cdot \mid x_i)$. Each position fixes one,
+$\bar z_i$, per image, giving the dataset $\bar D = \{(x_i, \bar z_i, \tfrac{1}{N})\}$. Write
+$\operatorname{fit}_\theta\, A \,\|\, B$ for training $\theta$ on loss $A$ by minibatch steps and keeping the
+epoch with the lowest held-out score $B$, with one epoch count shared by all $F+1$ copies.
+
+**1. Partitions.** For each $h$, draw a training image $\alpha_h$ and its anchor code
+$a^h \sim q^{f(\alpha_h)}(\cdot \mid x_{\alpha_h})$. Then
+
+```math
+\lambda_h \;=\; \operatorname{Hartigan}_\lambda\; M\big(D^h, q_\lambda\big),
+\qquad
+D^h \;=\; \bigcup_{s=0}^{t} \Big\{\big(y_j,\, \tau_{a^h}(z_j),\, \tfrac{\rho_s}{R/(t+1)}\big)\Big\}_{j=1}^{R/(t+1)},
+\qquad
+(y_j, z_j) \sim \mathrm{U}(y)\, q^{f(y)}(z \mid y) \;\big|\; s(z, a^h) = s,
+```
+
+drawn per stratum $s$ (codes sharing exactly $s$ tokens with $a^h$), where
+$\rho_s = \mathbb{E}_y\, q^{f(y)}\big(s(z, a^h) = s \mid y\big)$ is the stratum's probability, so the
+weights sum to 1.
+$\operatorname{Hartigan}_\lambda$ is a local minimum over class assignments $\lambda$ of $D^h$, found by
+Hartigan's method from a random start. A partition labels any $(x, z)$ by the class whose implied loss
+rises least when $(x, \tau_{a^h}(z))$ joins $D^h$ as one more draw with that class (the first class if
+no draw shares $\tau_{a^h}(z)$):
+
+```math
+\lambda_h(x, z) \;=\; \arg\min_c \; M\big(D^h + (x, \tau_{a^h}(z)),\; q_{\lambda_h + c}\big).
+```
+
+**2. Encoders**, one head per partition:
+
+```math
+e_k^m \;=\; \operatorname{fit}_e\;
+  \mathbb{E}_{i : f(i) \ne m}\; \mathbb{E}_{z \sim q^{f(i)}(\cdot \mid x_i)}\; \mathbb{E}_h\, \mathrm{CE}\big(e(x_i, z)_h,\, \lambda_h(x_i, z)\big)
+\;\big\|\;
+  \mathbb{E}_i\, \mathbb{E}_h\, \mathrm{CE}\big(e_k^{f(i)}(x_i, \bar z_i)_h,\, \lambda_h(x_i, \bar z_i)\big).
+```
+
+**3. Costs**: each image's held-out term under each head,
+
+```math
+C_{ih} \;=\; \ell_i \text{ of } M\big(\bar D, q^{(h)}\big),
+\qquad
+q^{(h)}(c \mid x_i, \bar z_i) \;=\; \mathrm{softmax}\big(e_k^{f(i)}(x_i, \bar z_i)_h\big)_c .
+```
+
+**4. Selectors**, scored by the held-out loss of their choices, then shared:
+
+```math
+\sigma_k^m \;=\; \operatorname{fit}_\sigma\;
+  \mathbb{E}_{i : f(i) \ne m}\; \mathbb{E}_h\, \big(\sigma(\bar z_i)_h - C_{ih}\big)^2
+\;\big\|\;
+  \mathbb{E}_i\, C_{i,\, \arg\min_h \sigma_k^{f(i)}(\bar z_i)_h},
+\qquad
+\sigma_k^m \leftarrow \sigma_k^\star \;\; \text{for all } m .
+```
+
+**5. Position $k$** of the encoder is $q_k(c \mid x, z) = \mathrm{softmax}\big(e_k^\star(x, z)_{\,\eta_k(z)}\big)_c$;
+the fold copies $e_k^m$ are kept for out-of-fold codes at later positions.
+
+### In pseudo-code
 
 **Codes.** A code through the first $t$ positions, using copy $m$:
 
@@ -162,13 +243,6 @@ over all images, from per-code sums of weights, pixels and squared norms.
 **A partition's implied marginal decompression loss.** For a partition with classes $c_j$, it is
 $\mathbb{E}_{j \sim w}\, \ell_j$ with $q_j = \mathrm{onehot}(c_j)$, the one-hot distribution on $c_j$: the
 loss of an encoder that reproduces (image, code + class) exactly.
-
-**Truncation against an anchor.** For an anchor code $a$ and a code $z$ (both of length $t$), let
-$s(z, a)$ be the length of their shared prefix. The truncated code $\hat z_a$ keeps one token past it:
-
-```math
-\hat z_a \;=\; z_{1 : \min(s(z, a) + 1,\; t)} .
-```
 
 **All positions.**
 
