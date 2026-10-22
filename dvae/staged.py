@@ -145,11 +145,12 @@ class StagedEncoder(nn.Module):
             codes = torch.cat([codes, nxt], 1)
         return codes
 
-    def prefix_logprobs(self, x, mode="actual", top_p=0.9, chunk=65536):
-        """Enumerate the code tree: entry t is [N, V**t], the log-prob of every length-t prefix."""
+    def prefix_logprobs(self, x, mode="actual", top_p=0.9, chunk=65536, depth=None):
+        """Enumerate the code tree: entry t is [N, V**t], the log-prob of every length-t prefix, for t up to
+        depth (default k_max)."""
         N = x.shape[0]
         out = [torch.zeros(N, 1, device=x.device)]
-        for t, net in enumerate(self.stage_nets):
+        for t, net in enumerate(self.stage_nets[:depth]):
             width = self.V**t
             feats = net.features(x)  # computed once per image, reused for every prefix
             prefixes = all_prefixes(t, self.V, x.device)

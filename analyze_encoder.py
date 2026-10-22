@@ -1,6 +1,7 @@
 """How much of the latent space does an encoder use?
 
-Computed exactly over a data split by enumerating the code tree. For every prefix length k:
+Computed exactly over a data split by enumerating the code tree, for every prefix length k up to k_max or the
+deepest whose V**k codes can be enumerated:
 
   capacity     k * log2(V) bits: what the first k tokens could hold
   H[q̄]         entropy of the aggregate posterior q̄(z_1:k) = E_x q(z_1:k|x): bits the code space spreads over
@@ -42,21 +43,26 @@ def main():
     device = get_device(args.device)
     encoder, _ = load_checkpoint(args.encoder, "encoder", device)
     V, k_max = encoder.config["vocab_size"], encoder.config["k_max"]
-    if V**k_max > MAX_CODES:
-        raise SystemExit(f"{V}**{k_max} codes is too many to enumerate exactly")
+    depth = max((t for t in range(1, k_max + 1) if V**t <= MAX_CODES), default=0)
+    if depth == 0:
+        raise SystemExit(f"{V} codes per token is too many to enumerate exactly")
+    if depth < k_max:
+        print(f"note: {V}**{depth + 1} codes is too many to enumerate exactly, so only prefixes up to "
+              f"k={depth} of {k_max} are analyzed")
     images = load_mnist(args.split, args.data_root, device)
     labels = load_labels(args.split, args.data_root, device)
     N, n_labels = len(images), 10
 
-    widths = [V**t for t in range(k_max + 1)]
+    widths = [V**t for t in range(depth + 1)]
     agg = [torch.zeros(w, device=device) for w in widths]
     agg_by_label = [torch.zeros(n_labels, w, device=device) for w in widths]
-    cond_entropy = torch.zeros(k_max + 1, device=device)
+    cond_entropy = torch.zeros(depth + 1, device=device)
     used = [torch.zeros(w, dtype=torch.bool, device=device) for w in widths]
     with torch.no_grad():
         for idx in batches(N, args.batch_size, False, device, drop_last=False):
-            tree = encoder.prefix_logprobs(to_float(images[idx]), args.encoder_mode, args.encoder_top_p)
-            for t in range(1, k_max + 1):
+            tree = encoder.prefix_logprobs(to_float(images[idx]), args.encoder_mode, args.encoder_top_p,
+                                           depth=depth)
+            for t in range(1, depth + 1):
                 q = tree[t].exp()  # [n, V**t]
                 agg[t] += q.sum(0)
                 agg_by_label[t].index_add_(0, labels[idx], q)
@@ -66,7 +72,7 @@ def main():
     label_counts = torch.bincount(labels, minlength=n_labels).float()
     p_label = label_counts / N
     rows, prev_info = [], 0.0
-    for t in range(1, k_max + 1):
+    for t in range(1, depth + 1):
         h_agg = entropy_bits(agg[t] / N).item()
         h_cond = (cond_entropy[t] / N).item()
         info = h_agg - h_cond
@@ -79,7 +85,8 @@ def main():
         prev_info = info
 
     label_entropy = entropy_bits(p_label).item()
-    print(f"{args.encoder}: V={V}, k_max={k_max}, {args.split} split ({N} images), encoder mode {args.encoder_mode}")
+    print(f"{args.encoder}: V={V}, k_max={k_max} (analyzed to k={depth}), {args.split} split ({N} images), "
+          f"encoder mode {args.encoder_mode}")
     header = f"{'k':>3} {'capacity':>8} {'H[q̄]':>7} {'H[q|x]':>7} {'I(x;z)':>7} {'used':>6} {'+I':>6} {'codes':>13} {'eff':>8} {'I(y;z)':>7}"
     print(header)
     print("-" * len(header))
@@ -94,7 +101,8 @@ def main():
     out = args.out or os.path.join("results", f"usage_{os.path.splitext(os.path.basename(args.encoder))[0]}.json")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w") as f:
-        json.dump({"encoder": args.encoder, "vocab_size": V, "k_max": k_max, "split": args.split, "num_images": N,
+        json.dump({"encoder": args.encoder, "vocab_size": V, "k_max": k_max, "analyzed_depth": depth,
+                   "split": args.split, "num_images": N,
                    "encoder_mode": args.encoder_mode, "label_entropy_bits": label_entropy, "per_k": rows}, f, indent=2)
     print(f"wrote {out}")
 
