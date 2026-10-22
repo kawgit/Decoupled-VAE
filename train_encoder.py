@@ -30,6 +30,7 @@ state (--state, every fold model) so --resume can continue with the next positio
 import argparse
 import copy
 import math
+import os
 import time
 from contextlib import contextmanager
 from typing import Any
@@ -296,7 +297,9 @@ def main():
         f"{P} anchors, {R} reference draws per anchor")
 
     state: dict[str, Any] = {"args": vars(args), "stages": [], "history": []}
-    if args.resume:
+    if args.resume and not os.path.exists(args.state):
+        log(f"--resume: no build state at {args.state} (no position was finished), so starting from position 1")
+    if args.resume and os.path.exists(args.state):
         state = torch.load(args.state, map_location="cpu", weights_only=False)
         fold_of = state["fold_of"]
         log(f"resuming from {args.state}: {len(state['stages'])} positions built")
@@ -511,7 +514,10 @@ def main():
                     net.load_state_dict(s)
                 save_checkpoint(args.out, "encoder", encoder, args=vars(args), history=state["history"])
     except KeyboardInterrupt:
-        log(f"interrupted; {len(state['stages'])} completed positions are in {args.state} (continue with --resume)")
+        if state["stages"]:
+            log(f"interrupted; {len(state['stages'])} completed positions are in {args.state} (continue with --resume)")
+        else:
+            log("interrupted before any position finished; nothing was saved (start again without --resume)")
 
 
 if __name__ == "__main__":
