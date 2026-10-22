@@ -19,41 +19,43 @@ F_k(x, z) = E_{y~p(y|z_{1:k})} d(x, y),     p(y | z_{1:k}) ∝ q(z_{1:k} | y) p_
 ## How the encoder is built
 
 On this branch the encoder isn't trained by descending L directly. That objective is non-convex in the
-encoder's outputs, much like k-means. Instead `train_encoder.py` builds the code one token at a time,
-and at each position it *chooses* a partition and trains a classifier to reproduce it:
+encoder's outputs, much like k-means. Instead `train_encoder.py` builds the code one token at a time. At
+each position it constructs candidate partitions, trains the encoder to reproduce all of them, and
+learns which one to use for each code.
 
-1. **Prefixes.** For each training image, draw `--prefix-samples` (S, default 4) *distinct* prefixes
-   z₁..z_t without replacement from its out-of-fold encoder distribution, i.e. using the models of
-   earlier positions on images they weren't trained on. The method is stochastic beam search. Each
-   prefix gets an importance weight q(z)/π(z), so weighted sums estimate sums over the image's whole
-   prefix distribution, and are exact once S covers every prefix. Cost is fixed per image, whatever
-   the code-space or dataset size.
-2. **Candidates** (`dvae/partition.py`).
-   - **Generation:** draw `--num-candidates` (default 64) candidates. Each picks a sharing level m
-     uniformly from 0..t, groups the prefixes by their first m tokens, and fits one weighted V-means
-     codebook per group to the residuals (image minus its full prefix group's mean). m = t gives every
-     prefix its own codebook, and m = 0 gives one codebook for all. Repeated m values act as restarts.
-   - **Labels:** an image's label is its residual's nearest codeword. Codewords are labelled by rank
-     along one shared direction (`--labels aligned`), a pixel-space heuristic; `--labels random`
-     shuffles them per group instead.
-   - **Pruning:** every candidate is scored by its exact in-sample objective at this position, on
-     training images only. Near-duplicates (weighted per-prefix ARI > `--dedup-ari`) are dropped in
-     favour of the better-scoring one, and the best `--keep-candidates` (default 32) are kept.
-3. **Training.** Train `--folds` + 1 copies of a `StageNet` with one head per kept candidate, by
-   cross-entropy: fold model f on the images outside fold f, and a final model on all of them.
-   Each batch draws one prefix per image from the out-of-fold models (a fresh draw every epoch), so each position learns from the
-   mistakes earlier positions really make on unseen images. Those next-token distributions are
-   memoized (`--memo-cap`), since earlier positions are frozen.
-4. **Scoring and selection.** After every epoch, every head is scored on each fold's held-out images
-   with the decompression objective, over its weighted prefix entries. The score is exact, with all
-   training entries as references, from per-prefix sums. The best head is picked *per prefix*, and the epoch with the best total is
-   kept. The fold models and the final model share that epoch count and that selection.
-5. **The stage.** The final model plus its per-prefix head selector becomes this position. The log
-   reports its honest score on the separate val split (S distinct prefixes per val image, through the
-   final models), for the per-prefix selection and for the single best head.
+**Second definition of decompression loss.** For a partition of a weighted set of (image, code) pairs into
+V classes, this is the (first-definition) loss of the new token for an encoder that exactly reproduces
+(image, code + class).
 
-The ground truth for every choice is the decompression objective of a trained model on held-out images.
-Pixel-space criteria (k-means fit, alignment) only generate the candidates.
+At position k (prefix length t = k−1):
+
+1. **Partitions** (`dvae/partition.py`):
+   - Sample `--anchors` P anchor images and `--references` R reference images, each with one
+     out-of-fold code.
+   - For every anchor, truncate each reference's code to s+1 tokens, where s is the length of the
+     prefix it shares with the anchor's code (the whole code when it matches). References are
+     thereby grouped finely around the anchor's code and more coarsely further from it.
+   - Within each group, Hartigan's method (from a random start, with batched moves that are kept only
+     if the total drops) assigns references to V classes, strictly lowering the second-definition loss
+     until no single move helps.
+   - A partition labels any image with the class whose loss rises least if the image joins it.
+     Codes whose group has no references get class 0.
+2. **Encoders.**
+   - Train `--folds` + 1 `StageNet`s with one head per partition, by cross-entropy against the
+     partitions' labels: fold model f on the training images outside fold f, and a final model on
+     all of them.
+   - Each minibatch draws one fresh out-of-fold code per image (memoized, `--memo-cap`), so each
+     position learns from the mistakes earlier positions really make on unseen images.
+   - All copies share the epoch count, chosen by the pooled held-out cross-entropy.
+3. **Costs.** For every training image, with its held-out encoder, the new token's decompression loss
+   under each partition. It's exact, with all training images as references.
+4. **Selectors.** Train `--folds` + 1 `SelectorNet`s to predict those costs from the code alone (MSE),
+   with the same fold split, early-stopped on held-out MSE. The encoder uses the partition with the
+   lowest predicted cost, so the new token means the same thing for every image with the same code.
+5. **Report.** The new token's loss on the val split: with the selector's choices, with the single
+   best partition, and with no code.
+
+Every step logs when it starts, its progress and its duration.
 
 ## Setup
 
@@ -103,9 +105,9 @@ python analyze_encoder.py --encoder checkpoints/encoder.pt # -> results/usage_en
 ## Layout
 
 ```
-train_encoder.py    builds the staged encoder (folds, multi-head training, per-prefix head selection)
-dvae/staged.py      StageNet (one per position) and StagedEncoder (sample, log_prob, tree enumeration)
-dvae/partition.py   weighted prefix entries, candidate codebooks, pruning/dedup, exact per-prefix objective
+train_encoder.py    builds the staged encoder (anchor partitions, folded encoders and selectors)
+dvae/staged.py      StageNet and SelectorNet (one each per position), StagedEncoder (sample, log_prob, tree)
+dvae/partition.py   anchor partitions (truncated codes, Hartigan, label rule), exact per-prefix objective
 dvae/models.py      Prior, Decoder; tree enumeration of all code prefixes
 dvae/data.py        MNIST tensors, train/val split, labels, binarization
 dvae/common.py      device, checkpoints, CLI flags, early-stopping loop

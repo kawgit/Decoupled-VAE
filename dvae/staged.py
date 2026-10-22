@@ -1,8 +1,8 @@
 """The staged encoder: one network per code position.
 
 Stage t (t = 0 .. k_max-1) predicts token z_{t+1} from the image and the prefix z_1..z_t. Each stage has
-several output heads, one per candidate partition it was trained on, and a selector that picks a head
-per prefix (falling back to a default head for prefixes it never saw). Built by train_encoder.py.
+several output heads, one per candidate partition it was trained on, and a selector network that picks a
+head from the prefix alone. Built by train_encoder.py.
 
 Codes are indexed as base-V numbers with z_1 most significant, so node j at depth t has children
 j*V .. j*V+V-1 at depth t+1.
@@ -66,28 +66,38 @@ class StageNet(nn.Module):
         return self.logits(self.features(x), prefix)
 
 
-class Selector:
-    """Maps prefix node ids to a head index; unseen prefixes get the default head."""
+class SelectorNet(nn.Module):
+    """Predicts, from the prefix z alone, the new token's decompression loss under each of n_heads partitions.
 
-    def __init__(self, nodes, heads, default):
-        order = torch.as_tensor(nodes, dtype=torch.long).argsort()
-        self.nodes = torch.as_tensor(nodes, dtype=torch.long)[order]
-        self.heads = torch.as_tensor(heads, dtype=torch.long)[order]
-        self.default = int(default)
+    The encoder uses the partition with the lowest prediction, so every image with the same prefix uses the
+    same partition and the new token means the same thing for all of them.
+    """
 
-    def __call__(self, ids):
-        if len(self.nodes) == 0:
-            return torch.full_like(ids, self.default)
-        nodes, heads = self.nodes.to(ids.device), self.heads.to(ids.device)
-        pos = torch.searchsorted(nodes, ids).clamp_max(len(nodes) - 1)
-        return torch.where(nodes[pos] == ids, heads[pos], torch.full_like(ids, self.default))
+    def __init__(self, vocab_size, depth, n_heads, width=128):
+        super().__init__()
+        self.depth = depth
+        slots = max(depth, 1)  # depth 0: a constant input, so the prediction is one learned vector
+        self.emb = nn.Embedding(vocab_size, width)
+        self.pos = nn.Parameter(torch.randn(slots, width) * 0.02)
+        self.mlp = nn.Sequential(nn.Linear(slots * width, width), nn.GELU(), nn.Linear(width, width), nn.GELU())
+        self.out = nn.Linear(width, n_heads)
+
+    def forward(self, prefix):
+        """prefix [N, depth] -> predicted loss per partition [N, n_heads]."""
+        if self.depth == 0:
+            e = self.pos.flatten().expand(prefix.shape[0], -1)
+        else:
+            e = (self.emb(prefix) + self.pos).flatten(1)
+        return self.out(self.mlp(e))
+
+    def choose(self, prefix):
+        return self(prefix).argmin(-1)
 
 
 class StagedEncoder(nn.Module):
-    """q(z|x) as a chain of StageNets with per-prefix head selection. Same interface the other scripts use.
+    """q(z|x) as a chain of StageNets, each with a SelectorNet choosing its head from the prefix.
 
-    stages: one dict per position with n_heads, width, sel_nodes, sel_heads, default_head (and, for
-    reference, the candidate names its heads were trained on).
+    stages: one dict per position with n_heads, width, selector_width. Same interface the other scripts use.
     """
 
     def __init__(self, vocab_size=2, k_max=0, stages=()):
@@ -97,7 +107,8 @@ class StagedEncoder(nn.Module):
         self.config = dict(vocab_size=vocab_size, k_max=k_max, stages=stages)
         self.V = vocab_size
         self.nets = nn.ModuleList(StageNet(vocab_size, t, s["n_heads"], s["width"]) for t, s in enumerate(stages))
-        self.selectors = [Selector(s["sel_nodes"], s["sel_heads"], s["default_head"]) for s in stages]
+        self.selectors = nn.ModuleList(SelectorNet(vocab_size, t, s["n_heads"], s["selector_width"])
+                                       for t, s in enumerate(stages))
 
     @property
     def k_max(self):
@@ -107,10 +118,14 @@ class StagedEncoder(nn.Module):
     def stage_nets(self) -> list[StageNet]:
         return cast(list[StageNet], list(self.nets))
 
+    @property
+    def selector_nets(self) -> list[SelectorNet]:
+        return cast(list[SelectorNet], list(self.selectors))
+
     def stage_logits(self, t, features, prefix):
         """Selected-head logits for position t: [N, V]."""
         logits = self.stage_nets[t].logits(features, prefix)
-        head = self.selectors[t](node_ids(prefix, self.V))
+        head = self.selector_nets[t].choose(prefix)
         return logits[torch.arange(len(logits), device=logits.device), head]
 
     def log_prob(self, x, codes, mode="actual", top_p=0.9):

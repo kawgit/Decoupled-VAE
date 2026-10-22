@@ -1,35 +1,33 @@
-"""Candidate partitions for one code position, pruning, deduplication, and the decompression objective
-evaluated exactly per prefix.
+"""Anchor partitions for one code position, and the decompression objective evaluated exactly per prefix.
 
-Prefix data comes as weighted entries: each image appears with up to S distinct prefixes, sampled without
-replacement from its prefix distribution, each with an importance weight. Weighted sums over an image's
-entries estimate sums over its whole prefix distribution (exactly, once S covers every prefix).
+Decompression loss, second definition: for a partition of a set of (image, code) pairs into V classes, the
+(first-definition) loss of the new token for an encoder that exactly reproduces (image, code + class): each
+image's expected squared distance to the other images with the same code and class.
 
-A candidate for position t+1 (prefix length t) has a sharing level m in 0..t. Entries are grouped by the
-first m tokens of their prefix, and each group gets one V-means codebook, fit with the entries' weights to
-their residuals (image minus the weighted mean of its full prefix group). An image's label is the nearest
-codeword to its residual in its group's codebook. m = t gives every prefix its own codebook; m = 0 gives
-one codebook for all prefixes.
+For anchor image a with code z_a, every reference's code is truncated to s+1 tokens, where s is the length
+of the prefix it shares with z_a (the whole code when it matches z_a entirely). References are thereby
+grouped finely around the anchor's own code and ever more coarsely further from it. Within each group,
+Hartigan's method assigns references to V classes to minimise the second-definition loss: moves are taken
+only when they lower it, so it decreases strictly until no single move helps. Moves are applied in batches
+for speed, halving a batch until the total loss drops (a single best move always does).
 
-Codewords are labelled by rank along one shared direction (the top principal direction of the residuals),
-so token v means roughly the same thing in every group ("aligned"); "random" shuffles the labels per group.
-Alignment is a pixel-space heuristic. Everything uses flattened pixels; the objective's distance is the
-mean squared pixel distance.
+Any image is then labelled by truncating its code against z_a and choosing the class whose total loss rises
+least if the image joins it; codes whose truncated group has no references get class 0. Distances are mean
+squared pixel distance; pass centered pixels for precision.
 """
 
 import torch
 
-CHUNK = 4096  # entries per vectorized chunk
+CHUNK_ELEMENTS = 2**25  # floats in the largest temporary per vectorized chunk ([rows, V, P])
 
 
-def gumbel(shape, generator):
-    """Standard Gumbel noise (on CPU)."""
-    u = torch.rand(shape, generator=generator, dtype=torch.float64).clamp(1e-12, 1 - 1e-12)
-    return -torch.log(-torch.log(u))
+def chunk_rows(V, P):
+    """Rows per chunk so a [rows, V, P] temporary stays around CHUNK_ELEMENTS floats."""
+    return max(1024, CHUNK_ELEMENTS // (V * P))
 
 
 class NodeTable:
-    """Sorted prefix node ids with a vectorized lookup."""
+    """Sorted ids with a vectorized lookup."""
 
     def __init__(self, nodes):
         self.nodes = nodes
@@ -42,134 +40,111 @@ class NodeTable:
         return pos, self.nodes[pos] == ids
 
 
-class GroupMeans:
-    """Weighted mean image of each full prefix group; unknown groups use the overall mean."""
-
-    def __init__(self, table, means, overall):
-        self.table, self.means, self.overall = table, means, overall
-
-    def residual(self, x, ids):
-        pos, hit = self.table.find(ids)
-        return x - torch.where(hit[:, None], self.means[pos], self.overall)
-
-
-class Entries:
-    """Weighted (image, prefix) pairs at prefix length `depth`: rows of x_table indexed by img."""
-
-    def __init__(self, x_table, img, ids, w, depth, vocab_size):
-        self.x_table, self.img, self.ids, self.w, self.depth, self.V = x_table, img, ids, w, depth, vocab_size
-        nodes, self.node_inv = torch.unique(ids, return_inverse=True)
-        P = x_table.shape[1]
-        wsum = torch.zeros(len(nodes), device=w.device).index_add_(0, self.node_inv, w)
-        sums = torch.zeros(len(nodes), P, device=w.device)
-        for sl in self.chunks():
-            sums.index_add_(0, self.node_inv[sl], w[sl, None] * self.x(sl))
-        overall = sums.sum(0) / wsum.sum().clamp_min(1e-12)
-        self.group_means = GroupMeans(NodeTable(nodes), sums / wsum.clamp_min(1e-12)[:, None], overall)
-
-    def __len__(self):
-        return len(self.img)
-
-    def chunks(self):
-        for start in range(0, len(self.img), CHUNK):
-            yield slice(start, start + CHUNK)
-
-    def x(self, sl):
-        return self.x_table[self.img[sl]]
-
-    def resid(self, sl):
-        return self.x(sl) - self.group_means.means[self.node_inv[sl]]
+def truncated_group(codes, anchor_code, V):
+    """Group id of each code [n, t] truncated against anchor_code [t]: t*V for a full match, else
+    s*V + (the code's token at position s) where s is the shared prefix length."""
+    n, t = codes.shape
+    if t == 0:
+        return torch.zeros(n, dtype=torch.long, device=codes.device)
+    shared = (codes == anchor_code).long().cumprod(1).sum(1)
+    token = codes.gather(1, shared.clamp_max(t - 1)[:, None]).squeeze(1)
+    return torch.where(shared == t, t * V, shared * V + token)
 
 
-def segment_argmax(scores, segments, n_segments):
-    """Index of the highest score within each segment -> [n_segments] (computed on CPU)."""
-    scores, segments = scores.double().cpu(), segments.cpu()
-    best = torch.full((n_segments,), -torch.inf, dtype=torch.float64).scatter_reduce(0, segments, scores, "amax")
-    rows = torch.arange(len(scores))
-    winners = scores == best[segments]
-    return torch.full((n_segments,), len(scores)).scatter_reduce(0, segments[winners], rows[winners], "amin")
+def cluster_cost(n, S, Q, ng, Sg, Qg, P):
+    """Second-definition loss of one (group, class) cluster from its sufficient statistics.
+
+    n members with pixel sum S [.., P] and squared-norm sum Q, in a group with ng members, sum Sg, sum Qg.
+    n >= 2: each member's mean distance to the others, summed = 2 n/(n-1) * SSE.
+    n == 1: no other member shares code and class, so (as in node_costs) the member's posterior falls back
+    to the rest of its group: its mean distance to the other group members.
+    """
+    nf = n.float()
+    sse = Q - S.pow(2).sum(-1) / nf.clamp_min(1)
+    many = 2 * nf / (nf - 1).clamp_min(1) * sse
+    others = (ng - 1).float()
+    single = (others * Q - 2 * (S * (Sg - S)).sum(-1) + (Qg - Q)) / others.clamp_min(1)
+    single = torch.where(others > 0, single, 0.0)
+    return torch.where(n >= 2, many, torch.where(n == 1, single, 0.0)) / P
 
 
-def weighted_top_direction(entries, generator, iters=30):
-    """Top principal direction of the weighted residuals (power iteration) -> unit [P]."""
-    v = torch.randn(entries.x_table.shape[1], generator=generator).to(entries.w.device)
-    for _ in range(iters):
-        new = torch.zeros_like(v)
-        for sl in entries.chunks():
-            r = entries.resid(sl)
-            new += r.T @ (entries.w[sl] * (r @ v))
-        v = new / new.norm().clamp_min(1e-12)
-    return v
+class AnchorPartition:
+    """A partition built around one anchor code with Hartigan's method (see the module docstring)."""
 
+    def __init__(self, anchor_code, ref_x, ref_codes, V, generator, max_rounds=200):
+        self.anchor_code, self.V, self.P = anchor_code, V, ref_x.shape[1]
+        device = ref_x.device
+        gid = truncated_group(ref_codes, anchor_code, V)
+        groups, ginv = torch.unique(gid, return_inverse=True)
+        self.table, G = NodeTable(groups), len(groups)
+        sq = ref_x.pow(2).sum(1)
+        self.ng = torch.bincount(ginv, minlength=G)
+        self.Sg = torch.zeros(G, self.P, device=device).index_add_(0, ginv, ref_x)
+        self.Qg = torch.zeros(G, device=device).index_add_(0, ginv, sq)
+        labels = torch.randint(V, (len(ref_x),), generator=generator).to(device)
+        self.rounds = 0
+        for self.rounds in range(1, max_rounds + 1):
+            n, S, Q = self._stats(ginv, labels, ref_x, sq, G)
+            cost = self._costs(n, S, Q)  # [G, V]
+            total = cost.sum()
+            # exact change in total loss from moving each reference to each other class
+            a = labels
+            rem = cluster_cost(n[ginv, a] - 1, S[ginv, a] - ref_x, Q[ginv, a] - sq,
+                               self.ng[ginv], self.Sg[ginv], self.Qg[ginv], self.P) - cost[ginv, a]
+            add = cluster_cost(n[ginv] + 1, S[ginv] + ref_x[:, None, :], Q[ginv] + sq[:, None],
+                               self.ng[ginv, None], self.Sg[ginv, None, :], self.Qg[ginv, None], self.P) - cost[ginv]
+            delta = (rem[:, None] + add).masked_fill(torch.nn.functional.one_hot(a, V).bool(), torch.inf)
+            best, target = delta.min(1)
+            improving = (best < -1e-9 * total.abs().clamp_min(1e-12)).nonzero().squeeze(1)
+            if len(improving) == 0:
+                break
+            order = improving[best[improving].argsort()]
+            k = len(order)
+            while k >= 1:  # apply the k best moves together; halve until the total really drops
+                trial = labels.clone()
+                trial[order[:k]] = target[order[:k]]
+                if self._costs(*self._stats(ginv, trial, ref_x, sq, G)).sum() < total:
+                    labels = trial
+                    break
+                k //= 2
+            if k == 0:
+                break
+        self.n, self.S, self.Q = self._stats(ginv, labels, ref_x, sq, G)
+        self.cost = self._costs(self.n, self.S, self.Q)
+        self.ref_labels = labels
 
-def grouped_kmeans(entries, groups, n_groups, V, generator, iters=25):
-    """Weighted V-means inside every group at once (k-means++ init) -> centroids [n_groups, V, P]."""
-    w, device = entries.w, entries.w.device
-    P = entries.x_table.shape[1]
-    centroids = torch.zeros(n_groups, V, P, device=device)
-    d2 = torch.full((len(entries),), torch.inf, device=device)
-    log_w = w.clamp_min(1e-30).log()
-    for j in range(V):  # k-means++: first centre by weight, then by weight x squared distance
-        score = log_w if j == 0 else (w * d2).clamp_min(1e-30).log()
-        pick = segment_argmax(score.cpu() + gumbel(len(entries), generator), groups, n_groups).to(device)
-        pick = pick.clamp_max(len(entries) - 1)
-        centroids[:, j] = entries.resid(pick)
-        for sl in entries.chunks():
-            d2[sl] = torch.minimum(d2[sl], (entries.resid(sl) - centroids[groups[sl], j]).pow(2).sum(1))
-    for _ in range(iters):
-        sums = torch.zeros(n_groups * V, P, device=device)
-        mass = torch.zeros(n_groups * V, device=device)
-        for sl in entries.chunks():
-            r = entries.resid(sl)
-            nearest = (r[:, None, :] - centroids[groups[sl]]).pow(2).sum(-1).argmin(1)
-            key = groups[sl] * V + nearest
-            sums.index_add_(0, key, w[sl, None] * r)
-            mass.index_add_(0, key, w[sl])
-        new = torch.where(mass[:, None] > 0, sums / mass.clamp_min(1e-12)[:, None], centroids.view(-1, P))
-        new = new.view(n_groups, V, P)
-        if torch.allclose(new, centroids):
-            break
-        centroids = new
-    return centroids
+    def _stats(self, ginv, labels, x, sq, G):
+        key = ginv * self.V + labels
+        n = torch.bincount(key, minlength=G * self.V).view(G, self.V)
+        S = torch.zeros(G * self.V, self.P, device=x.device).index_add_(0, key, x).view(G, self.V, self.P)
+        Q = torch.zeros(G * self.V, device=x.device).index_add_(0, key, sq).view(G, self.V)
+        return n, S, Q
 
+    def _costs(self, n, S, Q):
+        return cluster_cost(n, S, Q, self.ng[:, None], self.Sg[:, None, :], self.Qg[:, None], self.P)
 
-class ShareRule:
-    """Labels for any (image, prefix): nearest codeword of the prefix's m-group codebook to its residual."""
+    def total_loss(self):
+        return float(self.cost.sum())
 
-    def __init__(self, name, m, depth, V, group_means, groups, codebooks, perm, fallback=None):
-        self.name, self.m, self.depth, self.V = name, m, depth, V
-        self.group_means, self.groups, self.codebooks, self.perm = group_means, groups, codebooks, perm
-        self.fallback = fallback  # used for m-groups that weren't fitted; None for m = 0 (always fitted)
+    def labels(self, x, codes):
+        """Class for each image x [n, P] with code [n, t]: the class whose total loss rises least if the image
+        joins it (class 0 when its truncated group has no references)."""
+        rows = chunk_rows(self.V, self.P)
+        return torch.cat([self._labels(x[i:i + rows], codes[i:i + rows]) for i in range(0, len(x), rows)]) \
+            if len(x) > rows else self._labels(x, codes)
 
-    def labels(self, x_table, img, ids):
-        """x_table [*, P] pixels, img [n] rows of it, ids [n] prefix node ids -> labels [n]."""
-        out = torch.empty(len(img), dtype=torch.long, device=ids.device)
-        for start in range(0, len(img), CHUNK):
-            sl = slice(start, start + CHUNK)
-            out[sl] = self._labels(x_table[img[sl]], ids[sl])
-        return out
-
-    def _labels(self, x, ids):
-        r = self.group_means.residual(x, ids)
-        pos, hit = self.groups.find(ids // self.V ** (self.depth - self.m))
-        nearest = (r[:, None, :] - self.codebooks[pos]).pow(2).sum(-1).argmin(1)
-        out = self.perm[pos, nearest]
-        if self.fallback is not None and not bool(hit.all()):
-            out = torch.where(hit, out, self.fallback._labels(x, ids))
-        return out
-
-
-def fit_candidate(entries, m, u, generator, labels="aligned", fallback=None):
-    """One candidate with sharing level m, fit to the weighted entries."""
-    V, depth = entries.V, entries.depth
-    group_ids = entries.ids // V ** (depth - m)
-    groups, inv = torch.unique(group_ids, return_inverse=True)
-    codebooks = grouped_kmeans(entries, inv, len(groups), V, generator)
-    if labels == "aligned":
-        perm = (codebooks @ u).argsort(-1).argsort(-1)  # codeword -> its rank along the shared direction
-    else:
-        perm = torch.rand(len(groups), V, generator=generator).argsort(-1).to(codebooks.device)
-    return ShareRule(f"m={m}", m, depth, V, entries.group_means, NodeTable(groups), codebooks, perm, fallback)
+    def _labels(self, x, codes):
+        pos, hit = self.table.find(truncated_group(codes, self.anchor_code, self.V))
+        sq = x.pow(2).sum(1)
+        n, S, Q, cost = self.n[pos], self.S[pos], self.Q[pos], self.cost[pos]  # [m, V, ...]
+        ng1, Sg1, Qg1 = self.ng[pos] + 1, self.Sg[pos] + x, self.Qg[pos] + sq  # the group with the image added
+        own = cluster_cost(n + 1, S + x[:, None, :], Q + sq[:, None], ng1[:, None], Sg1[:, None, :], Qg1[:, None],
+                           self.P) - cost
+        # lone members of other classes now also measure their distance to the image
+        lone = torch.where(n == 1, cluster_cost(n, S, Q, ng1[:, None], Sg1[:, None, :], Qg1[:, None], self.P) - cost,
+                           0.0)
+        rise = own + lone.sum(1, keepdim=True) - lone
+        return torch.where(hit, rise.argmin(1), 0)
 
 
 def node_costs(anchor_table, anchor_img, anchor_ids, anchor_p, ref_table, ref_img, ref_ids, ref_p, ref_w,
@@ -203,8 +178,9 @@ def node_costs(anchor_table, anchor_img, anchor_ids, anchor_p, ref_table, ref_im
     Wg = torch.zeros(len(groups), device=device).index_add_(0, group_inv, ref_w)
     Qg = torch.zeros(len(groups), device=device).index_add_(0, group_inv, ref_w * ref_sq)
     Sg = torch.zeros(len(groups), P, device=device)
-    for start in range(0, len(ref_img), CHUNK):
-        sl = slice(start, start + CHUNK)
+    rows = chunk_rows(V, P)
+    for start in range(0, len(ref_img), rows):
+        sl = slice(start, start + rows)
         xr = ref_table[ref_img[sl]]
         S.index_add_(0, key_inv[sl].flatten(), (wt[sl, :, None] * xr[:, None, :]).flatten(0, 1))
         Sg.index_add_(0, group_inv[sl], ref_w[sl, None] * xr)
@@ -212,8 +188,8 @@ def node_costs(anchor_table, anchor_img, anchor_ids, anchor_p, ref_table, ref_im
     key_table, group_table = NodeTable(keys), NodeTable(groups)
 
     out = torch.empty(len(anchor_img), device=device)
-    for start in range(0, len(anchor_img), CHUNK):
-        sl = slice(start, start + CHUNK)
+    for start in range(0, len(anchor_img), rows):
+        sl = slice(start, start + rows)
         xa, ids, pa, self_row = anchor_table[anchor_img[sl]], anchor_ids[sl], anchor_p[sl], anchor_ref[sl]
         sqa = xa.pow(2).sum(1)
         has_self = self_row >= 0
@@ -237,36 +213,3 @@ def node_costs(anchor_table, anchor_img, anchor_ids, anchor_p, ref_table, ref_im
         F_tok = torch.where(Wk > min_weight, sum_tok / Wk.clamp_min(min_weight), F_grp[:, None])
         out[sl] = (pa * F_tok).sum(-1) / P
     return out
-
-
-def candidate_proxy(entries, labels, n_images):
-    """In-sample objective of hard labels at this position: weighted mean over entries / images."""
-    onehot = torch.nn.functional.one_hot(labels, entries.V).float()
-    rows = torch.arange(len(entries), device=labels.device)
-    cost = node_costs(entries.x_table, entries.img, entries.ids, onehot, entries.x_table, entries.img, entries.ids,
-                      onehot, entries.w, rows)
-    return float((entries.w * cost).sum() / n_images)
-
-
-def weighted_node_ari(a, b, ids, w, V):
-    """Adjusted Rand index between labelings a and b inside each prefix group, weighted (label-free)."""
-    _, inv = torch.unique(ids, return_inverse=True)
-    M = int(inv.max()) + 1 if len(inv) else 0
-    table = torch.zeros(M * V * V, device=w.device).index_add_(0, (inv * V + a) * V + b, w).view(M, V, V)
-
-    def pairs(t):
-        return t * t / 2  # weighted pair mass; matches n(n-1)/2 up to the self-pair term
-
-    n = table.sum((1, 2))
-    s_ab, s_a, s_b = pairs(table).sum((1, 2)), pairs(table.sum(2)).sum(1), pairs(table.sum(1)).sum(1)
-    expected = s_a * s_b / pairs(n).clamp_min(1e-12)
-    top = (s_a + s_b) / 2
-    same = ((s_ab - s_a).abs() < 1e-9) & ((s_ab - s_b).abs() < 1e-9)
-    ari = torch.where((top - expected).abs() > 1e-9, (s_ab - expected) / (top - expected), same.float())
-    return float((ari * n).sum() / n.sum().clamp_min(1e-12))
-
-
-def costs_by_group(ids, costs):
-    """Sum per-entry costs [n, C] within each prefix group -> (group ids, sums [G, C])."""
-    groups, inv = torch.unique(ids, return_inverse=True)
-    return groups, torch.zeros(len(groups), costs.shape[1], device=costs.device).index_add_(0, inv, costs)
