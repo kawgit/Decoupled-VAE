@@ -22,29 +22,35 @@ On this branch the encoder isn't trained by descending L directly. That objectiv
 encoder's outputs, much like k-means. Instead `train_encoder.py` builds the code one token at a time,
 and at each position it *chooses* a partition and trains a classifier to reproduce it:
 
-1. **Prefixes.** Sample a prefix z₁..z_t for every training image, using the models of earlier
-   positions on images they weren't trained on (out-of-fold).
-2. **Candidates.** Generate candidate partitions for the next token (`dvae/partition.py`):
-   - `node`: V-means inside each prefix group;
-   - `node-balanced`: each group split evenly along its own top principal direction;
-   - `shared`: one V-word codebook for every group, applied to the image minus its group's mean;
-   - `shared-balanced`: one shared direction, with each group split evenly along it;
-   - `node-unaligned`: `node` with random labels per group, to test whether label alignment matters.
-
-   Labels are aligned across groups by ranking children along one shared direction. That's a
-   heuristic, not a guarantee. Candidates whose partitions coincide (ARI > `--dedup-ari`) are dropped.
-3. **Training.** Train `--folds` + 1 copies of a `StageNet` with one head per candidate, by
+1. **Prefixes.** For each training image, draw `--prefix-samples` (S, default 4) *distinct* prefixes
+   z₁..z_t without replacement from its out-of-fold encoder distribution, i.e. using the models of
+   earlier positions on images they weren't trained on. The method is stochastic beam search. Each
+   prefix gets an importance weight q(z)/π(z), so weighted sums estimate sums over the image's whole
+   prefix distribution, and are exact once S covers every prefix. Cost is fixed per image, whatever
+   the code-space or dataset size.
+2. **Candidates** (`dvae/partition.py`).
+   - **Generation:** draw `--num-candidates` (default 64) candidates. Each picks a sharing level m
+     uniformly from 0..t, groups the prefixes by their first m tokens, and fits one weighted V-means
+     codebook per group to the residuals (image minus its full prefix group's mean). m = t gives every
+     prefix its own codebook, and m = 0 gives one codebook for all. Repeated m values act as restarts.
+   - **Labels:** an image's label is its residual's nearest codeword. Codewords are labelled by rank
+     along one shared direction (`--labels aligned`), a pixel-space heuristic; `--labels random`
+     shuffles them per group instead.
+   - **Pruning:** every candidate is scored by its exact in-sample objective at this position, on
+     training images only. Near-duplicates (weighted per-prefix ARI > `--dedup-ari`) are dropped in
+     favour of the better-scoring one, and the best `--keep-candidates` (default 32) are kept.
+3. **Training.** Train `--folds` + 1 copies of a `StageNet` with one head per kept candidate, by
    cross-entropy: fold model f on the images outside fold f, and a final model on all of them.
-   Prefixes are resampled from the out-of-fold models every batch, so each position learns from the
+   Each batch draws one prefix per image from the out-of-fold models (a fresh draw every epoch), so each position learns from the
    mistakes earlier positions really make on unseen images. Those next-token distributions are
    memoized (`--memo-cap`), since earlier positions are frozen.
 4. **Scoring and selection.** After every epoch, every head is scored on each fold's held-out images
-   with the decompression objective. The score is exact, with all training images as references,
-   from per-prefix sums. The best head is picked *per prefix*, and the epoch with the best total is
+   with the decompression objective, over its weighted prefix entries. The score is exact, with all
+   training entries as references, from per-prefix sums. The best head is picked *per prefix*, and the epoch with the best total is
    kept. The fold models and the final model share that epoch count and that selection.
 5. **The stage.** The final model plus its per-prefix head selector becomes this position. The log
-   reports its honest score on the separate val split, for the per-prefix selection and for the single
-   best head.
+   reports its honest score on the separate val split (S distinct prefixes per val image, through the
+   final models), for the per-prefix selection and for the single best head.
 
 The ground truth for every choice is the decompression objective of a trained model on held-out images.
 Pixel-space criteria (k-means fit, alignment) only generate the candidates.
@@ -99,7 +105,7 @@ python analyze_encoder.py --encoder checkpoints/encoder.pt # -> results/usage_en
 ```
 train_encoder.py    builds the staged encoder (folds, multi-head training, per-prefix head selection)
 dvae/staged.py      StageNet (one per position) and StagedEncoder (sample, log_prob, tree enumeration)
-dvae/partition.py   candidate partitions, alignment, dedup, exact per-prefix objective
+dvae/partition.py   weighted prefix entries, candidate codebooks, pruning/dedup, exact per-prefix objective
 dvae/models.py      Prior, Decoder; tree enumeration of all code prefixes
 dvae/data.py        MNIST tensors, train/val split, labels, binarization
 dvae/common.py      device, checkpoints, CLI flags, early-stopping loop
