@@ -46,7 +46,15 @@ from dvae.staged import SelectorNet, StagedEncoder, StageNet, node_ids
 FORWARD_CHUNK = 2048  # images per forward pass when scoring or sampling
 
 
+_skipped = 0  # progress lines a Ticker dropped since the last printed line
+
+
 def log(msg):
+    """Print a timestamped line, noting how many progress lines were skipped since the previous one."""
+    global _skipped
+    if _skipped:
+        msg += f"  ({_skipped} similar message{'s' if _skipped > 1 else ''} skipped since the last line)"
+        _skipped = 0
     print(f"  [{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
@@ -60,15 +68,19 @@ def timed(what):
 
 
 class Ticker:
-    """Throttled progress lines inside a long loop: at most one per interval seconds."""
+    """Throttled progress lines inside a long loop: at most one per interval seconds. The next printed line
+    of any kind says how many were skipped."""
 
     def __init__(self, interval):
         self.interval, self.last = interval, time.time()
 
     def __call__(self, msg):
-        if time.time() - self.last >= self.interval:
-            self.last = time.time()
-            log(msg)
+        global _skipped
+        if time.time() - self.last < self.interval:
+            _skipped += 1
+            return
+        self.last = time.time()
+        log(msg)
 
 
 def forward_chunked(model, x, prefix):
