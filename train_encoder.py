@@ -82,17 +82,36 @@ class CodeSampler:
     distribution of every (image, prefix) visited is memoized: positions are frozen once built and the
     selector's choice depends on the prefix alone, so it never changes. The memo holds at most memo_cap
     entries; when full it evicts the prefixes least likely to be reached. Other images (val) go through the
-    final models, without the memo.
+    final models, without the memo. Each position's image features for every training image are cached
+    the first time they're needed, for the same reason.
     """
 
     def __init__(self, images, fold_of, vocab_size, n_folds, memo_cap):
         self.images, self.fold_of, self.V, self.n_folds = images, fold_of, vocab_size, n_folds
         self.memo_cap, self.memo, self.positions = memo_cap, {}, []
+        self.features: list[torch.Tensor | None] = []
 
     def add_position(self, encoders, selectors):
         for m in list(encoders) + list(selectors):
             m.eval().requires_grad_(False)
         self.positions.append((encoders, selectors))
+        self.features.append(None)
+
+    @torch.no_grad()
+    def train_features(self, t):
+        """Position t's image features [N, width] of every training image, from its out-of-fold encoder."""
+        cached = self.features[t]
+        if cached is None:
+            encoders, _ = self.positions[t]
+            device = self.images.device
+            cached = torch.empty(len(self.images), encoders[0].head[0].in_features, device=device)
+            for m in range(self.n_folds):
+                rows = (self.fold_of == m).nonzero().squeeze(1).to(device)
+                for i in range(0, len(rows), FORWARD_CHUNK):
+                    r = rows[i:i + FORWARD_CHUNK]
+                    cached[r] = encoders[m].features(self.images[r])
+            self.features[t] = cached
+        return cached
 
     def _probs(self, t, x, prefix, model_idx):
         """Next-token distributions [n, V] (on CPU) from position t's model_idx[i] encoder and selector."""
@@ -162,16 +181,17 @@ class CodeSampler:
     @torch.no_grad()
     def stage_probs(self, t, prefixes):
         """Position t's next-token distributions [n, N, V] of every training image (out-of-fold models) after
-        each of the prefixes [n, t]. Each image's features are computed once and shared by all the prefixes."""
+        each of the prefixes [n, t], from the cached image features."""
         encoders, selectors = self.positions[t]
         device = self.images.device
+        features = self.train_features(t)
         out = torch.empty(len(prefixes), len(self.images), self.V, device=device)
         for m in range(self.n_folds):
             rows = (self.fold_of == m).nonzero().squeeze(1).to(device)
             heads = selectors[m].choose(prefixes).tolist()
             for i in range(0, len(rows), FORWARD_CHUNK):
                 r = rows[i:i + FORWARD_CHUNK]
-                feats = encoders[m].features(self.images[r])
+                feats = features[r]
                 for j, head in enumerate(heads):
                     out[j, r] = encoders[m].logits(feats, prefixes[j:j + 1])[:, head].softmax(-1)
         return out
@@ -248,7 +268,7 @@ def main():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=20, help="max encoder epochs per position")
-    p.add_argument("--patience", type=int, default=3)
+    p.add_argument("--patience", type=int, default=1)
     p.add_argument("--selector-width", type=int, default=128)
     p.add_argument("--selector-batch-size", type=int, default=1024)
     p.add_argument("--selector-lr", type=float, default=1e-3)
