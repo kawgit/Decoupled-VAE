@@ -50,7 +50,8 @@ At position k (prefix length t = k−1):
 3. **Costs.** For every training image, with its held-out encoder, the new token's decompression loss
    under each partition. It's exact, with all training images as references.
 4. **Selectors.** Train `--folds` + 1 `SelectorNet`s to predict those costs from the code alone (MSE),
-   with the same fold split, early-stopped on the fold copies' held-out MSE. Then every copy uses the
+   with the same fold split, early-stopped on the held-out decompression loss of the fold copies'
+   choices (the cost of the partition each picks, pooled over images). Then every copy uses the
    final selector, so the new token means the same thing for every image with the same code, in every
    copy. The encoder uses the partition with the lowest predicted cost.
 5. **Report.** The new token's loss on the val split: with the selector's choices, with the single
@@ -141,8 +142,9 @@ $s(z, a)$ be the length of their shared prefix. Then
 \quad \textbf{for each epoch}: \\
 \qquad \textbf{for } m \in \{1, \dots, F, \star\}: \quad
         \text{minimize } \tfrac{1}{P} \lVert s_k^m(\bar z_i) - C_{i,:} \rVert^2 \text{ over images with } f(i) \ne m \\
-\qquad \text{held-out MSE} = \frac{1}{NP} \sum_i \lVert s_k^{f(i)}(\bar z_i) - C_{i,:} \rVert^2 \\
-\quad \text{keep the epoch with the lowest held-out MSE (all copies); stop after a patience of epochs} \\
+\qquad \text{held-out loss of choices} = \frac{1}{N} \sum_i C_{i, \hat p_i}, \qquad
+        \hat p_i = \arg\min_p s_k^{f(i)}(\bar z_i)_p \\
+\quad \text{keep the epoch with the lowest held-out loss of choices (all copies); stop after a patience of epochs} \\
 \quad s_k^m \leftarrow s_k^\star \text{ for every fold copy } m \quad \text{(fold selectors only chose the epoch)} \\[4pt]
 \quad \text{// 5. the position} \\
 \quad \text{position } k \text{ of the encoder} = \big(e_k^\star, s_k^\star\big); \quad

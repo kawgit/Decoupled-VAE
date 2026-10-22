@@ -13,7 +13,8 @@ For each position k (prefix length t = k-1):
   3. Costs. For every training image, with its held-out encoder, the new token's decompression loss
      under each partition (exact, all training images as references).
   4. Selectors. Train num_folds + 1 SelectorNets to predict those costs from the code alone (MSE), with
-     the same fold split and shared epochs, early-stopped on the fold copies' held-out MSE. Afterwards
+     the same fold split and shared epochs, early-stopped on the held-out decompression loss of the fold
+     copies' choices (the cost of the partition each picks, pooled over images). Afterwards
      every copy uses the final selector, so each token means the same thing in every copy. The encoder
      uses the partition with the lowest predicted cost.
   5. Report the new token's loss on the val split: per the selector's choices, for the single best
@@ -328,7 +329,8 @@ def main():
             log(f"held-out loss per partition: best {mean_cost.min():.5f}, worst {mean_cost.max():.5f}, "
                 f"per-image best (oracle) {cost.min(1).values.mean():.5f}")
 
-            # 4. selectors: F+1 SelectorNets regressing the costs from the code, early stopping on held-out MSE
+            # 4. selectors: F+1 SelectorNets regressing the costs from the code, early stopping on the held-out
+            # loss of their choices
             selectors = [SelectorNet(V, t, P, args.selector_width).to(device) for _ in range(Fo + 1)]
             for s in selectors:
                 with torch.no_grad():
@@ -347,12 +349,18 @@ def main():
                             loss.backward()
                             opt.step()
                     with torch.no_grad():
-                        mse = sum(F.mse_loss(selectors[f].eval()(eval_codes[held_out[f]]), cost[held_out[f]],
-                                             reduction="sum").item() for f in range(Fo)) / (N * P)
-                    improved = mse < best_sel["score"]
-                    tick(f"  selector epoch {epoch}: held-out MSE {mse:.3e}{'  *best*' if improved else ''}")
+                        mse, choice = 0.0, 0.0
+                        for f in range(Fo):
+                            pred = selectors[f].eval()(eval_codes[held_out[f]])
+                            mse += F.mse_loss(pred, cost[held_out[f]], reduction="sum").item()
+                            choice += cost[held_out[f]].gather(1, pred.argmin(-1, keepdim=True)).sum().item()
+                        mse, choice = mse / (N * P), choice / N
+                    improved = choice < best_sel["score"]
+                    tick(f"  selector epoch {epoch}: held-out loss of choices {choice:.4f}, MSE {mse:.3e}"
+                         f"{'  *best*' if improved else ''}")
                     if improved:
-                        best_sel = {"score": mse, "epoch": epoch, "states": [copy.deepcopy(s.state_dict()) for s in selectors]}
+                        best_sel = {"score": choice, "mse": mse, "epoch": epoch,
+                                    "states": [copy.deepcopy(s.state_dict()) for s in selectors]}
                         bad = 0
                     else:
                         bad += 1
@@ -361,7 +369,8 @@ def main():
             for s, st in zip(selectors, best_sel["states"]):
                 s.load_state_dict(st)
                 s.eval()
-            log(f"selectors: best epoch {best_sel['epoch']}, held-out MSE {best_sel['score']:.3e}")
+            log(f"selectors: best epoch {best_sel['epoch']}, held-out loss of choices {best_sel['score']:.4f}, "
+                f"MSE {best_sel['mse']:.3e}")
             # Every copy codes with the final selector from here on: the fold selectors only chose the epoch.
             # One choice per code keeps each token's meaning the same in every copy (partitions can be tied
             # mirror images, so independent choices could flip it).
@@ -387,7 +396,8 @@ def main():
                 chosen = torch.bincount(selectors[Fo].choose(eval_codes), minlength=P)
             entry = {"position": t + 1, "encoder_epochs": encoder_epochs, "selector_epochs": best_sel["epoch"],
                      "held_out_cross_entropy": best["score"], "held_out_loss_per_partition": mean_cost.tolist(),
-                     "selector_mse": best_sel["score"], "val_selector": report["selector"],
+                     "selector_choice_loss": best_sel["score"],
+                     "selector_mse": best_sel["mse"], "val_selector": report["selector"],
                      "val_single_best": report["single best"], "k0": k0, "seconds": time.time() - t0}
             state["history"].append(entry)
             log(f"position {t + 1} done in {entry['seconds']:.0f}s: val loss at k={t + 1}: selector {report['selector']:.5f}, "
