@@ -281,7 +281,7 @@ def main():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=20, help="max encoder epochs per position")
-    p.add_argument("--patience", type=int, default=1)
+    p.add_argument("--patience", type=int, default=3)
     p.add_argument("--selector-width", type=int, default=128)
     p.add_argument("--selector-batch-size", type=int, default=1024)
     p.add_argument("--selector-lr", type=float, default=1e-3)
