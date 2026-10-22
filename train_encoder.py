@@ -25,6 +25,7 @@ import copy
 import math
 import time
 from collections import Counter
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -37,6 +38,31 @@ from dvae.partition import (Entries, candidate_proxy, costs_by_group, fit_candid
 from dvae.staged import Selector, StagedEncoder, StageNet, node_ids
 
 FORWARD_CHUNK = 2048  # images per forward pass when scoring or sampling
+
+
+def log(msg):
+    print(f"  [{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+@contextmanager
+def timed(what):
+    """Log the start of an expensive step and how long it took."""
+    log(f"{what} ...")
+    t0 = time.time()
+    yield
+    log(f"{what}: done in {time.time() - t0:.1f}s")
+
+
+class Ticker:
+    """Throttled progress lines inside a long loop: at most one per interval seconds."""
+
+    def __init__(self, interval):
+        self.interval, self.last = interval, time.time()
+
+    def __call__(self, msg):
+        if time.time() - self.last >= self.interval:
+            self.last = time.time()
+            log(msg)
 
 
 def forward_chunked(model, x, prefix):
@@ -100,8 +126,9 @@ class PrefixSampler:
 
     def _evict(self):
         if len(self.memo) > self.memo_cap:  # keep the prefixes most likely to be reached
-            keep = sorted(self.memo.items(), key=lambda item: item[1][1], reverse=True)[: int(0.9 * self.memo_cap)]
-            self.memo = dict(keep)
+            with timed(f"memo full ({len(self.memo)} entries): evicting the least likely prefixes"):
+                keep = sorted(self.memo.items(), key=lambda item: item[1][1], reverse=True)[: int(0.9 * self.memo_cap)]
+                self.memo = dict(keep)
 
     @torch.no_grad()
     def sample_train(self, idx, depth, generator):
@@ -166,10 +193,12 @@ class PrefixSampler:
             w = phi.exp()
         return beam_prefix, w.float().to(device)
 
-    def entries(self, x_all, depth, S, generator, train=True, chunk=FORWARD_CHUNK):
+    def entries(self, x_all, depth, S, generator, train=True, chunk=FORWARD_CHUNK, progress=None):
         """Flattened (image row, prefix, weight) for every image in x_all -> img [E], prefix [E, depth], w [E]."""
         imgs, prefixes, weights = [], [], []
         for start in range(0, len(x_all), chunk):
+            if progress is not None:
+                progress(f"  sampled prefixes for {start}/{len(x_all)} images (memo {len(self.memo)})")
             idx = torch.arange(start, min(start + chunk, len(x_all)), device=x_all.device)
             prefix, w = self.sample_distinct(x_all[idx], depth, S, generator, idx if train else None)
             imgs.append(idx.repeat_interleave(prefix.shape[1]))
@@ -207,8 +236,9 @@ def main():
 
     torch.manual_seed(args.seed)
     device = get_device(args.device)
-    X = to_float(load_mnist("train", args.data_root, device)[: args.limit_train])
-    Xv = to_float(load_mnist("val", args.data_root, device)[: args.limit_val])
+    with timed("loading MNIST"):
+        X = to_float(load_mnist("train", args.data_root, device)[: args.limit_train])
+        Xv = to_float(load_mnist("val", args.data_root, device)[: args.limit_val])
     mean = X.flatten(1).mean(0)
     Xc, Xvc = X.flatten(1) - mean, Xv.flatten(1) - mean  # centered pixels, for the objective's precision
     N, Nv, V, Fo, S = len(X), len(Xv), args.vocab_size, args.folds, args.prefix_samples
@@ -224,6 +254,8 @@ def main():
         state["fold_of"] = fold_of
     sampler = PrefixSampler(X, fold_of, V, Fo, args.memo_cap)
     stage_cfgs, final_states = [], []
+    if state["stages"]:
+        log(f"rebuilding the {len(state['stages'])} saved positions ({Fo + 1} models each)")
     for t, st in enumerate(state["stages"]):
         cfg = st["cfg"]
         models = []
@@ -246,21 +278,33 @@ def main():
             gen = torch.Generator().manual_seed(args.seed * 1000 + t)
 
             # 1-2. weighted prefix entries, candidates, pruning
-            img, prefix, w = sampler.entries(X, t, S, gen)
+            tick = Ticker(args.log_interval)
+            with timed(f"sampling {S} distinct prefixes per training image"):
+                img, prefix, w = sampler.entries(X, t, S, gen, progress=tick)
             ids = node_ids(prefix, V)
-            entries = Entries(Xc, img, ids, w, t, V)
-            u = weighted_top_direction(entries, gen)
-            base = fit_candidate(entries, 0, u, gen, args.labels)  # m = 0; also the fallback for unseen groups
-            pool = [base] + [fit_candidate(entries, int(torch.randint(t + 1, (1,), generator=gen)), u, gen,
-                                           args.labels, base) for _ in range(args.num_candidates - 1)]
-            labels = [rule.labels(Xc, img, ids) for rule in pool]
-            proxies = [candidate_proxy(entries, lab, N) for lab in labels]
-            kept: list[int] = []
-            for i in sorted(range(len(pool)), key=lambda j: proxies[j]):
-                if all(weighted_node_ari(labels[i], labels[j], ids, w, V) <= args.dedup_ari for j in kept):
-                    kept.append(i)
-                    if len(kept) == args.keep_candidates:
-                        break
+            with timed(f"prefix group means and shared direction ({len(img)} entries, {len(ids.unique())} prefixes)"):
+                entries = Entries(Xc, img, ids, w, t, V)
+                u = weighted_top_direction(entries, gen)
+            with timed(f"fitting {args.num_candidates} candidate codebooks"):
+                pool = [fit_candidate(entries, 0, u, gen, args.labels)]  # m = 0; also the fallback for unseen groups
+                for c in range(1, args.num_candidates):
+                    m_level = int(torch.randint(t + 1, (1,), generator=gen))
+                    tick(f"  candidate {c + 1}/{args.num_candidates} (m={m_level})")
+                    pool.append(fit_candidate(entries, m_level, u, gen, args.labels, pool[0]))
+            with timed("labelling and scoring every candidate (in-sample objective)"):
+                labels, proxies = [], []
+                for c, rule in enumerate(pool):
+                    tick(f"  candidate {c + 1}/{len(pool)}")
+                    labels.append(rule.labels(Xc, img, ids))
+                    proxies.append(candidate_proxy(entries, labels[-1], N))
+            with timed(f"dedup and pruning to the best {args.keep_candidates}"):
+                kept: list[int] = []
+                for checked, i in enumerate(sorted(range(len(pool)), key=lambda j: proxies[j])):
+                    tick(f"  checked {checked}/{len(pool)}, kept {len(kept)}")
+                    if all(weighted_node_ari(labels[i], labels[j], ids, w, V) <= args.dedup_ari for j in kept):
+                        kept.append(i)
+                        if len(kept) == args.keep_candidates:
+                            break
             rules = [pool[i] for i in kept]
             heads = [f"{pool[i].name}#{i}" for i in kept]
             print(f"  {len(img)} prefix entries over {len(ids.unique())} prefixes; {len(pool)} candidates "
@@ -275,7 +319,8 @@ def main():
             best: dict[str, Any] = {"score": math.inf}
             bad = 0
             for epoch in range(1, args.epochs + 1):
-                last_log, losses = time.time(), []
+                last_log, losses, epoch_start = time.time(), [], time.time()
+                log(f"epoch {epoch}: training {Fo + 1} models with {len(rules)} heads each")
                 for m, (model, opt) in enumerate(zip(models, opts)):
                     model.train()
                     order = train_sets[m][torch.randperm(len(train_sets[m]), generator=gen).to(device)]
@@ -293,15 +338,19 @@ def main():
                             print(f"  epoch {epoch} model {m + 1}/{Fo + 1} cross-entropy "
                                   f"{sum(losses[-50:]) / len(losses[-50:]):.4f} (memo {len(sampler.memo)})", flush=True)
 
-                with torch.no_grad():
+                log(f"epoch {epoch}: training done in {time.time() - epoch_start:.1f}s")
+                with torch.no_grad(), timed(f"epoch {epoch}: scoring {len(rules)} heads on the held-out folds"):
                     probs = torch.empty(len(img), len(rules), V, device=device)
                     for f in range(Fo):
                         rows = (entry_fold == f).nonzero().squeeze(1).to(device)
                         models[f].eval()
                         probs[rows] = forward_chunked(models[f], X[img[rows]], prefix[rows]).softmax(-1)
                     rows_all = torch.arange(len(img), device=device)
-                    costs = torch.stack([node_costs(Xc, img, ids, probs[:, h], Xc, img, ids, probs[:, h], w, rows_all)
-                                         for h in range(len(rules))], 1)
+                    head_costs = []
+                    for h in range(len(rules)):
+                        tick(f"  head {h + 1}/{len(rules)}")
+                        head_costs.append(node_costs(Xc, img, ids, probs[:, h], Xc, img, ids, probs[:, h], w, rows_all))
+                    costs = torch.stack(head_costs, 1)
                     groups, group_costs = costs_by_group(ids, costs * w[:, None])
                     hybrid = group_costs.min(1).values.sum().item() / N
                     per_head = (group_costs.sum(0) / N).tolist()
@@ -332,7 +381,7 @@ def main():
 
             # 5. honest score on the val split: val images coded by the final models (S distinct prefixes each),
             # training entries (coded out-of-fold) as references; per-prefix head selection vs one head everywhere.
-            with torch.no_grad():
+            with torch.no_grad(), timed("val report (final model, val split)"):
                 val_gen = torch.Generator().manual_seed(args.seed + 7 + t)
                 vimg, vprefix, vw = sampler.entries(Xv, t, S, val_gen, train=False)
                 vids = node_ids(vprefix, V)
@@ -356,13 +405,13 @@ def main():
                   f"{chosen}; val objective at k={t + 1}: per-prefix {honest['per-prefix']:.5f}, single head "
                   f"({heads[best['default']]}) {honest['single head']:.5f}; no code {k0:.5f}")
 
-            state["stages"].append({"cfg": cfg, "model_states": [copy.deepcopy(m.state_dict()) for m in models]})
-            torch.save(state, args.state)
-            encoder = StagedEncoder(V, len(stage_cfgs), stage_cfgs)
-            for net, s in zip(encoder.nets, final_states):
-                net.load_state_dict(s)
-            save_checkpoint(args.out, "encoder", encoder, args=vars(args), history=state["history"])
-            print(f"  saved {args.out} ({len(stage_cfgs)} positions) and {args.state}")
+            with timed(f"saving {args.out} ({len(stage_cfgs)} positions) and {args.state}"):
+                state["stages"].append({"cfg": cfg, "model_states": [copy.deepcopy(m.state_dict()) for m in models]})
+                torch.save(state, args.state)
+                encoder = StagedEncoder(V, len(stage_cfgs), stage_cfgs)
+                for net, s in zip(encoder.nets, final_states):
+                    net.load_state_dict(s)
+                save_checkpoint(args.out, "encoder", encoder, args=vars(args), history=state["history"])
     except KeyboardInterrupt:
         print(f"\ninterrupted; {len(state['stages'])} completed positions are in {args.state} (continue with --resume)")
 
