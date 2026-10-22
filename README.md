@@ -50,12 +50,105 @@ At position k (prefix length t = k−1):
 3. **Costs.** For every training image, with its held-out encoder, the new token's decompression loss
    under each partition. It's exact, with all training images as references.
 4. **Selectors.** Train `--folds` + 1 `SelectorNet`s to predict those costs from the code alone (MSE),
-   with the same fold split, early-stopped on held-out MSE. The encoder uses the partition with the
-   lowest predicted cost, so the new token means the same thing for every image with the same code.
+   with the same fold split, early-stopped on the fold copies' held-out MSE. Then every copy uses the
+   final selector, so the new token means the same thing for every image with the same code, in every
+   copy. The encoder uses the partition with the lowest predicted cost.
 5. **Report.** The new token's loss on the val split: with the selector's choices, with the single
    best partition, and with no code.
 
 Every step logs when it starts, its progress and its duration.
+
+## Encoder training in pseudo-code
+
+**Notation.**
+- Training images $x_1, \dots, x_N$, each in a fold $f(i) \in \{1, \dots, F\}$.
+- Model copies $m \in \{1, \dots, F, \star\}$: fold copy $m$ never sees fold $m$; $\star$ is the final copy.
+- Position $k$ has encoder copies $e_k^m(x, z) \in \mathbb{R}^{P \times V}$ (logits, one row per partition)
+  and selector copies $s_k^m(z) \in \mathbb{R}^P$ (predicted loss per partition). Once position $k$ is
+  built, every copy codes with the final selector $s_k^\star$.
+- $d(x, y) = \tfrac{1}{D} \lVert x - y \rVert^2$, with $D$ pixels.
+
+**Codes.** A code through the first $t$ positions, using copy $m$:
+
+```math
+\begin{array}{l}
+\textbf{function } \mathrm{code}^m(x, t): \\
+\quad z \leftarrow () \\
+\quad \textbf{for } j = 1, \dots, t: \\
+\qquad p \leftarrow \arg\min_{p'} \, s_j^\star(z)_{p'} \qquad \text{(one choice per code, shared by every copy)} \\
+\qquad z_j \sim \mathrm{softmax}\big(e_j^m(x, z)_p\big) \\
+\quad \textbf{return } z
+\end{array}
+```
+
+A training image's *out-of-fold* code is $\mathrm{code}^{f(i)}(x_i, t)$, memoized per (image, prefix).
+
+**Decompression loss of the new token** (first definition). Each image has a code $z_i$ and a distribution
+$q_i$ over the next token $c$. Then
+
+```math
+\ell_i \;=\; \sum_{c} q_i(c) \sum_{j \ne i} \pi(j \mid z_i, c)\, d(x_i, x_j),
+\qquad
+\pi(j \mid z, c) \;\propto\; \mathbf{1}[z_j = z]\; q_j(c).
+```
+
+If no other image carries $(z, c)$, the posterior falls back to the images with code $z$. This is exact
+over all images, from per-code sums of weights, pixels and squared norms.
+
+**Second definition.** For a partition with classes $c_j$, it is $\sum_j \ell_j$ with
+$q_j = \mathrm{onehot}(c_j)$: the loss of an encoder that reproduces (image, code + class) exactly.
+
+**Truncation against an anchor.** For an anchor code $a$ and a code $z$ (both of length $t$), let
+$s(z, a)$ be the length of their shared prefix. Then
+
+```math
+\hat z_a \;=\; z_{1 : \min(s(z, a) + 1,\; t)} .
+```
+
+**All positions.**
+
+```math
+\begin{array}{l}
+\textbf{for } k = 1, \dots, K: \qquad (t = k - 1) \\[4pt]
+\quad \text{// 1. partitions} \\
+\quad \text{sample anchors } a_1, \dots, a_P \text{ and references } y_1, \dots, y_R \text{ from the training images} \\
+\quad z_{a_p} \leftarrow \text{out-of-fold code}, \quad z_{y_j} \leftarrow \text{out-of-fold code} \\
+\quad \textbf{for } p = 1, \dots, P: \\
+\qquad \text{group every reference by } \hat z_{y_j} \text{ truncated against } z_{a_p} \\
+\qquad c_j \sim \mathrm{Uniform}\{1, \dots, V\} \text{ for every reference} \\
+\qquad \textbf{repeat}: \qquad \text{(Hartigan, batched)} \\
+\qquad\quad \Delta_{j, c} \leftarrow \text{exact change in the second-definition loss from moving } y_j \text{ to class } c \\
+\qquad\quad M \leftarrow \text{references with } \min_c \Delta_{j,c} < 0, \text{ best first} \\
+\qquad\quad \textbf{if } M = \emptyset: \textbf{ break} \\
+\qquad\quad \text{apply the } |M| \text{ best moves; halve the batch until the total loss drops} \\
+\qquad \lambda_p(x, z) \;=\; \arg\min_c \,\big[\text{loss with } (x, \hat z, c) \text{ added}\big]
+        \quad (\text{class } 1 \text{ if no reference shares } \hat z) \\[4pt]
+\quad \text{// 2. encoders: } F + 1 \text{ copies, lockstep epochs} \\
+\quad \textbf{for each epoch}: \\
+\qquad \textbf{for } m \in \{1, \dots, F, \star\}: \\
+\qquad\quad \textbf{for each minibatch } B \text{ of training images with } f(i) \ne m: \\
+\qquad\qquad z_i \leftarrow \text{out-of-fold code (fresh)} \\
+\qquad\qquad \mathcal{L} = \frac{1}{|B| P} \sum_{i \in B} \sum_{p} \mathrm{CE}\big(e_k^m(x_i, z_i)_p,\; \lambda_p(x_i, z_i)\big);
+          \quad \text{step } e_k^m \\
+\qquad \text{held-out CE} = \frac{1}{NP} \sum_i \sum_p \mathrm{CE}\big(e_k^{f(i)}(x_i, \bar z_i)_p,\; \lambda_p(x_i, \bar z_i)\big)
+        \quad (\bar z_i \text{ fixed per position}) \\
+\quad \text{keep the epoch with the lowest held-out CE (all copies); stop after a patience of epochs} \\[4pt]
+\quad \text{// 3. costs} \\
+\quad \textbf{for } p = 1, \dots, P: \quad
+        q_i^{(p)} = \mathrm{softmax}\big(e_k^{f(i)}(x_i, \bar z_i)_p\big), \qquad
+        C_{ip} = \ell_i \text{ with codes } \bar z \text{ and } q^{(p)} \\[4pt]
+\quad \text{// 4. selectors: } F + 1 \text{ copies, lockstep epochs} \\
+\quad \textbf{for each epoch}: \\
+\qquad \textbf{for } m \in \{1, \dots, F, \star\}: \quad
+        \text{minimize } \tfrac{1}{P} \lVert s_k^m(\bar z_i) - C_{i,:} \rVert^2 \text{ over images with } f(i) \ne m \\
+\qquad \text{held-out MSE} = \frac{1}{NP} \sum_i \lVert s_k^{f(i)}(\bar z_i) - C_{i,:} \rVert^2 \\
+\quad \text{keep the epoch with the lowest held-out MSE (all copies); stop after a patience of epochs} \\
+\quad s_k^m \leftarrow s_k^\star \text{ for every fold copy } m \quad \text{(fold selectors only chose the epoch)} \\[4pt]
+\quad \text{// 5. the position} \\
+\quad \text{position } k \text{ of the encoder} = \big(e_k^\star, s_k^\star\big); \quad
+        \text{report } \ell \text{ on the val split with the selector's choices}
+\end{array}
+```
 
 ## Setup
 

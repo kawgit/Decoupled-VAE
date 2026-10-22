@@ -13,8 +13,9 @@ For each position k (prefix length t = k-1):
   3. Costs. For every training image, with its held-out encoder, the new token's decompression loss
      under each partition (exact, all training images as references).
   4. Selectors. Train num_folds + 1 SelectorNets to predict those costs from the code alone (MSE), with
-     the same fold split and shared epochs, early-stopped on held-out MSE. The encoder uses the partition
-     with the lowest predicted cost.
+     the same fold split and shared epochs, early-stopped on the fold copies' held-out MSE. Afterwards
+     every copy uses the final selector, so each token means the same thing in every copy. The encoder
+     uses the partition with the lowest predicted cost.
   5. Report the new token's loss on the val split: per the selector's choices, for the single best
      partition, and with no code.
 
@@ -361,6 +362,11 @@ def main():
                 s.load_state_dict(st)
                 s.eval()
             log(f"selectors: best epoch {best_sel['epoch']}, held-out MSE {best_sel['score']:.3e}")
+            # Every copy codes with the final selector from here on: the fold selectors only chose the epoch.
+            # One choice per code keeps each token's meaning the same in every copy (partitions can be tied
+            # mirror images, so independent choices could flip it).
+            for s in selectors[:Fo]:
+                s.load_state_dict(selectors[Fo].state_dict())
             sampler.add_position(encoders, selectors)
 
             # 5. report on the val split: val images coded by the final models, training images (coded out of
