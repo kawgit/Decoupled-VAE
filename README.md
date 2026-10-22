@@ -15,7 +15,7 @@ of its own posterior.
 **Decompression loss** of an encoder $q$ on an image dataset $x_1, \dots, x_N$:
 
 ```math
-L \;=\; \frac{1}{N} \sum_i \sum_k p(k)\, \mathbb{E}_{z \sim q(z_{1:k} \mid x_i)}\, F_k(x_i, z),
+L \;=\; \mathbb{E}_{i \sim \mathrm{U}\{1, \dots, N\}}\; \mathbb{E}_{k \sim p}\; \mathbb{E}_{z \sim q(z_{1:k} \mid x_i)}\, F_k(x_i, z),
 \qquad
 F_k(x_i, z) \;=\; \mathbb{E}_{j \sim \pi(j \mid z_{1:k}),\; j \ne i}\; d(x_i, x_j),
 \qquad
@@ -23,21 +23,21 @@ F_k(x_i, z) \;=\; \mathbb{E}_{j \sim \pi(j \mid z_{1:k}),\; j \ne i}\; d(x_i, x_
 ```
 
 **Marginal decompression loss** of a next-token encoder $q(c \mid x, z)$ on a weighted (image, code)
-dataset $D = \{(x_i, z_i, w_i)\}$, with all codes of one length $t$. It measures what one more token adds
-on top of the given codes:
+dataset $D = \{(x_i, z_i, w_i)\}$, with all codes of one length $t$ and weights summing to 1. It measures
+what one more token adds on top of the given codes:
 
 ```math
-M(D, q) \;=\; \sum_i w_i\, \ell_i,
+M(D, q) \;=\; \mathbb{E}_{i \sim w}\, \ell_i,
 \qquad
-\ell_i \;=\; \sum_c q(c \mid x_i, z_i) \sum_{j \ne i} \pi(j \mid z_i, c)\, d(x_i, x_j),
+\ell_i \;=\; \mathbb{E}_{c \sim q(c \mid x_i, z_i)}\; \mathbb{E}_{j \sim \pi(j \mid z_i, c),\; j \ne i}\; d(x_i, x_j),
 \qquad
 \pi(j \mid z, c) \;\propto\; w_j\, \mathbf{1}[z_j = z]\, q(c \mid x_j, z_j).
 ```
 
-The decompression loss is a $p(k)$-weighted average of marginal ones:
+The decompression loss is an average of marginal ones over $k \sim p$:
 
 ```math
-L \;=\; \sum_k p(k)\, M(D_{k-1}, q_k),
+L \;=\; \mathbb{E}_{k \sim p}\, M(D_{k-1}, q_k),
 \qquad
 D_{k-1} \;=\; \Big\{\big(x_i,\, z,\, \tfrac{1}{N} q(z \mid x_i)\big) : z \in \{1, \dots, V\}^{k-1}\Big\},
 \qquad
@@ -133,7 +133,7 @@ A training image's *out-of-fold* code is $\mathrm{code}^{f(i)}(x_i, t)$, memoize
 distribution $q_i$ over the next token $c$. Then
 
 ```math
-\ell_i \;=\; \sum_{c} q_i(c) \sum_{j \ne i} \pi(j \mid z_i, c)\, d(x_i, x_j),
+\ell_i \;=\; \mathbb{E}_{c \sim q_i}\; \mathbb{E}_{j \sim \pi(j \mid z_i, c),\; j \ne i}\; d(x_i, x_j),
 \qquad
 \pi(j \mid z, c) \;\propto\; \mathbf{1}[z_j = z]\; q_j(c).
 ```
@@ -142,7 +142,7 @@ If no other image carries $(z, c)$, the posterior falls back to the images with 
 over all images, from per-code sums of weights, pixels and squared norms.
 
 **A partition's implied marginal decompression loss.** For a partition with classes $c_j$, it is
-$\sum_j w_j \ell_j$ with $q_j = \mathrm{onehot}(c_j)$: the loss of an encoder that reproduces
+$\mathbb{E}_{j \sim w}\, \ell_j$ with $q_j = \mathrm{onehot}(c_j)$: the loss of an encoder that reproduces
 (image, code + class) exactly.
 
 **Truncation against an anchor.** For an anchor code $a$ and a code $z$ (both of length $t$), let
@@ -179,9 +179,9 @@ $s(z, a)$ be the length of their shared prefix. Then
 \qquad \textbf{for } m \in \{1, \dots, F, \star\}: \\
 \qquad\quad \textbf{for each minibatch } B \text{ of training images with } f(i) \ne m: \\
 \qquad\qquad z_i \leftarrow \text{out-of-fold code (fresh)} \\
-\qquad\qquad \mathcal{L} = \frac{1}{|B| P} \sum_{i \in B} \sum_{p} \mathrm{CE}\big(e_k^m(x_i, z_i)_p,\; \lambda_p(x_i, z_i)\big);
+\qquad\qquad \mathcal{L} = \mathbb{E}_{i \sim B}\, \mathbb{E}_{p}\, \mathrm{CE}\big(e_k^m(x_i, z_i)_p,\; \lambda_p(x_i, z_i)\big);
           \quad \text{step } e_k^m \\
-\qquad \text{held-out CE} = \frac{1}{NP} \sum_i \sum_p \mathrm{CE}\big(e_k^{f(i)}(x_i, \bar z_i)_p,\; \lambda_p(x_i, \bar z_i)\big)
+\qquad \text{held-out CE} = \mathbb{E}_{i}\, \mathbb{E}_{p}\, \mathrm{CE}\big(e_k^{f(i)}(x_i, \bar z_i)_p,\; \lambda_p(x_i, \bar z_i)\big)
         \quad (\bar z_i \text{ fixed per position}) \\
 \quad \text{keep the epoch with the lowest held-out CE (all copies); stop after a patience of epochs} \\[4pt]
 \quad \text{// 3. costs} \\
@@ -191,8 +191,8 @@ $s(z, a)$ be the length of their shared prefix. Then
 \quad \text{// 4. selectors: } F + 1 \text{ copies, lockstep epochs} \\
 \quad \textbf{for each epoch}: \\
 \qquad \textbf{for } m \in \{1, \dots, F, \star\}: \quad
-        \text{minimize } \tfrac{1}{P} \lVert s_k^m(\bar z_i) - C_{i,:} \rVert^2 \text{ over images with } f(i) \ne m \\
-\qquad \text{held-out loss of choices} = \frac{1}{N} \sum_i C_{i, \hat p_i}, \qquad
+        \text{minimize } \mathbb{E}_{i : f(i) \ne m}\, \mathbb{E}_{p}\, \big(s_k^m(\bar z_i)_p - C_{ip}\big)^2 \\
+\qquad \text{held-out loss of choices} = \mathbb{E}_{i}\, C_{i, \hat p_i}, \qquad
         \hat p_i = \arg\min_p s_k^{f(i)}(\bar z_i)_p \\
 \quad \text{keep the epoch with the lowest held-out loss of choices (all copies); stop after a patience of epochs} \\
 \quad s_k^m \leftarrow s_k^\star \text{ for every fold copy } m \quad \text{(fold selectors only chose the epoch)} \\[4pt]
