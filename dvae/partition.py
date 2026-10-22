@@ -22,7 +22,7 @@ Hartigan's moves and the labels unchanged; it puts total_loss() on the scale of 
 
 import torch
 
-CHUNK_ELEMENTS = 2**25  # floats in the largest temporary per vectorized chunk ([rows, V, P])
+CHUNK_ELEMENTS = 2**25  # floats in the largest temporary per vectorized chunk
 
 
 def chunk_rows(V, P):
@@ -63,11 +63,20 @@ def cluster_cost(n, S, Q, ng, Sg, Qg, P):
     n == 1: no other member shares code and class, so (as in node_costs) the member's posterior falls back
     to the rest of its group: its mean distance to the other group members.
     """
+    return cluster_cost_dots(n, S.pow(2).sum(-1), (S * Sg).sum(-1), Q, ng, Qg, P)
+
+
+def cluster_cost_dots(n, SS, SSg, Q, ng, Qg, P):
+    """cluster_cost with the pixel sums given only through SS = |S|^2 and SSg = S . Sg, which is all it needs.
+
+    Moving one image x in or out of a cluster changes these by dot products with x, so the change in cost
+    of every candidate move needs no [.., P] temporary.
+    """
     nf = n.float()
-    sse = Q - S.pow(2).sum(-1) / nf.clamp_min(1)
+    sse = Q - SS / nf.clamp_min(1)
     many = 2 * nf / (nf - 1).clamp_min(1) * sse
     others = (ng - 1).float()
-    single = (others * Q - 2 * (S * (Sg - S)).sum(-1) + (Qg - Q)) / others.clamp_min(1)
+    single = (others * Q - 2 * (SSg - SS) + (Qg - Q)) / others.clamp_min(1)
     single = torch.where(others > 0, single, 0.0)
     return torch.where(n >= 2, many, torch.where(n == 1, single, 0.0)) / P
 
@@ -88,17 +97,26 @@ class AnchorPartition:
         self.Sg = torch.zeros(G, self.P, device=device).index_add_(0, ginv, ref_x)
         self.Qg = torch.zeros(G, device=device).index_add_(0, ginv, sq)
         labels = torch.randint(V, (len(ref_x),), generator=generator).to(device)
+        members = [(ginv == g).nonzero().squeeze(1) for g in range(G)]
+        member_x = [ref_x[m] for m in members]
+        xSg = (ref_x * self.Sg[ginv]).sum(1)  # each reference . its group's pixel sum
+        rows = torch.arange(len(ref_x), device=device)
+        ng, Qg = self.ng[ginv], self.Qg[ginv]
         self.rounds = 0
         for self.rounds in range(1, max_rounds + 1):
             n, S, Q = self._stats(ginv, labels, ref_x, sq, G)
-            cost = self._costs(n, S, Q)  # [G, V]
+            SS, SSg = S.pow(2).sum(-1), (S * self.Sg[:, None, :]).sum(-1)  # [G, V]
+            cost = cluster_cost_dots(n, SS, SSg, Q, self.ng[:, None], self.Qg[:, None], self.P)
             total = cost.sum()
+            xS = torch.empty(len(ref_x), V, device=device)  # each reference . every class sum in its group
+            for g in range(G):
+                xS[members[g]] = member_x[g] @ S[g].T
             # exact change in total loss from moving each reference to each other class
             a = labels
-            rem = cluster_cost(n[ginv, a] - 1, S[ginv, a] - ref_x, Q[ginv, a] - sq,
-                               self.ng[ginv], self.Sg[ginv], self.Qg[ginv], self.P) - cost[ginv, a]
-            add = cluster_cost(n[ginv] + 1, S[ginv] + ref_x[:, None, :], Q[ginv] + sq[:, None],
-                               self.ng[ginv, None], self.Sg[ginv, None, :], self.Qg[ginv, None], self.P) - cost[ginv]
+            rem = cluster_cost_dots(n[ginv, a] - 1, SS[ginv, a] - 2 * xS[rows, a] + sq, SSg[ginv, a] - xSg,
+                                    Q[ginv, a] - sq, ng, Qg, self.P) - cost[ginv, a]
+            add = cluster_cost_dots(n[ginv] + 1, SS[ginv] + 2 * xS + sq[:, None], SSg[ginv] + xSg[:, None],
+                                    Q[ginv] + sq[:, None], ng[:, None], Qg[:, None], self.P) - cost[ginv]
             delta = (rem[:, None] + add).masked_fill(torch.nn.functional.one_hot(a, V).bool(), torch.inf)
             best, target = delta.min(1)
             improving = (best < -1e-9 * total.abs().clamp_min(1e-12)).nonzero().squeeze(1)
@@ -117,6 +135,7 @@ class AnchorPartition:
                 break
         self.n, self.S, self.Q = self._stats(ginv, labels, ref_x, sq, G)
         self.cost = self._costs(self.n, self.S, self.Q)
+        self.SS, self.SSg = self.S.pow(2).sum(-1), (self.S * self.Sg[:, None, :]).sum(-1)
         self.ref_labels = labels
 
     def _stats(self, ginv, labels, x, sq, G):
@@ -135,20 +154,22 @@ class AnchorPartition:
     def labels(self, x, codes):
         """Class for each image x [n, P] with code [n, t]: the class whose total loss rises least if the image
         joins it (class 0 when its truncated group has no references)."""
-        rows = chunk_rows(self.V, self.P)
+        rows = max(1024, CHUNK_ELEMENTS // max(self.S.shape[0] * self.V, self.P))
         return torch.cat([self._labels(x[i:i + rows], codes[i:i + rows]) for i in range(0, len(x), rows)]) \
             if len(x) > rows else self._labels(x, codes)
 
     def _labels(self, x, codes):
         pos, hit = self.table.find(truncated_group(codes, self.anchor_code, self.V))
+        m = torch.arange(len(x), device=x.device)
         sq = x.pow(2).sum(1)
-        n, S, Q, cost = self.n[pos], self.S[pos], self.Q[pos], self.cost[pos]  # [m, V, ...]
-        ng1, Sg1, Qg1 = self.ng[pos] + 1, self.Sg[pos] + x, self.Qg[pos] + sq  # the group with the image added
-        own = cluster_cost(n + 1, S + x[:, None, :], Q + sq[:, None], ng1[:, None], Sg1[:, None, :], Qg1[:, None],
-                           self.P) - cost
+        xS = (x @ self.S.flatten(0, 1).T).view(len(x), -1, self.V)[m, pos]  # image . every class sum in its group
+        xSg = (x * self.Sg[pos]).sum(1)
+        n, SS, SSg, Q, cost = self.n[pos], self.SS[pos], self.SSg[pos], self.Q[pos], self.cost[pos]  # [m, V]
+        ng1, Qg1 = (self.ng[pos] + 1)[:, None], (self.Qg[pos] + sq)[:, None]  # the group with the image added
+        own = cluster_cost_dots(n + 1, SS + 2 * xS + sq[:, None], SSg + xS + xSg[:, None] + sq[:, None],
+                                Q + sq[:, None], ng1, Qg1, self.P) - cost
         # lone members of other classes now also measure their distance to the image
-        lone = torch.where(n == 1, cluster_cost(n, S, Q, ng1[:, None], Sg1[:, None, :], Qg1[:, None], self.P) - cost,
-                           0.0)
+        lone = torch.where(n == 1, cluster_cost_dots(n, SS, SSg + xS, Q, ng1, Qg1, self.P) - cost, 0.0)
         rise = own + lone.sum(1, keepdim=True) - lone
         return torch.where(hit, rise.argmin(1), 0)
 
