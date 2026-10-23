@@ -4,8 +4,9 @@ A discrete VAE with a 1-D autoregressive latent of `k_max` tokens over a vocab o
 three separate stages. The encoder is built first, against an ideal decoder. Then the decoder and
 the prior are each trained on the frozen encoder's codes.
 
-Default latent: `V=2`, `k_max=10`, i.e. 1024 codes. `analyze_encoder.py` and `benchmark.py`
-enumerate every code, so they need a code space that small.
+Default latent: `V=16`, `k_max=8`, i.e. 16⁸ ≈ 4.3 billion codes. Beyond 2¹⁶ codes, `analyze_encoder.py`
+analyzes only the prefixes it can enumerate, and `benchmark.py` estimates its numbers from the encoder's
+top and sampled codes.
 
 ## The objective
 

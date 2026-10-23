@@ -22,7 +22,7 @@ def main():
     p.add_argument("--likelihood", choices=["gray", "binary"], default="gray")
     add_mode_args(p, "encoder")
     p.add_argument("--d-model", type=int, default=128)
-    p.add_argument("--n-layers", type=int, default=2)
+    p.add_argument("--n-layers", type=int, default=4)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--channels", type=int, default=128)
     args = parse_train_args(p)

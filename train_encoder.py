@@ -269,9 +269,9 @@ def draw_references(sampler, anchor_codes, R, generator, progress):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common_args(p)
-    p.add_argument("--vocab-size", type=int, default=2)
-    p.add_argument("--k-max", type=int, default=10)
-    p.add_argument("--folds", type=int, default=8)
+    p.add_argument("--vocab-size", type=int, default=16)
+    p.add_argument("--k-max", type=int, default=8)
+    p.add_argument("--folds", type=int, default=4)
     p.add_argument("--anchors", type=int, default=32, help="P: anchor images, one partition each")
     p.add_argument("--references", type=int, default=8192,
                    help="R: reference draws per anchor, split evenly over its truncated groups")
@@ -281,7 +281,7 @@ def main():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=20, help="max encoder epochs per position")
-    p.add_argument("--patience", type=int, default=3)
+    p.add_argument("--patience", type=int, default=1)
     p.add_argument("--selector-width", type=int, default=128)
     p.add_argument("--selector-batch-size", type=int, default=1024)
     p.add_argument("--selector-lr", type=float, default=1e-3)
