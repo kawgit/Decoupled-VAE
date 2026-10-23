@@ -340,7 +340,12 @@ python analyze_encoder.py --encoder checkpoints/encoder.pt # -> results/usage_en
   picks the $q$ used), and reports how many training images the posterior spreads over.
 - **Benchmark:** `benchmark.py` scores each decoder on the data it was trained for: 8-bit MNIST, or
   the test set binarized with a fixed seed. It reports exact NLL, plus −ELBO and rate when you pass
-  `--encoder`.
+  `--encoder`. When the code space is too large to enumerate (more than 2¹⁶ codes), it uses the encoder
+  (default `checkpoints/encoder.pt`): the top `--beam` codes per image under q are summed exactly, and
+  `--samples` more are drawn from q outside them. That gives an unbiased estimate of p(x), reported as
+  `nll_is` (an upper bound on the NLL on average), plus a guaranteed upper bound from the top codes
+  alone (`nll_top_bound`) and the −ELBO, distortion and rate. The decoder runs once per distinct code.
+  Use `--limit` for a quicker partial run.
 - **Latent usage:** `analyze_encoder.py` reports, for each prefix length k, how many bits carry
   information about the image and about the digit label, and how many codes are used.
 
