@@ -148,8 +148,8 @@ A token with fewer than two images of weight adds nothing: its $\hat D$ falls ba
 partition $\lambda$, which gives every training image one of $V$ classes $\lambda_j$, has the implied gain
 $\hat G(z, \lambda)$ of the slice that reproduces it exactly, $r(c \mid x_j) = \mathbf{1}[c = \lambda_j]$.
 
-**Which codes.** There are far too many codes to enumerate, so the build examines a random subset. It
-samples $C$ (`--codes`) training images without replacement, and an out-of-fold code for each. $Z_u$ is
+**Which codes.** There are far too many codes to enumerate, so the selector is fit on a random subset.
+The build samples $C$ (`--codes`) training images without replacement, and an out-of-fold code for each. $Z_u$ is
 the set of their distinct length-$u$ prefixes, and $n_z$ is how many samples share prefix $z$. Every
 sample's code comes from the implied prior $p_q$, so count-weighted averages estimate prior expectations,
 and each distinct prefix is computed once:
@@ -173,29 +173,31 @@ If no training image has weight on the prefix, the longest prefix that has some 
 
 - **SliceNet** maps an image to logits $s(x) \in \mathbb{R}^{S \times V}$ for its $S$ slices. Slice $h$
   is $r_h(c \mid x) = \mathrm{softmax}\big(s(x)_h\big)_c$. It sees only the image.
+- **Committed nodes.** Some codes $z$ have a slice built for them, $\kappa(z)$, which they always ask. The
+  committed codes form a tree from the root: every committed node's parent is committed too.
 - **SelectorNet** maps a prefix $z$ of any length to $\sigma(z) \in \mathbb{R}^S$, the predicted gain of
-  each slice there. It sees only the code.
-- **Encoding.** At each position, the knight picks the unused slice with the highest predicted gain and
-  samples the token from it:
+  each slice there. It sees only the code, and it picks wherever no slice is committed.
+- **Encoding.** At each position the knight asks the committed slice, or else the unused slice with the
+  highest predicted gain, and samples the token from it:
 
 ```math
 q(z_u \mid x, z_{1:u-1}) \;=\; r_{\eta(z_{1:u-1})}(z_u \mid x),
 \qquad
-\eta(z) \;=\; \arg\max_{h \notin \mathrm{used}(z)} \sigma(z)_h,
+\eta(z) \;=\; \begin{cases} \kappa(z) & z \text{ committed,} \\ \arg\max_{h \notin \mathrm{used}(z)} \sigma(z)_h & \text{otherwise,} \end{cases}
 \qquad
 \mathrm{used}(z) \;=\; \big\{ \eta(z_{1:u}) : 0 \le u < |z| \big\}.
 ```
 
 Every image with the same prefix uses the same slice, so a token means the same thing for all of them.
-One slice can be picked at many prefixes and depths: the slices are a shared bank of questions, and a
+One slice can be asked at many prefixes and depths: the slices are a shared bank of questions, and a
 code is a path down a decision tree whose questions come from the bank. A slice sees only the image, so
 asking it twice along one code gets the same answer again; $\mathrm{used}(z)$, which follows from $z$
 alone, rules that out. Once the bank is used up, after $S$ tokens, every further token is 0.
 
-**The decoder and prior read the slices too.** At every position they're told which slice the selector
-asks there (a separate index once the bank is used up). That index follows from the code's earlier tokens
-through the selector, so the encoder supplies it: when they train, when the prior samples, and when the
-benchmark enumerates codes.
+**The decoder and prior read the slices too.** At every position they're told which slice is asked
+there (a separate index once the bank is used up). That index follows from the code's earlier tokens
+through the commits and the selector, so the encoder supplies it: when they train, when the prior
+samples, and when the benchmark enumerates codes.
 
 **SliceNet grows by columns.** Each build round adds one column holding up to $B$ (`--slices-per-round`)
 new slices. A column is a small conv stack with one head per slice. Its layer $l$ reads its own layer
@@ -206,60 +208,54 @@ Earlier columns are frozen, so adding a column never changes an earlier slice's 
 
 ## How the encoder is built
 
-`train_encoder.py` grows the bank round by round. Each round adds up to $B$ slices that improve the
-encoder most, then retrains the selector to use them. Throughout, a table holds every slice's held-out output
-on every training image, so any code's posterior is a lookup away.
+`train_encoder.py` grows a committed tree top down, like divisive hierarchical $V$-means: each round
+splits the $B$ nodes whose children hold the most loss, each with a slice built for it, then retrains the selector
+to fill in everywhere else. Throughout, a table holds every slice's held-out output on every training
+image, so any code's posterior is a lookup away.
 
-1. **Codes.** Examine a sample of the encoder's codes: $C$ training images with an out-of-fold code each,
-   rolled out to depth $T$, and all their prefixes. $T$ is where codes stop: the bank is used up
-   ($T = S$), or every examined code is reached by a single training image, since deeper tokens can't be
-   scored. In round 1 the bank is empty, $T = 0$, and the only code is the empty one.
-2. **Bar.** At every examined code, the bank's best realized gain: the highest $\hat G$ of a slice not yet
-   used on that code, with its held-out outputs.
-3. **Partitions.** Candidates first, one per code: sample `--candidates` $\times B$ distinct examined codes,
-   each with probability proportional to its weight in the improvement, $\omega_u n_z / C$, among the codes
-   whose posteriors weigh at least `--min-support` images.
-   - For each sampled code, split its posterior as well as possible: within one code, a partition's implied
-     loss is k-means' objective with $V$ clusters, with images weighted by the code's posterior, up to the
-     different-pairs correction. So the search starts as k-means++ does, from the code's own images: $V$
-     seeds sampled one at a time, each with probability proportional to its posterior weight times its
-     squared distance to the nearest seed so far. Then Hartigan's method with batched moves, kept only if
-     the code's gain rises. It stops when no move helps, or when the last 5 rounds raised the gain by
-     less than `--hartigan-tol` of it per round.
-   - Then label every training image by its nearest class centroid, a class's posterior-weighted mean
-     image at that code. That makes each class mean the same thing everywhere, and a nearest-centroid
-     rule is linear in the image, so a column can learn it.
-   - Score each candidate by the bank's improvement: over the examined codes at depths $0, \dots, T$,
-     weighted by count and depth, how far its implied gain beats the bar. Depth $T$ counts because a new
-     slice can follow the end of a code. Keep the $B$ best. Different target codes make them differ.
-   - The bar is realized, from trained slices. The partitions' gains are implied, which is optimistic,
-     since a trained slice won't reproduce the classes exactly.
-   - Images with no weight in any code where a kept partition beats the bar get no label for it. A
-     candidate that beats the bar nowhere isn't kept; if none does, the build stops.
-4. **Column.** Train `--folds` + 1 copies of the new column by cross-entropy against the partitions'
-   classes, skipping unlabeled images: fold copy $f$ on the training images outside fold $f$, a final
-   copy on all. All copies share the epoch count, chosen by the pooled held-out cross-entropy. Slices see
-   only images, so no codes are needed here. The new slices' held-out outputs join the table.
-5. **Selector.** A fresh SelectorNet, fit one depth at a time on a fresh sample of $C$ images, since codes
-   at depth $u$ depend on the selector's choices above it. For $u = 0, 1, \dots$:
-   - extend the sampled codes by one token with the selector so far; stop, with $T = u$, if the bank is used
-     up or every depth-$u$ code is reached by a single image;
+1. **Frontier.** The uncommitted children of committed nodes, or the root before anything is committed.
+   Each is scored by the loss its children would still hold under the question asked there now (the
+   selector's pick, or none before any slice exists), weighted by the chance a decoder reads the token after
+   it: $\rho^{|z|}\, W(z)\, \big(\hat D(z) - G_{z,\eta(z)}\big)$, with $W(z)$ the images its posterior weighs and
+   $\hat D(z)$ its spread. A node the bank already splits well ranks low. Frontier nodes' ancestors are all
+   committed, so their posteriors are exact products of table entries. The $B$ highest are this round's
+   targets.
+2. **Partitions.** For each target, split its posterior as well as possible: within one code, a
+   partition's implied loss is k-means' objective with $V$ clusters, with images weighted by the posterior,
+   up to the different-pairs correction.
+   - The search starts as k-means++ does, from the target's own images: $V$ seeds sampled one at a time,
+     each with probability proportional to its posterior weight times its squared distance to the nearest
+     seed so far. Then Hartigan's method with batched moves, kept only if the gain rises. It stops when no
+     move helps, or when the last 5 rounds raised the gain by less than `--hartigan-tol` of it per round.
+     The best of `--restarts` starts is kept.
+   - Then every training image takes its nearest class centroid, a class's posterior-weighted mean image
+     at the target. That keeps the classes consistent, and a nearest-centroid rule is linear in the
+     image, so a column can learn it.
+3. **Column.** Train `--folds` + 1 copies of the new column by cross-entropy against the partitions'
+   classes, each image weighted by its posterior weight in the target: fold copy $f$ on the training
+   images outside fold $f$, a final copy on all. All copies share the epoch count, chosen by the pooled
+   held-out cross-entropy. Slices see only images, so no codes are needed here. The new slices' held-out
+   outputs join the table, and each target commits to its new slice. The build logs each new slice's
+   realized gain at its target, next to the best gain any older slice gets there.
+4. **Selector.** A fresh SelectorNet, fit one depth at a time on $C$ (`--codes`) sampled images, since
+   codes at depth $u$ depend on the choices above it. For $u = 0, 1, \dots$:
+   - extend the sampled codes by one token, with the commits and the selector so far; stop, with $T = u$, if
+     the bank is used up or every depth-$u$ code is reached by a single image;
    - at every distinct depth-$u$ prefix, the realized gain of every slice, used ones included: asking a
      slice again gains about nothing, and the selector has to know that in case its choices above change;
    - fit `--folds` + 1 copies by MSE on those gains at depths $0, \dots, u$, early-stopped on the held-out
-     gain of their choices (only unused slices can be chosen), weighted by depth. A sample belongs to its
-     image's fold. Then every copy uses the final selector.
+     gain of their choices at uncommitted prefixes (only unused slices can be chosen), weighted by depth.
+     A sample belongs to its image's fold. Then every copy uses the final selector.
 
    Fitting a deeper depth can change choices at shallower ones after their codes were rolled out; the
-   build logs how many changed, and how often the final selector picks the unused slice with the highest
-   realized gain, at each depth.
-6. **Report.** On the val split: $\hat L_t$ for every length $t \le T$, and $\hat L$ (lengths past $T$
+   build logs how many changed, and per depth the share of committed prefixes and how often the final
+   selector picks the unused slice with the highest realized gain elsewhere.
+5. **Report.** On the val split: $\hat L_t$ for every length $t \le T$, and $\hat L$ (lengths past $T$
    score the same as $T$), with the label term when $\lambda > 0$; the wrong-digit rate at length $T$, the
-   posterior's weight on training images of another digit, which compares runs with different $\lambda$;
-   each new slice's implied and realized improvement; how many slices the selector uses.
+   posterior's weight on training images of another digit, which compares runs with different $\lambda$.
 
-The build stops after `--rounds` rounds, or when the val loss hasn't improved for `--round-patience`
-rounds. Every step logs when it starts, its progress and its duration.
+The build stops after `--rounds` rounds, when no frontier node can be split, or when the val loss hasn't
+improved for `--round-patience` rounds. Every step logs one line with its result and duration.
 
 ## Encoder training
 
@@ -268,15 +264,16 @@ rounds. Every step logs when it starts, its progress and its duration.
 - Model copies $m \in \{1, \dots, F, \star\}$: fold copy $m$ never sees fold $m$; $\star$ is the final copy.
   A val image $v$ goes through the final copy, $f(v) = \star$, which never trained on it either.
 - Copy $m$ of the SliceNet has slices $r^m_h$, $h \in \{1, \dots, S\}$. There is one selector,
-  $\sigma^\star$, and $\eta(z) = \arg\max_{h \notin \mathrm{used}(z)} \sigma^\star(z)_h$. Copy $m$ of the
-  encoder is $q^m(z_u \mid x, z_{1:u-1}) = r^m_{\eta(z_{1:u-1})}(z_u \mid x)$.
+  $\sigma^\star$, and one commit table $\kappa$, which give $\eta$ as above. Copy $m$ of the encoder is
+  $q^m(z_u \mid x, z_{1:u-1}) = r^m_{\eta(z_{1:u-1})}(z_u \mid x)$.
 - The table holds $R_{jhc} = r^{f(j)}_h(c \mid x_j)$, every training image's held-out slice outputs. A
   code's posterior weights are held out too: $w_j(z) = q^{f(j)}(z \mid x_j)$.
+- $\mathcal F$ is the frontier: the uncommitted children of committed nodes (the root while nothing is
+  committed). $W(z) = \sum_j w_j(z)$ and $\hat D(z) = \hat D(w(z))$.
 - Samples $d = 1, \dots, C$: a training image $j_d$, sampled without replacement, and its out-of-fold code
-  $z_d \sim q^{f(j_d)}(\cdot \mid x_{j_d})$, rolled out to depth $T$. $Z_u$ holds their distinct length-$u$
-  prefixes, and $n_z$ counts the samples with prefix $z$.
+  $z_d$, rolled out to depth $T$. $Z_u$ holds their distinct length-$u$ prefixes.
 - $T$ is the depth the codes stop at: $T = S$ when the bank is used up, or the first depth at which every
-  examined code is reached by a single training image.
+  sampled code is reached by a single training image.
 - $\omega_u = P_{t \sim p_t}(t \ge u + 1) = \rho^u$ weighs depth $u$, whose token is position $u+1$.
 - $G_{zh} = \hat G(z, R_{\cdot h \cdot})$ is slice $h$'s realized gain at code $z$, and $\hat G(z, \lambda)$
   a partition's implied gain.
@@ -288,41 +285,45 @@ Two versions follow: a concise one in equations, and a step-by-step one in pseud
 
 ### In equations
 
-**One round**, with $S$ slices in the bank and the examined codes $Z_0, \dots, Z_T$:
+**One round**, with $S$ slices in the bank:
 
-**1. Partitions**, one candidate per sampled code $z$:
+**1. Targets**: the $B$ frontier nodes $z_1, \dots, z_B \in \mathcal F$ with the highest
 
 ```math
-\lambda^{(z)} \;=\; \operatorname{nearestCentroid}_z\Big(\operatorname{Hartigan}_\lambda\, \hat G(z, \lambda)\Big),
-\qquad
-J(\lambda) \;=\; \sum_{u=0}^{T} \omega_u\, \frac{1}{C} \sum_{z \in Z_u} n_z\, \big[\, \hat G(z, \lambda) - G^*_z \big]_+ ,
-\qquad
-G^*_z \;=\; \max\Big( 0,\; \max_{h \notin \mathrm{used}(z)}\, G_{zh} \Big),
+\mathrm{score}(z) \;=\; \omega_{|z|}\; W(z)\; \big(\hat D(z) - G_{z,\eta(z)}\big),
 ```
 
-for each sampled code $z$, from a k-means++ start among its images. $\lambda_1, \dots, \lambda_B$ are the
-candidates with the highest $J$ (and $J > 0$). Image $j$ is labeled by $\lambda_b$ ($\nu_{jb} = 1$) when it has
-weight in some examined code $z$ with $\hat G(z, \lambda_b) > G^*_z$. $B$ below counts the partitions kept.
+the loss its children would hold under the question asked there now ($G = 0$ while the bank is empty).
 
-**2. Column**: slices $S+1, \dots, S+B$, for every copy $m$:
+**2. Partitions**, one per target:
+
+```math
+\lambda_b \;=\; \operatorname{nearestCentroid}_{z_b}\Big(\operatorname{Hartigan}_\lambda\, \hat G(z_b, \lambda)\Big),
+```
+
+the best of `--restarts` k-means++ starts among $z_b$'s images.
+
+**3. Column**: slices $S+1, \dots, S+B$, for every copy $m$, each image weighted by its posterior weight
+in the target; then $\kappa(z_b) \leftarrow S + b$:
 
 ```math
 s^m_{\mathrm{new}} \;=\; \operatorname{fit}_s\;
-  \frac{\mathbb{E}_{j : f(j) \ne m}\, \sum_b \nu_{jb}\, \mathrm{CE}\big(s(x_j)_{S+b},\, \lambda_{b,j}\big)}
-       {\mathbb{E}_{j : f(j) \ne m}\, \sum_b \nu_{jb}}
+  \frac{\mathbb{E}_{j : f(j) \ne m}\, \sum_b w_j(z_b)\, \mathrm{CE}\big(s(x_j)_{S+b},\, \lambda_{b,j}\big)}
+       {\mathbb{E}_{j : f(j) \ne m}\, \sum_b w_j(z_b)}
 \;\big\|\;
   \text{the same over all } j \text{ with } s^{f(j)}_{\mathrm{new}} .
 ```
 
-**3. Selector**: reinitialized, with $C$ fresh samples. For $u = 0, 1, \dots$: extend every $z_d$ by one
-token with the current $\sigma^\star$; stop with $T = u$ if the bank is used up or every code in $Z_u$ is
-reached by a single image; else compute $G_{zh}$ for every $z \in Z_u$ and every slice $h$, used or not, and
+**4. Selector**: reinitialized, with $C$ fresh samples. For $u = 0, 1, \dots$: extend every $z_d$ by one
+token with $\kappa$ and the current $\sigma^\star$; stop with $T = u$ if the bank is used up or every code in
+$Z_u$ is reached by a single image; else compute $G_{zh}$ for every $z \in Z_u$ and every slice $h$, used or
+not, and
 
 ```math
 \sigma^m \;=\; \operatorname{fit}_\sigma\;
   \mathbb{E}_{d : f(j_d) \ne m}\, \sum_{u' \le u}\, \mathbb{E}_h\, \big(\sigma(z_{d,1:u'})_h - G_{z_{d,1:u'} h}\big)^2
 \;\big\|\;
-  \mathbb{E}_d \sum_{u' \le u} \omega_{u'}\, G_{z_{d,1:u'} \hat h},
+  \frac{1}{C} \sum_d \sum_{u' \le u} \mathbf{1}[z_{d,1:u'} \text{ uncommitted}]\; \omega_{u'}\, G_{z_{d,1:u'} \hat h},
 \qquad
 \hat h \;=\; \arg\max_{h \notin \mathrm{used}} \sigma^{f(j_d)}(z_{d,1:u'})_h ,
 ```
@@ -330,7 +331,7 @@ reached by a single image; else compute $G_{zh}$ for every $z \in Z_u$ and every
 with $\mathrm{used} = \mathrm{used}(z_{d,1:u'})$, warm-started from the previous depth's fit. Then
 $\sigma^m \leftarrow \sigma^\star$ for every copy.
 
-**4. Report** $\hat L$ on the val split, with val images coded by $q^\star$.
+**5. Report** $\hat L$ on the val split, with val images coded by $q^\star$.
 
 ### In pseudo-code
 
@@ -346,29 +347,24 @@ calls them.
 \text{// } x_j \text{: the training images (shape } N \times n_{\mathrm{px}} \text{); } f(j) \text{: each image's fold (shape } N \text{)} \\
 \text{// the bank: } F + 1 \text{ SliceNet copies with } S \text{ slices each; copy } m \text{ answers slice } h \text{ with } r^m_h(\cdot \mid x) \text{ (shape } V \text{)} \\
 \text{// the table: } R_{jhc} = r^{f(j)}_h(c \mid x_j) \text{, every training image's held-out slice outputs (shape } N \times S \times V \text{)} \\
-\text{// } \sigma^\star \text{: the selector, which gives } \mathrm{used}(z) \text{ and the knight's picks} \\
+\text{// } \kappa \text{: the commit table, node } \to \text{ the slice built for it; } \sigma^\star \text{: the selector} \\
 \text{// the samples: images } j_1, \dots, j_C \text{ (shape } C \text{) and their codes } z_1, \dots, z_C \text{ (shape } C \times T \text{); and } T \\
-\text{// the examined codes: } Z_u \text{, the distinct length-} u \text{ prefixes (shape } |Z_u| \times u \text{), with counts } n_z \text{ (shape } |Z_u| \text{);} \\
-\text{// all of them, } Z = Z_0 \cup \dots \cup Z_T \text{ (} |Z| \text{ codes)} \\[12pt]
+\text{// the sampled codes: } Z_u \text{, the distinct length-} u \text{ prefixes (shape } |Z_u| \times u \text{)} \\[12pt]
+\textbf{function } \mathrm{ask}(z): \\
+\quad \text{// in: a code } z \text{ (shape } |z| \text{)} \\
+\quad \text{// out: the slice asked after it: its committed slice, or the selector's best unused one (one index)} \\
+\quad \textbf{return } \kappa(z) \text{ if } z \text{ is committed, else } \arg\max_{h \notin \mathrm{used}(z)} \sigma^\star(z)_h \\[12pt]
 \textbf{function } \mathrm{sampleCode}(j, t): \\
 \quad \text{// in: an image } j \text{, training or val; a length } t \le S \\
 \quad \text{// out: } z \text{, image } j \text{'s answers to the knight's first } t \text{ questions (shape } t \text{, each token in } \{1, \dots, V\} \text{)} \\
 \quad z \leftarrow () \\
 \quad \textbf{for } u = 0, \dots, t-1: \\
-\qquad h \leftarrow \arg\max_{h \notin \mathrm{used}(z)} \sigma^\star(z)_h \qquad \text{// the knight picks an unused slice, seeing only the code} \\
-\qquad z_{u+1} \sim r^{f(j)}_h(\cdot \mid x_j) \qquad \text{// the image answers it, through the copy that never trained on it} \\
+\qquad z_{u+1} \sim r^{f(j)}_{\mathrm{ask}(z)}(\cdot \mid x_j) \qquad \text{// the image answers, through the copy that never trained on it} \\
 \quad \textbf{return } z \\[12pt]
-\textbf{function } \mathrm{sampleCodes}(t): \\
-\quad \text{// in: a depth } t \le S \\
-\quad \text{// out: the samples, } C \text{ training images (shape } C \text{) each with an out-of-fold code (shape } C \times t \text{); and } Z_u \text{,} \\
-\quad \text{// their distinct length-} u \text{ prefixes (shape } |Z_u| \times u \text{) for } u = 0, \dots, t \text{, with } n_z \text{, how many samples share each (shape } |Z_u| \text{)} \\
-\quad j_1, \dots, j_C \leftarrow C \text{ training images sampled without replacement} \\
-\quad z_d \leftarrow \mathrm{sampleCode}(j_d, t) \text{ for every sample } d \\
-\quad Z_u \leftarrow \text{the distinct prefixes } z_{d,1:u} \text{, and } n_z \leftarrow \text{how many samples have prefix } z \text{, for } u = 0, \dots, t \\[12pt]
 \textbf{function } \mathrm{weights}(z): \\
 \quad \text{// in: a code } z \text{ (shape } |z| \text{)} \\
 \quad \text{// out: } w \text{, each training image's held-out chance of producing } z \text{: the code's posterior, unnormalized (shape } N \text{, mostly 0)} \\
-\quad w_j \leftarrow \textstyle\prod_{u=1}^{|z|} R_{j h_u z_u} \text{, where } h_u \text{ is the slice the knight asks after } z_{1:u-1} \\
+\quad w_j \leftarrow \textstyle\prod_{u=1}^{|z|} R_{j h_u z_u} \text{, where } h_u = \mathrm{ask}(z_{1:u-1}) \\
 \quad w_j \leftarrow 0 \text{ wherever } w_j < \epsilon \\
 \quad \textbf{return } w \\[12pt]
 \textbf{function } \mathrm{spread}(w): \\
@@ -389,21 +385,17 @@ calls them.
 \quad \text{// in: a code } z \text{ (shape } |z| \text{)} \\
 \quad \text{// out: } G_{z \cdot} \text{, the realized gain at } z \text{ of every slice (shape } S \text{); a slice already used on } z \text{ gains about nothing} \\
 \quad \textbf{return } G_{zh} = \mathrm{gain}(z, R_{\cdot h \cdot}) \text{ for every slice } h \\[12pt]
-\textbf{function } \mathrm{impliedGain}(z, \lambda): \\
-\quad \text{// in: a code } z \text{ (shape } |z| \text{); } \lambda \text{, a class for every training image (shape } N \text{, each in } \{1, \dots, V\} \text{)} \\
-\quad \text{// out: the gain at } z \text{ of a slice that reproduced } \lambda \text{ exactly (one number)} \\
-\quad \textbf{return } \mathrm{gain}\big(z, \mathrm{onehot}(\lambda)\big) \\[12pt]
-\textbf{function } \mathrm{improvement}(g, G^*): \\
-\quad \text{// in: } g \text{, a candidate slice's gain at every examined code (shape } |Z| \text{); } G^* \text{, the bar at every examined code (shape } |Z| \text{)} \\
-\quad \text{// out: } J \text{, how far the candidate beats the bar, averaged over the samples and weighted by depth (one number)} \\
-\quad \textbf{return } \textstyle\sum_{u=0}^{T} \omega_u\, \frac{1}{C} \sum_{z \in Z_u} n_z \big[ g_z - G^*_z \big]_+ \\[12pt]
-\textbf{function } \mathrm{bankBest}(): \\
-\quad \text{// out: } G^* \text{, the bank's best realized gain at every examined code (shape } |Z| \text{)} \\
-\quad \textbf{return } G^*_z = \max\big(0,\; \max_{h \notin \mathrm{used}(z)} \mathrm{sliceGains}(z)_h\big) \text{ for every } z \in Z
+\textbf{function } \mathrm{frontier}(): \\
+\quad \text{// out: the uncommitted children of committed nodes (just the root if nothing is committed), each with its} \\
+\quad \text{// score: the loss its children would hold under the question asked there now; highest first (} |\mathcal F| \text{ codes)} \\
+\quad \mathcal F \leftarrow \{()\} \text{ if } () \text{ is uncommitted, else } \{ zc : z \text{ committed},\ zc \text{ uncommitted} \} \\
+\quad \textbf{for each } z \in \mathcal F: \quad w \leftarrow \mathrm{weights}(z); \quad
+        \mathrm{score}(z) \leftarrow \omega_{|z|} \textstyle\sum_j w_j \cdot \big(\mathrm{spread}(w) - \mathrm{sliceGains}(z)_{\mathrm{ask}(z)}\big) \\
+\quad \textbf{return } \mathcal F \text{ sorted by score, highest first}
 \end{array}
 ```
 
-**Partition search.**
+**Partitions.**
 
 ```math
 \begin{array}{l}
@@ -415,7 +407,7 @@ calls them.
 \quad \textbf{return } \lambda \text{ with } \lambda_j = \arg\min_c \lVert x_j - y_c \rVert^2 \\[12pt]
 \textbf{function } \mathrm{hartigan}(\lambda, z): \\
 \quad \text{// in: } \lambda \text{, a starting class per image (shape } N \text{); a code } z \text{ (shape } |z| \text{)} \\
-\quad \text{// out: } \lambda \text{, moved image by image until no single move raises } \mathrm{impliedGain}(z, \lambda) \text{ (shape } N \text{),} \\
+\quad \text{// out: } \lambda \text{, moved image by image until no single move raises } \mathrm{gain}\big(z, \mathrm{onehot}(\lambda)\big) \text{ (shape } N \text{),} \\
 \quad \text{// or until it stalls} \\
 \quad \textbf{repeat at most } \texttt{hartigan-rounds} \text{ times}: \\
 \qquad \Delta_{jc} \leftarrow \text{the exact change in the gain from moving image } j \text{ to class } c \text{ (shape } N \times V \text{; 0 off } z \text{'s posterior),} \\
@@ -431,18 +423,11 @@ calls them.
 \quad \text{// out: every image's nearest class centroid at } z \text{ (shape } N \text{): the same classes, extended to all images} \\
 \quad w \leftarrow \mathrm{weights}(z); \quad \mu_c \leftarrow \textstyle\sum_{j : \lambda_j = c} w_j x_j \big/ \sum_{j : \lambda_j = c} w_j \text{ for every class with weight (shape } V \times n_{\mathrm{px}} \text{)} \\
 \quad \textbf{return } \lambda' \text{ with } \lambda'_j = \arg\min_c \lVert x_j - \mu_c \rVert^2 \\[12pt]
-\textbf{function } \mathrm{pickPartitions}(G^*): \\
-\quad \text{// in: } G^* \text{, the bank's bar at every examined code (shape } |Z| \text{)} \\
-\quad \text{// out: } \lambda_1, \dots, \lambda_B \text{, the answer every image should give to each new question (shape } B \times N \text{);} \\
-\quad \text{// and } \nu \text{, whether an image's answer to each new question matters (shape } N \times B \text{, 0 or 1)} \\
-\quad A \leftarrow \texttt{candidates} \cdot B \text{ distinct examined codes whose posteriors weigh at least } \texttt{min-support} \text{ images,} \\
-\qquad\qquad \text{each sampled with probability} \propto \omega_u n_z / C \text{ (shape } |A| \text{)} \\
-\quad \textbf{for each } z \in A: \qquad \text{// one candidate per code: split its posterior as well as possible} \\
-\qquad \lambda^{(z)} \leftarrow \mathrm{nearestCentroid}\big(\mathrm{hartigan}(\mathrm{kmeansppStart}(\mathrm{weights}(z)), z),\ z\big) \\
-\qquad J^{(z)} \leftarrow \mathrm{improvement}\big(\mathrm{impliedGain}(\cdot, \lambda^{(z)}), G^*\big) \qquad \text{// how much it helps the bank overall} \\
-\quad \lambda_1, \dots, \lambda_B \leftarrow \text{the } \lambda^{(z)} \text{ with the highest } J^{(z)} \text{, among those with } J^{(z)} > 0 \\
-\quad \nu_{jb} \leftarrow 1 \text{ if } j \text{ has weight in some examined } z \text{ with } \mathrm{impliedGain}(z, \lambda_b) > G^*_z \text{, else } 0 \\
-\quad \textbf{return } (\lambda_1, \dots, \lambda_B),\ \nu
+\textbf{function } \mathrm{split}(z): \\
+\quad \text{// in: a target code } z \text{ (shape } |z| \text{)} \\
+\quad \text{// out: } \lambda \text{, the best } V \text{-way split of } z \text{'s posterior, extended to every image (shape } N \text{)} \\
+\quad \lambda \leftarrow \text{the } \mathrm{hartigan}\big(\mathrm{kmeansppStart}(\mathrm{weights}(z)), z\big) \text{ with the highest gain at } z \text{, over } \texttt{restarts} \text{ starts} \\
+\quad \textbf{return } \mathrm{nearestCentroid}(\lambda, z)
 \end{array}
 ```
 
@@ -461,15 +446,16 @@ calls them.
 \qquad\qquad \text{step } \theta^m \text{ on } \mathrm{loss}(\theta^m, \mathcal B) \\
 \qquad \textbf{if } \text{no higher } \mathrm{score} \text{ for } \mathrm{patience} \text{ epochs}: \textbf{ break} \\
 \quad \text{every copy takes back its weights from the epoch with the highest score} \\[12pt]
-\textbf{function } \mathrm{trainColumn}(\lambda, \nu): \\
-\quad \text{// in: the partitions } \lambda_1, \dots, \lambda_B \text{ (shape } B \times N \text{) and which answers matter, } \nu \text{ (shape } N \times B \text{)} \\
-\quad \text{// out: nothing returned; every copy gains } B \text{ frozen slices, so its SliceNet maps an image to logits of shape } (S+B) \times V \text{,} \\
-\quad \text{// and the table grows to shape } N \times (S+B) \times V \\
+\textbf{function } \mathrm{trainColumn}(z_{1:B}, \lambda): \\
+\quad \text{// in: the targets } z_1, \dots, z_B \text{ and their partitions } \lambda_1, \dots, \lambda_B \text{ (shape } B \times N \text{)} \\
+\quad \text{// out: nothing returned; every copy gains } B \text{ frozen slices, so its SliceNet maps an image to logits of shape } (S+B) \times V \text{;} \\
+\quad \text{// the table grows to shape } N \times (S+B) \times V \text{; and each target commits to its new slice} \\
 \quad \text{add a column with heads } S+1, \dots, S+B \text{ to every copy; earlier columns stay frozen} \\
-\quad \mathrm{CE}_\nu(s, \mathcal B) = \textstyle\sum_{j \in \mathcal B} \sum_b \nu_{jb}\, \mathrm{CE}\big(s(x_j)_{S+b},\, \lambda_{b,j}\big) \Big/ \sum_{j \in \mathcal B} \sum_b \nu_{jb} \\
-\quad \mathrm{fitCopies}\big(\text{the new columns},\ \mathrm{CE}_\nu,\ -\mathrm{CE}_\nu \text{ over all images, each through copy } f(j),\ \texttt{patience}\big) \\
-\quad \text{freeze the new columns} \\
-\quad R_{j, S+b, c} \leftarrow r^{f(j)}_{S+b}(c \mid x_j) \text{ for every image } j \text{, new slice } b \text{ and token } c; \quad S \leftarrow S + B \\[12pt]
+\quad w_{jb} \leftarrow \mathrm{weights}(z_b)_j \qquad \text{// each image's posterior weight in each target (shape } N \times B \text{)} \\
+\quad \mathrm{CE}_w(s, \mathcal B) = \textstyle\sum_{j \in \mathcal B} \sum_b w_{jb}\, \mathrm{CE}\big(s(x_j)_{S+b},\, \lambda_{b,j}\big) \Big/ \sum_{j \in \mathcal B} \sum_b w_{jb} \\
+\quad \mathrm{fitCopies}\big(\text{the new columns},\ \mathrm{CE}_w,\ -\mathrm{CE}_w \text{ over all images, each through copy } f(j),\ \texttt{patience}\big) \\
+\quad \text{freeze the new columns; } R_{j, S+b, c} \leftarrow r^{f(j)}_{S+b}(c \mid x_j) \text{ for every image } j \text{, new slice } b \text{ and token } c \\
+\quad \kappa(z_b) \leftarrow S + b \text{ for every target; } S \leftarrow S + B \\[12pt]
 \textbf{function } \mathrm{fitSelector}(): \\
 \quad \text{// out: a fresh } \sigma^\star \text{, the knight's guess of how much each question would help after any code} \\
 \quad \text{// (maps a prefix of shape } u \text{ to gains of shape } S \text{); } T \text{, the depth the codes now stop at;} \\
@@ -477,8 +463,8 @@ calls them.
 \quad \sigma^m \leftarrow \text{freshly initialized, for every copy } m \\
 \quad j_1, \dots, j_C \leftarrow C \text{ training images sampled without replacement; } z_d \leftarrow () \text{ for every sample } d; \quad \mathcal D \leftarrow \emptyset \\
 \quad \textbf{for } u = 0, 1, \dots: \\
-\qquad \text{// extend every sampled code by one token, with the selector fit so far} \\
-\qquad \textbf{if } u \ge 1: \quad z_{d,u} \sim r^{f(j_d)}_{\eta(z_{d,1:u-1})}(\cdot \mid x_{j_d}) \text{ for every sample } d \\
+\qquad \textbf{if } u \ge 1: \quad z_{d,u} \sim r^{f(j_d)}_{\mathrm{ask}(z_{d,1:u-1})}(\cdot \mid x_{j_d}) \text{ for every sample } d
+        \qquad \text{// one more token, with the selector fit so far} \\
 \qquad Z_u \leftarrow \text{the distinct prefixes } z_{d,1:u} \\
 \qquad \textbf{if } u = S \text{ or every code in } Z_u \text{ is reached by a single image}: \quad T \leftarrow u; \textbf{ break}
         \qquad \text{// nothing deeper can be asked or scored} \\
@@ -486,12 +472,12 @@ calls them.
 \qquad \text{// fit every copy on depths } 0, \dots, u \text{, warm-started from the last depth; a sample belongs to its image's fold} \\
 \qquad \mathrm{MSE}(\sigma, \mathcal B) = \mathbb{E}_{(d, u') \in \mathcal B}\, \mathbb{E}_h \big( \sigma(z_{d,1:u'})_h - G_{z_{d,1:u'} h} \big)^2
         \qquad \text{// every slice, used ones included} \\
-\qquad \mathrm{choices}(\sigma^1, \dots, \sigma^F) = \textstyle\sum_{u' \le u} \omega_{u'}\, \mathbb{E}_d\, G_{z_{d,1:u'} \hat h},
+\qquad \mathrm{choices}(\sigma^1, \dots, \sigma^F) = \frac{1}{C} \textstyle\sum_{u' \le u} \omega_{u'} \sum_{d :\, z_{d,1:u'} \text{ uncommitted}} G_{z_{d,1:u'} \hat h},
         \quad \hat h = \arg\max_{h \notin \mathrm{used}(z_{d,1:u'})} \sigma^{f(j_d)}(z_{d,1:u'})_h \\
 \qquad \mathrm{fitCopies}\big(\sigma,\ \mathrm{MSE},\ \mathrm{choices},\ \texttt{selector-patience}\big) \\
-\qquad \sigma^m \leftarrow \sigma^\star \text{ for every fold copy } m \qquad \text{// } \eta \text{ now uses this fit} \\
-\qquad \text{log the drift: the fraction of } (d, u' < u) \text{ whose } \eta(z_{d,1:u'}) \text{ is no longer the slice that drew } z_{d,u'+1} \\
-\quad \text{log how often } \sigma^\star \text{ picks the unused slice with the highest } G \text{, at every depth} \\
+\qquad \sigma^m \leftarrow \sigma^\star \text{ for every fold copy } m \qquad \text{// } \mathrm{ask} \text{ now uses this fit} \\
+\qquad \text{log the drift: the fraction of } (d, u' < u) \text{ whose } \mathrm{ask}(z_{d,1:u'}) \text{ is no longer the slice that drew } z_{d,u'+1} \\
+\quad \text{log, per depth, the share of committed prefixes and how often } \sigma^\star \text{ picks the best unused slice elsewhere} \\
 \quad \textbf{return } \sigma^\star, T \\[12pt]
 \textbf{function } \mathrm{evaluate}(): \\
 \quad \text{// out: } \hat L_t \text{, how far a val image's decompressed version lands from it on average, given } t \text{ tokens (shape } T \text{);} \\
@@ -511,26 +497,23 @@ calls them.
 ```math
 \begin{array}{l}
 \text{split the training images into } F \text{ folds at random} \\
-S \leftarrow 0; \quad T \leftarrow 0 \qquad \text{// no slices yet: every code is the empty one} \\
+S \leftarrow 0; \quad T \leftarrow 0; \quad \kappa \leftarrow \text{empty} \qquad \text{// no slices yet: every code is the empty one} \\
 \textbf{for } \text{round} = 1, 2, \dots, \texttt{rounds}: \\
-\quad \mathrm{sampleCodes}(T) \qquad \text{// A. a sample of the encoder's codes, to depth } T \\
-\quad G^* \leftarrow \mathrm{bankBest}() \qquad \text{// and how well the bank already does at each} \\
-\quad (\lambda, \nu) \leftarrow \mathrm{pickPartitions}(G^*) \qquad \text{// B. the } B \text{ best of many one-code questions} \\
-\quad \mathrm{trainColumn}(\lambda, \nu) \qquad \text{// C. a new column learns to answer them} \\
-\quad \textbf{for } b = 1, \dots, B: \qquad \text{// how much of each promised improvement the trained slice delivers} \\
-\qquad \text{log } \mathrm{improvement}\big(\mathrm{impliedGain}(\cdot, \lambda_b), G^*\big) \text{ and } \mathrm{improvement}\big(\mathrm{gain}(\cdot, R_{\cdot, S-B+b, \cdot}), G^*\big) \\
-\quad (\sigma^\star, T) \leftarrow \mathrm{fitSelector}() \qquad \text{// D. the knight learns when to ask them} \\
+\quad z_{1:B} \leftarrow \text{the first } B \text{ of } \mathrm{frontier}() \text{ that can be split} \qquad \text{// A. the nodes whose children hold the most loss} \\
+\quad \lambda_b \leftarrow \mathrm{split}(z_b) \text{ for every target} \qquad \text{// B. the best split of each} \\
+\quad \mathrm{trainColumn}(z_{1:B}, \lambda) \qquad \text{// C. a new column learns them, and each target commits to its slice} \\
+\quad \text{log each new slice's gain at its target, and the best older slice's there} \\
+\quad (\sigma^\star, T) \leftarrow \mathrm{fitSelector}() \qquad \text{// D. the knight learns what to ask everywhere else} \\
 \quad (\hat L_{1:T}, \hat L) \leftarrow \mathrm{evaluate}() \qquad \text{// E. score on held-out images} \\
-\quad \text{log } T,\ \hat L_1, \dots, \hat L_T,\ \hat L \text{, and how many slices } \eta \text{ picks at some examined code} \\
 \quad \textbf{if } \hat L \text{ has not improved for } \texttt{round-patience} \text{ rounds}: \textbf{ stop}
 \end{array}
 ```
 
 Notes:
-- In `hartigan`, a single move with $\Delta_{jc} > 0$ always raises $J$, so the halving loop ends.
+- In `hartigan`, a single move with $\Delta_{jc} > 0$ always raises the gain, so the halving loop ends.
 - In `fitSelector`, the fold copies of the selector exist only so that a held-out score can pick the
   epoch. After each depth, every copy is the final one.
-- A code's posterior is exact over all training images. Only which codes get examined is sampled.
+- A code's posterior is exact over all training images. Only which codes the selector is fit on is sampled.
 
 ## Setup
 

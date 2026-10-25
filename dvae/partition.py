@@ -132,34 +132,65 @@ class CodeSet:
         Codes with fewer than two images of weight gain nothing. A token cell with fewer than two images
         falls back to the code's own spread: the token adds nothing there.
         """
-        P, V = self.x.shape[1], self.table.shape[2]
         out = torch.zeros(len(codes), len(slices), device=self.x.device)
         if len(slices) == 0:
             return out
         offsets, counts = self._offsets()
         support, offsets, counts = self.support.tolist(), offsets.tolist(), counts.tolist()
-        rows = max(1, CHUNK_ELEMENTS // (len(slices) * V))
         for k, z in enumerate(codes.tolist()):
             if progress is not None:
                 progress(k, len(codes))
             if support[z] < 2:
                 continue
             start, stop = offsets[z], offsets[z] + counts[z]
-            W = torch.zeros(len(slices), V, device=self.x.device)
-            W2, Q, n = W.clone(), W.clone(), W.clone()
-            M = torch.zeros(len(slices), V, P, device=self.x.device)
-            for i in range(start, stop, rows):
-                img, w = self.e_img[i:min(i + rows, stop)], self.e_w[i:min(i + rows, stop)]
-                A = w[:, None, None] * self.table[img][:, slices]
-                A = torch.where(A >= self.cutoff, A, 0.0)
-                W += A.sum(0)
-                W2 += A.pow(2).sum(0)
-                Q += torch.einsum("nhc,n->hc", A, self.sq[img])
-                n += (A > 0).sum(0)
-                M += torch.einsum("nhc,np->hcp", A, self.x[img])
-            cells = torch.where(n >= 2, spread(W, M.pow(2).sum(-1), Q, W2, self.n_px), self.D[z])
-            out[k] = self.D[z] - (W / self.W[z] * cells).sum(1)
+            out[k] = posterior_gains(self.x, self.sq, self.table, self.e_img[start:stop], self.e_w[start:stop], slices,
+                                     self.n_px, self.cutoff, self.W[z], self.D[z])
         return out
+
+    @classmethod
+    def of_posterior(cls, x, img, w, n_px, cutoff):
+        """A set holding a single code, with the given posterior entries (images img [n], weights w [n])."""
+        self = cls.__new__(cls)
+        dev = x.device
+        self.table, self.x, self.cutoff, self.n_px = torch.empty(0, 0, 0, device=dev), x, cutoff, n_px
+        self.sq = x.pow(2).sum(1)
+        self.images = self.tokens = self.slices = torch.zeros(0, 0, dtype=torch.long, device=dev)
+        self.ids = torch.zeros(0, 1, dtype=torch.long, device=dev)
+        self.depth = torch.zeros(1, dtype=torch.long, device=dev)
+        self.count = torch.ones(1, device=dev)
+        self.used = [torch.zeros(1, 0, dtype=torch.long, device=dev)]
+        self.e_code, self.e_img, self.e_w = torch.zeros(len(img), dtype=torch.long, device=dev), img, w
+        self.W, self.D, self.support = self._stats(self.e_code, img, w, 1)
+        return self
+
+
+def posterior_gains(x, sq, table, img, w, slices, n_px, cutoff, W=None, D=None):
+    """Realized gain of each of the given slices [h] on one posterior (images img [n], weights w [n]), with the
+    slices' answers from table [N, S, V] -> [len(slices)]. W and D (the posterior's total weight and spread) are
+    computed when not given. A token cell with fewer than two images falls back to the posterior's own spread:
+    the token adds nothing there. A posterior with fewer than two images gains nothing."""
+    P, V, dev = x.shape[1], table.shape[2], x.device
+    if len(img) < 2 or len(slices) == 0:
+        return torch.zeros(len(slices), device=dev)
+    if W is None or D is None:
+        M = w @ x[img]
+        W = w.sum()
+        D = spread(W, M.pow(2).sum(), w @ sq[img], w.pow(2).sum(), n_px)
+    Wc = torch.zeros(len(slices), V, device=dev)
+    W2, Q, n = Wc.clone(), Wc.clone(), Wc.clone()
+    M = torch.zeros(len(slices), V, P, device=dev)
+    rows = max(1, CHUNK_ELEMENTS // (len(slices) * V))
+    for i in range(0, len(img), rows):
+        im, ww = img[i:i + rows], w[i:i + rows]
+        A = ww[:, None, None] * table[im][:, slices]
+        A = torch.where(A >= cutoff, A, 0.0)
+        Wc += A.sum(0)
+        W2 += A.pow(2).sum(0)
+        Q += torch.einsum("nhc,n->hc", A, sq[im])
+        n += (A > 0).sum(0)
+        M += torch.einsum("nhc,np->hcp", A, x[im])
+    cells = torch.where(n >= 2, spread(Wc, M.pow(2).sum(-1), Q, W2, n_px), D)
+    return D - (Wc / W * cells).sum(1)
 
 
 def kmeanspp(x, V, generator, weight=None):

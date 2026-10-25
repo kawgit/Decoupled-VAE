@@ -150,6 +150,34 @@ class SelectorNet(nn.Module):
         return used
 
 
+def commit_picks(commits, prefix, picks):
+    """Override picks [n] for the prefixes [n, t] that have a committed slice (commits: code tuple -> slice)."""
+    t = prefix.shape[1]
+    if not commits or all(len(code) != t for code in commits):
+        return picks
+    fixed = [(i, commits[key]) for i, key in enumerate(map(tuple, prefix.tolist())) if key in commits]
+    if not fixed:
+        return picks
+    rows, slices = zip(*fixed)
+    picks = picks.clone()
+    picks[list(rows)] = torch.tensor(slices, dtype=picks.dtype, device=picks.device)
+    return picks
+
+
+def knight_pick(selector, commits, prefix, used):
+    """The slice asked after each prefix [n, t] (used [n, t]: slices already asked along it): the committed slice
+    where there is one, else the selector's pick -> [n]."""
+    return commit_picks(commits, prefix, selector.pick(prefix, used))
+
+
+def knight_path(selector, commits, codes):
+    """The slice asked at every position of each code [n, t] -> [n, t]."""
+    used = codes.new_zeros(len(codes), 0)
+    for u in range(codes.shape[1]):
+        used = torch.cat([used, knight_pick(selector, commits, codes[:, :u], used)[:, None]], 1)
+    return used
+
+
 def with_none(t):
     """Append the "no slice" row to every image's per-slice logits or log-probs [n, S, V] -> [n, S + 1, V]: once
     the bank is used up, the token is always 0."""
@@ -163,14 +191,16 @@ class BlindKnightEncoder(nn.Module):
     the token is always 0. Codes have no fixed length: callers choose it.
 
     Slice indices run over 0..S-1, and S stands for "no slice" past the end of the bank. columns: one dict per
-    SliceNet column (n_slices). k_max is accepted, and ignored, so older checkpoints still load.
+    SliceNet column (n_slices). commits: [code, slice] pairs, the nodes whose slice is fixed (the one built for
+    them); the selector picks everywhere else. k_max is accepted, and ignored, so older checkpoints still load.
     """
 
-    def __init__(self, vocab_size=2, columns=(), width=32, hidden=64, selector_width=128, k_max=None):
+    def __init__(self, vocab_size=2, columns=(), width=32, hidden=64, selector_width=128, commits=(), k_max=None):
         super().__init__()
-        columns = list(columns)
+        columns, commits = list(columns), [[list(code), int(h)] for code, h in commits]
         self.config = dict(vocab_size=vocab_size, columns=columns, width=width, hidden=hidden,
-                           selector_width=selector_width)
+                           selector_width=selector_width, commits=commits)
+        self.commits = {tuple(code): h for code, h in commits}
         self.V = vocab_size
         self.slices = SliceNet(vocab_size, columns, width, hidden)
         self.selector = SelectorNet(vocab_size, self.slices.n_slices, selector_width)
@@ -187,17 +217,21 @@ class BlindKnightEncoder(nn.Module):
         """Log-probs of every slice's answer for every image, plus the "no slice" row [n, S + 1, V]."""
         return with_none(apply_mode(self.features(x), mode, top_p))
 
+    def pick(self, prefix, used):
+        """The slice asked after each prefix [n, t], within the bank (used [n, t]: slices asked along it) -> [n]."""
+        return knight_pick(self.selector, self.commits, prefix, used)
+
     def slice_path(self, codes):
         """The slice asked at every position of each code [n, t] -> [n, t] (S past the end of the bank)."""
         S, t = self.n_slices, codes.shape[1]
-        path = self.selector.path(codes[:, :S])
+        path = knight_path(self.selector, self.commits, codes[:, :S])
         return torch.cat([path, path.new_full((len(codes), max(t - S, 0)), S)], 1)
 
     def next_slices(self, prefix):
         """The slice asked after each prefix [n, t] -> [n] (S once the bank is used up)."""
         if prefix.shape[1] >= self.n_slices:
             return prefix.new_full((len(prefix),), self.n_slices)
-        return self.selector.pick(prefix, self.selector.path(prefix))
+        return self.pick(prefix, knight_path(self.selector, self.commits, prefix))
 
     def tree_slices(self, depth, device, chunk=65536):
         """The slice asked after every prefix of the code tree: entry t is [V**t], for t below depth."""
@@ -207,7 +241,7 @@ class BlindKnightEncoder(nn.Module):
                 out.append(torch.full((self.V**t,), self.n_slices, dtype=torch.long, device=device))
                 continue
             prefixes = all_prefixes(t, self.V, device)
-            nxt = torch.cat([self.selector.pick(prefixes[i:i + chunk], used[i:i + chunk])
+            nxt = torch.cat([self.pick(prefixes[i:i + chunk], used[i:i + chunk])
                              for i in range(0, len(prefixes), chunk)])
             out.append(nxt)
             used = torch.cat([used, nxt[:, None]], 1).repeat_interleave(self.V, 0)
@@ -230,7 +264,7 @@ class BlindKnightEncoder(nn.Module):
         codes = torch.zeros(len(x), 0, dtype=torch.long, device=x.device)
         used = codes.clone()
         for u in range(length):
-            h = self.selector.pick(codes, used) if u < self.n_slices else codes.new_full((len(x),), self.n_slices)
+            h = self.pick(codes, used) if u < self.n_slices else codes.new_full((len(x),), self.n_slices)
             nxt = torch.multinomial(logp[rows, h].exp(), 1, generator=generator)
             codes, used = torch.cat([codes, nxt], 1), torch.cat([used, h[:, None]], 1)
         return codes

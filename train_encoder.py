@@ -2,17 +2,18 @@
 
 A table holds every slice's held-out output on every training image (each image through the fold copy
 that never trained on it), so any code's posterior over the training images is a product of table entries.
-Each round:
-  A. Codes. Sample C training images and an out-of-fold code for each, to depth T. At every distinct prefix,
-     the bar: the bank's best realized gain among the slices not yet used along it.
-  B. Partitions. Sample candidates*B distinct prefixes in proportion to their weight in J. For each, split its
-     posterior as well as possible (Hartigan's method from a weighted k-means++ start, dvae/partition.py), then
-     label every image by its nearest class centroid. Keep the B with the largest improvement J over all
-     examined prefixes against the bar.
-  C. Column. Train a new SliceNet column on the partitions (F+1 fold copies, lockstep epochs, early stopping
-     on held-out cross-entropy) and add its held-out outputs to the table.
+Committed nodes always ask the slice built for them; the selector picks everywhere else. Each round:
+  A. Frontier. The uncommitted children of committed nodes (the root at first), scored by the loss their
+     children would still hold under the question asked there now: rho^depth * images * (spread - its gain).
+     The B highest are this round's targets.
+  B. Partitions. For each target, the best V-means split of its posterior (Hartigan's method from weighted
+     k-means++ starts, dvae/partition.py), extended to every image by nearest class centroid.
+  C. Column. Train a new SliceNet column on the partitions, each image weighted by its posterior weight in the
+     target (F+1 fold copies, lockstep epochs, early stopping on held-out cross-entropy), add its held-out
+     outputs to the table, and commit each target to its new slice.
   D. Selector. Fit a fresh selector depth by depth on a fresh sample of C codes, early-stopped on the held-out
-     gain of its choices; codes stop at depth T where the bank is used up or every prefix holds one image.
+     gain of its choices at uncommitted prefixes; codes stop at depth T where the bank is used up or every
+     prefix holds one image.
   E. Report the val decompression loss.
 
 Saves the encoder after every round (--out, usable by the decoder/prior/QA scripts) and the full build
@@ -32,8 +33,8 @@ import torch.nn.functional as F
 
 from dvae.common import add_common_args, get_device, save_checkpoint
 from dvae.data import NUM_PIXELS, load_labels, load_mnist, to_float
-from dvae.knight import BlindKnightEncoder, SelectorNet, SliceNet
-from dvae.partition import CodeSet, PartitionSearch, kmeanspp
+from dvae.knight import BlindKnightEncoder, SelectorNet, SliceNet, knight_path, knight_pick
+from dvae.partition import CodeSet, PartitionSearch, kmeanspp, posterior_gains, spread
 
 FORWARD_CHUNK = 2048  # images per forward pass when filling the table
 
@@ -83,12 +84,62 @@ def slice_table(copies, fold_of, X, Xv):
 
 
 @torch.no_grad()
-def extend(codes: CodeSet, selector, gen):
-    """One more token for every sampled code: the selector picks an unused slice, the image answers it."""
-    h = selector.pick(codes.tokens, codes.slices)
+def extend(codes: CodeSet, selector, commits, gen):
+    """One more token for every sampled code: the committed slice or the selector's pick, answered by the image."""
+    h = knight_pick(selector, commits, codes.tokens, codes.slices)
     probs = codes.table[codes.images, h]
     tokens = torch.multinomial(probs.cpu(), 1, generator=gen).squeeze(1).to(probs.device)
     codes.add_depth(h, tokens)
+
+
+def code_text(code):
+    return "\u00b7".join(map(str, code)) or "root"
+
+
+def node_weights(commits, table, code, cutoff):
+    """Posterior weights [N] of a node whose ancestors all have committed slices (a committed or frontier node)."""
+    w = torch.ones(table.shape[0], device=table.device)
+    for u in range(len(code)):
+        w = w * table[:, commits[code[:u]], code[u]]
+        w = torch.where(w >= cutoff, w, 0.0)
+    return w
+
+
+@torch.no_grad()
+def frontier_nodes(commits, selector, table, x, n_px, rho, cutoff, V):
+    """The uncommitted children of committed nodes (just the root before any commit), heaviest first, each scored
+    by the loss its children would still hold: rho^depth * images * (spread - the gain of the slice the selector
+    asks there now) -> [(score, code, images, spread, spread left after the current question)]."""
+    if () not in commits:
+        w = torch.ones(len(x), device=x.device)
+        groups = [((), w[None], [()])]
+    else:
+        groups = []
+        for z, h in commits.items():
+            kids = [z + (c,) for c in range(V) if z + (c,) not in commits]
+            if kids:
+                w = node_weights(commits, table, z, cutoff)[None] * table[:, h, [k[-1] for k in kids]].T
+                groups.append((z, torch.where(w >= cutoff, w, 0.0), kids))
+    sq, S, dev = x.pow(2).sum(1), table.shape[1], x.device
+    out = []
+    for _, w, kids in groups:  # w: one row of posterior weights per child
+        W, W2 = w.sum(1), w.pow(2).sum(1)
+        D = spread(W, (w @ x).pow(2).sum(1), w @ sq, W2, n_px)
+        ok = (w > 0).sum(1) >= 2
+        for i, k in enumerate(kids):
+            if not ok[i]:
+                out.append((0.0, k, float(W[i]), 0.0, 0.0))
+                continue
+            left = float(D[i])
+            path = [commits[k[:u]] for u in range(len(k))]  # a frontier node's ancestors are all committed
+            if selector is not None and len(path) < S:
+                prefix = torch.tensor([list(k)], dtype=torch.long, device=dev).view(1, len(k))
+                used = torch.tensor([path], dtype=torch.long, device=dev).view(1, len(path))
+                h = knight_pick(selector, commits, prefix, used)
+                img = w[i].nonzero().squeeze(1)
+                left -= float(posterior_gains(x, sq, table, img, w[i, img], h, n_px, cutoff, W[i], D[i])[0])
+            out.append((rho ** len(k) * float(W[i]) * left, k, float(W[i]), float(D[i]), left))
+    return sorted(out, key=lambda f: f[0], reverse=True)
 
 
 def fit_copies(modules, batches, loss_fn, score, epochs, patience, lr, weight_decay, progress, describe):
@@ -132,14 +183,13 @@ def main():
     p.add_argument("--folds", type=int, default=4)
     p.add_argument("--rounds", type=int, default=50)
     p.add_argument("--round-patience", type=int, default=3, help="stop after this many rounds without a better val loss")
-    p.add_argument("--slices-per-round", type=int, default=8, help="B: new partitions (one column) per round")
-    p.add_argument("--codes", type=int, default=512, help="C: sampled training codes examined per step")
+    p.add_argument("--slices-per-round", type=int, default=8, help="B: frontier nodes targeted per round, one new slice each (one column)")
+    p.add_argument("--codes", type=int, default=512, help="C: sampled training codes the selector is fit on")
     p.add_argument("--weight-cutoff", type=float, default=1e-4, help="posterior weights below this are dropped")
     p.add_argument("--label-weight", type=float, default=0.0,
                    help="lambda: the distance between two images also counts this much when their digits differ")
     p.add_argument("--k-decay", type=float, default=0.8, help="rho: each further token is read with this probability")
-    p.add_argument("--candidates", type=int, default=8, help="candidate partitions per kept one: B * this many codes")
-    p.add_argument("--min-support", type=int, default=100, help="codes need this much posterior weight (expected images) to be split")
+    p.add_argument("--restarts", type=int, default=8, help="k-means++ starts per target; the best split is kept")
     p.add_argument("--hartigan-rounds", type=int, default=100, help="cap on batched Hartigan move rounds per start")
     p.add_argument("--hartigan-tol", type=float, default=1e-4,
                    help="stop Hartigan when J rises by less than this fraction per round, over the last 5 rounds")
@@ -190,6 +240,7 @@ def main():
     state: dict[str, Any] = {"args": vars(args), "history": []}
     copies = [new_copy() for _ in range(Fo + 1)]
     selector: SelectorNet | None = None
+    commits: dict[tuple[int, ...], int] = {}  # node -> the slice built for it, which it always asks
     T, first_round = 0, 1
     if args.resume and os.path.exists(args.state):
         state = torch.load(args.state, map_location="cpu", weights_only=False)
@@ -200,6 +251,7 @@ def main():
             c.load_state_dict(st)
         selector = SelectorNet(V, copies[0].n_slices, args.selector_width).to(device)
         selector.load_state_dict(state["selector"])
+        commits = {tuple(code): h for code, h in state["commits"]}
         T, first_round = state["T"], len(state["history"]) + 1
     else:
         if args.resume:
@@ -220,77 +272,62 @@ def main():
             log(f"round {rnd}: {S} slices in the bank, codes reach depth {T}")
             entry: dict[str, Any] = {"round": rnd}
 
-            # A. a sample of the encoder's codes, and the bank's best realized gain at each prefix
+            # A. the frontier: children of committed nodes (or the root, at first), scored by the loss they hold
             summary: dict[str, str] = {}
-            with step("A codes", summary), torch.no_grad():
-                codes = CodeSet(table, Xc, cutoff, torch.randperm(N, generator=gen)[:C].to(device), P)
-                for _ in range(T):
-                    extend(codes, selector, gen)
-                all_codes = torch.arange(codes.n_codes, device=device)
-                G = codes.slice_gains(all_codes, torch.arange(S, device=device),
-                                      lambda k, n: progress(f"A bank gains: prefix {k}/{n}"))
-                G = G.masked_fill(codes.used_mask(all_codes, S), -torch.inf)
-                bar = G.max(1).values.clamp_min(0) if S else torch.zeros(codes.n_codes, device=device)
-                a = rho ** codes.depth.float() * codes.count / C
-                summary["text"] = (f"{codes.n_codes} distinct prefixes from {C} samples, "
-                                   f"bank's weighted gain {float((a * bar).sum()):.5f}")
-
-            # B. candidate partitions, one per sampled code, each splitting that code's posterior as well as it can;
-            # keep the B that most improve the bank overall
-            summary = {}
-            with step("B partitions", summary), torch.no_grad():
-                search = PartitionSearch(codes, a, V)
-                bar_active = bar[search.code_ids]
-                eligible = ((codes.W >= args.min_support) & (codes.support >= 2)).nonzero().squeeze(1)
-                n_cand = min(args.candidates * B, len(eligible))
-                aims = eligible[torch.multinomial(a[eligible].cpu(), n_cand, generator=gen).to(device)] if n_cand else eligible
-                cands: list[tuple[float, int, torch.Tensor]] = []
-                rounds = []
-                for k, z in enumerate(aims.tolist()):
-                    one = torch.zeros(codes.n_codes, device=device)
-                    one[z] = 1.0
-                    local = PartitionSearch(codes, one, V, only=torch.tensor([z], device=device))
-                    img, w = codes.posterior(z)
-                    weight = torch.zeros(N, device=device).index_add_(0, img, w)
-                    where = f"B candidate {k + 1}/{n_cand} (depth {int(codes.depth[z])})"
-                    lab, _, r = local.run(kmeanspp(Xc, V, gen, weight), torch.zeros(1, device=device),
-                                          args.hartigan_rounds, args.hartigan_tol,
-                                          progress=lambda r, J, where=where: progress(f"{where}, Hartigan round {r}"))
-                    rounds.append(r)
-                    lab = local.centroid_labels(lab)
-                    cands.append((search.objective(search.gains(search.stats(lab)), bar_active), z, lab))
-                cands.sort(key=lambda c: c[0], reverse=True)
-                kept = [c for c in cands[:B] if c[0] > 0]  # a partition that beats the bar nowhere would teach nothing
-                Bk = len(kept)
-                labels = torch.stack([c[2] for c in kept]) if kept else torch.empty(0, N, dtype=torch.long, device=device)
-                nu = torch.zeros(N, Bk, dtype=torch.bool, device=device)
-                for b, (_, _, lab) in enumerate(kept):
-                    gains = search.gains(search.stats(lab))
-                    beats = gains[search.e_code] > bar_active[search.e_code]
-                    nu[search.e_img[beats], b] = True
-                implied = [c[0] for c in kept]
-                where_kept = [(int(codes.depth[c[1]]), round(float(codes.W[c[1]]))) for c in kept]
-                summary["text"] = (f"{n_cand} candidates from {len(eligible)} eligible codes, "
-                                   f"{sum(rounds) / max(len(rounds), 1):.1f} Hartigan rounds each; kept "
-                                   + ", ".join(f"depth {d} ({s} images) J {J:.5f}"
-                                               for (d, s), J in zip(where_kept, implied)))
-            entry.update(implied_J=implied, targets=where_kept)
-            if Bk == 0:
-                log("stopping: no candidate partition beats the bank anywhere")
+            with step("A frontier", summary), torch.no_grad():
+                frontier = frontier_nodes(commits, selector, table, Xc, P, rho, cutoff, V)
+                aims = [f for f in frontier if f[0] > 0][:B]
+                summary["text"] = (f"{len(commits)} committed nodes, {len(frontier)} on the frontier; targets "
+                                   + ", ".join(f"{code_text(z)} ({W:.0f} images, spread {D:.4f}, {left:.4f} after "
+                                               "its current question)" for _, z, W, D, left in aims))
+            entry["targets"] = [(list(z), W, D, left) for _, z, W, D, left in aims]
+            if not aims:
+                log("stopping: no frontier node can be split")
                 break
 
-            # C. a new column learns the partitions; earlier columns stay frozen
+            # B. one partition per target: the best V-means split of its posterior, extended to every image by
+            # nearest class centroid
+            summary = {}
+            with step("B partitions", summary), torch.no_grad():
+                Bk = len(aims)
+                labels = torch.empty(Bk, N, dtype=torch.long, device=device)
+                weights = torch.zeros(N, Bk, device=device)  # each image's posterior weight in each target
+                implied, rounds = [], []
+                for b, (_, z, _, _, _) in enumerate(aims):
+                    w = node_weights(commits, table, z, cutoff)
+                    img = w.nonzero().squeeze(1)
+                    search = PartitionSearch(CodeSet.of_posterior(Xc, img, w[img], P, cutoff),
+                                             torch.ones(1, device=device), V)
+                    best: tuple[float, torch.Tensor | None] = (-math.inf, None)
+                    for s in range(args.restarts):
+                        where = f"B target {b + 1}/{Bk} {code_text(z)}, start {s + 1}/{args.restarts}"
+                        lab, J, r = search.run(kmeanspp(Xc, V, gen, w), torch.zeros(1, device=device),
+                                               args.hartigan_rounds, args.hartigan_tol,
+                                               progress=lambda r, J, where=where:
+                                               progress(f"{where}, Hartigan round {r}: gain {J:.5f}"))
+                        rounds.append(r)
+                        if J > best[0]:
+                            best = (J, lab)
+                    J, lab = best
+                    assert lab is not None
+                    labels[b], weights[:, b] = search.centroid_labels(lab), w
+                    implied.append(J)
+                summary["text"] = (f"implied gain at each target {fmt(implied, 5)}, "
+                                   f"{sum(rounds) / len(rounds):.1f} Hartigan rounds per start")
+            entry["implied_gain"] = implied
+
+            # C. a new column learns the partitions, each weighted by its target's posterior; earlier columns stay
+            # frozen. Then each target commits to its new slice.
             summary = {}
             with step("C column", summary):
                 columns = [c.add_column(Bk, device) for c in copies]
-                labeled = nu.any(1).nonzero().squeeze(1)
-                weights = nu.float()
+                labeled = (weights.sum(1) > 0).nonzero().squeeze(1)
 
                 def ce(m, idx):
                     logits = copies[m](X[idx])[:, S:]  # [n, Bk, V]
                     loss = F.cross_entropy(logits.reshape(-1, V), labels[:, idx].T.reshape(-1), reduction="none")
                     w = weights[idx].reshape(-1)
-                    return (loss * w).sum() / w.sum().clamp_min(1)
+                    return (loss * w).sum() / w.sum().clamp_min(1e-12)
 
                 def ce_batches(m):
                     rows = labeled if m == Fo else labeled[fold_of[labeled] != m]
@@ -304,7 +341,7 @@ def main():
                         for idx in rows.split(FORWARD_CHUNK):
                             total += float(ce(f, idx)) * float(weights[idx].sum())
                             count += float(weights[idx].sum())
-                    return -total / max(count, 1.0)
+                    return -total / max(count, 1e-12)
 
                 score, epoch = fit_copies(columns, ce_batches, ce, held_out_ce, args.epochs, args.patience, args.lr,
                                           args.weight_decay, progress,
@@ -312,16 +349,26 @@ def main():
                 for c in copies:
                     c.requires_grad_(False)
                 table, val_table = slice_table(copies, fold_of, X, Xv)
-                codes.table = table
-                new = torch.arange(S, S + Bk, device=device)
-                realized_gains = codes.slice_gains(search.code_ids, new,
-                                                   lambda k, n: progress(f"C realized gains: prefix {k}/{n}"))
-                realized = [search.objective(realized_gains[:, b], bar_active) for b in range(Bk)]
+                realized, bank_best = [], []
+                sq = Xc.pow(2).sum(1)
+                for b, (_, z, _, _, _) in enumerate(aims):
+                    w = weights[:, b]
+                    img = w.nonzero().squeeze(1)
+                    used = {commits[z[:u]] for u in range(len(z))}
+                    others = torch.tensor([h for h in range(S) if h not in used], dtype=torch.long, device=device)
+                    g = posterior_gains(Xc, sq, table, img, w[img], torch.cat([others, torch.tensor([S + b], device=device)]),
+                                        P, cutoff)
+                    realized.append(float(g[-1]))
+                    bank_best.append(float(g[:-1].max()) if len(others) else 0.0)
+                    commits[z] = S + b
                 S += Bk
-                summary["text"] = f"best epoch {epoch}, held-out cross-entropy {-score:.4f}, realized J {fmt(realized, 5)}"
-            entry.update(column_epochs=epoch, held_out_cross_entropy=-score, realized_J=realized)
+                summary["text"] = (f"best epoch {epoch}, held-out cross-entropy {-score:.4f}, realized gain at each "
+                                   f"target {fmt(realized, 5)} (best older slice there {fmt(bank_best, 5)})")
+            entry.update(column_epochs=epoch, held_out_cross_entropy=-score, realized_gain=realized,
+                         bank_best_gain=bank_best)
 
-            # D. a fresh selector learns, depth by depth, which slice gains most after each prefix
+            # D. a fresh selector learns, depth by depth, which slice gains most after each prefix; committed
+            # prefixes always ask their own slice, so only the others are its choices
             summary = {}
             with step("D selector", summary):
                 sels = [SelectorNet(V, S, args.selector_width).to(device) for _ in range(Fo + 1)]
@@ -331,11 +378,12 @@ def main():
                 # about nothing, and the selector must know that if its choices above ever change)
                 targets: list[torch.Tensor] = []
                 masks: list[torch.Tensor] = []  # per depth: True for slices already used [C, S], for picking only
+                free: list[torch.Tensor] = []  # per depth: True for samples whose prefix has no committed slice [C]
                 drift: list[float] = []
                 scale, choice = 1.0, 0.0
                 for u in range(S + 1):
                     if u >= 1:
-                        extend(codes, sels[Fo], gen)
+                        extend(codes, sels[Fo], commits, gen)
                     here = codes.codes_at(u)
                     if u == S or bool((codes.support[here] < 2).all()):
                         T = u
@@ -346,6 +394,8 @@ def main():
                         local = codes.ids[:, u] - here[0]
                         targets.append(G[local])
                         masks.append(codes.used_mask(codes.ids[:, u], S))
+                        free.append(torch.tensor([tuple(r) not in commits for r in codes.tokens.tolist()],
+                                                 dtype=torch.bool, device=device))
                     if u == 0:
                         scale = float(targets[0].abs().mean()) or 1.0
                     depths = list(range(u + 1))
@@ -368,10 +418,10 @@ def main():
                         for d in depths:
                             got = torch.zeros(C, device=device)
                             for f in range(Fo):
-                                rows = (sample_fold == f).nonzero().squeeze(1)
+                                rows = ((sample_fold == f) & free[d]).nonzero().squeeze(1)
                                 pick = sels[f](codes.tokens[rows, :d]).masked_fill(masks[d][rows], -torch.inf).argmax(1)
                                 got[rows] = targets[d][rows, pick]
-                            total += rho**d * float(got.mean())
+                            total += rho**d * float(got.sum()) / C  # committed prefixes add nothing to choose
                         return total
 
                     choice, _ = fit_copies(sels, sel_batches, mse, choices, args.selector_epochs, args.selector_patience,
@@ -381,29 +431,41 @@ def main():
                         s.load_state_dict(sels[Fo].state_dict())
                     with torch.no_grad():
                         if u >= 1:
-                            path = sels[Fo].path(codes.tokens[:, :u])
+                            path = knight_path(sels[Fo], commits, codes.tokens[:, :u])
                             drift = (path != codes.slices[:, :u]).float().mean(0).tolist()
                 selector = sels[Fo]
                 used = codes.slices.unique().numel() if T else 0
-                agree, captured = [], []  # how often the final selector picks the slice that really gains most,
-                with torch.no_grad():     # and how much of that slice's gain its picks get (near-ties cost little)
+                # at uncommitted prefixes: how often the final selector picks the slice that really gains most, and
+                # how much of that slice's gain its picks get (near-ties cost little); None where every prefix of
+                # that depth is committed
+                agree: list[float | None] = []
+                captured: list[float | None] = []
+                with torch.no_grad():
                     for d in range(len(targets)):
-                        g = targets[d].masked_fill(masks[d], -torch.inf)
-                        pick = sels[Fo](codes.tokens[:, :d]).masked_fill(masks[d], -torch.inf).argmax(1)
-                        best = g.max(1)
-                        agree.append(float((pick == best.indices).float().mean()))
+                        rows = free[d].nonzero().squeeze(1)
+                        if len(rows) == 0:
+                            agree.append(None)
+                            captured.append(None)
+                            continue
+                        g = targets[d][rows].masked_fill(masks[d][rows], -torch.inf)
+                        pick = sels[Fo](codes.tokens[rows, :d]).masked_fill(masks[d][rows], -torch.inf).argmax(1)
+                        top = g.max(1)
+                        agree.append(float((pick == top.indices).float().mean()))
                         got = g.gather(1, pick[:, None]).squeeze(1)
-                        captured.append(float(got.sum() / best.values.sum().clamp_min(1e-12)))
+                        captured.append(float(got.sum() / top.values.sum().clamp_min(1e-12)))
+                committed_share = [1 - float(f.float().mean()) for f in free]
 
                 def head(values):
-                    return fmt(values[:8], 2) + (" ..." if len(values) > 8 else "")
+                    shown = " ".join("-" if v is None else f"{v:.2f}" for v in values[:8])
+                    return shown + (" ..." if len(values) > 8 else "")
 
                 summary["text"] = (f"codes stop at depth {T}, held-out gain of choices {choice:.5f}, "
                                    f"{used} of {S} slices used"
-                                   + (f"; by depth: picks the best slice {head(agree)}, gets {head(captured)} of its "
-                                      f"gain, drift {head(drift) if drift else '-'}" if agree else ""))
+                                   + (f"; by depth: committed {head(committed_share)}, the selector picks the best "
+                                      f"slice {head(agree)}, gets {head(captured)} of its gain, "
+                                      f"drift {head(drift) if drift else '-'}" if agree else ""))
             entry.update(T=T, selector_choice_gain=choice, slices_used=used, drift=drift, best_slice_agreement=agree,
-                         best_gain_captured=captured)
+                         best_gain_captured=captured, committed_share=committed_share)
 
             # E. score on held-out images
             summary = {}
@@ -413,7 +475,7 @@ def main():
                 vtok = torch.zeros(Nv, 0, dtype=torch.long, device=device)
                 vsl = vtok.clone()
                 for _ in range(T):
-                    h = selector.pick(vtok, vsl)
+                    h = knight_pick(selector, commits, vtok, vsl)
                     probs = val_table[torch.arange(Nv, device=device), h]
                     t = torch.multinomial(probs.cpu(), 1, generator=vgen).to(device)
                     vtok, vsl = torch.cat([vtok, t], 1), torch.cat([vsl, h[:, None]], 1)
@@ -447,12 +509,14 @@ def main():
 
             # save the encoder (final copy and selector) and the build state
             assert selector is not None
-            encoder = BlindKnightEncoder(V, copies[Fo].config, args.column_width, args.column_hidden, args.selector_width)
+            commit_list = [[list(z), h] for z, h in commits.items()]
+            encoder = BlindKnightEncoder(V, copies[Fo].config, args.column_width, args.column_hidden, args.selector_width,
+                                         commit_list)
             encoder.slices.load_state_dict(copies[Fo].state_dict())
             encoder.selector.load_state_dict(selector.state_dict())
             save_checkpoint(args.out, "encoder", encoder.to(device), args=vars(args), history=state["history"])
             state.update(copies=[c.state_dict() for c in copies], columns=copies[0].config,
-                         selector=selector.state_dict(), T=T)
+                         selector=selector.state_dict(), commits=commit_list, T=T)
             torch.save(state, args.state)
 
             if val_loss < best_val:

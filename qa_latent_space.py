@@ -79,7 +79,7 @@ class Tree:
         dev = self.probs.device
         prefix = torch.tensor(code, dtype=torch.long, device=dev).view(1, len(code))
         used = torch.tensor(path, dtype=torch.long, device=dev).view(1, len(path))
-        return int(self.encoder.selector.pick(prefix, used))
+        return int(self.encoder.pick(prefix, used))
 
     def summaries(self, W):
         """Posterior summaries of the rows of a weight matrix [n, N]."""
@@ -116,11 +116,12 @@ class Tree:
         with self.lock:
             w, path = self.weights(code)
             node = self.summaries(w[None])[0]
-            node.update(code=list(code), path=list(path), slice=self.next_slice(code, path), children=[])
+            node.update(code=list(code), path=list(path), slice=self.next_slice(code, path), children=[],
+                        committed=code in self.encoder.commits)
             if node["slice"] is not None and node["mass"] > 0:
                 kids = self.summaries(w[None] * self.probs[:, node["slice"]].T)  # one row per token
                 for c, kid in enumerate(kids):
-                    kid.update(token=c, share=kid["mass"] / node["mass"])
+                    kid.update(token=c, share=kid["mass"] / node["mass"], committed=code + (c,) in self.encoder.commits)
                 node["children"] = kids
             node["entries"] = self.entries(w, 0, self.top)
             return node
@@ -253,7 +254,8 @@ img.tile { image-rendering: pixelated; border-radius: 4px; background: #000; dis
 </head>
 <body>
 <header><h1>Latent Space Browser</h1><span class="hint" id="meta"></span>
-<span class="hint">Click a child to focus it. Backspace or &larr; goes up.</span></header>
+<span class="hint">Click a child to focus it. Backspace or &larr; goes up. &#9733; marks nodes with a slice
+built for them.</span></header>
 <main>
   <section id="tree"></section>
   <section id="posterior"></section>
@@ -303,7 +305,8 @@ function renderTree(node) {
                 ["images", imgs(node.mass) + " (" + pct(node.mass / META.N) + " of all)"],
                 ["effective images", imgs(node.effective)],
                 ["spread", node.spread === null ? "–" : node.spread.toFixed(5)],
-                ["asks slice", node.slice === null ? "none left" : node.slice]];
+                ["asks slice", node.slice === null ? "none left" :
+                  node.slice + (node.committed ? " (built for this node)" : " (the selector's pick)")]];
   for (const [k, v] of rows) s.append(el("span", "k", k), el("span", "", String(v)));
   focus.append(tile(node.mean, 112), s);
   box.append(focus);
@@ -317,7 +320,8 @@ function renderTree(node) {
     const card = el("div", "kid"), bar = el("div", "bar"), fill = el("i");
     fill.style.width = (100 * c.share) + "%";
     bar.append(fill);
-    card.append(tile(c.mean, 64), el("div", "tok", "token " + c.token), bar, el("div", "", pct(c.share)),
+    card.append(tile(c.mean, 64), el("div", "tok", "token " + c.token + (c.committed ? " \u2605" : "")), bar,
+                el("div", "", pct(c.share)),
                 el("div", "small", imgs(c.mass) + " images"));
     card.onclick = () => go(node.code.concat([c.token]));
     kids.append(card);
