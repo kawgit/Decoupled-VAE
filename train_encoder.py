@@ -24,6 +24,7 @@ import argparse
 import copy
 import math
 import os
+import textwrap
 import time
 from contextlib import contextmanager
 from typing import Any
@@ -39,32 +40,65 @@ from dvae.partition import CodeSet, PartitionSearch, kmeanspp, posterior_gains, 
 FORWARD_CHUNK = 2048  # images per forward pass when filling the table
 
 
+WIDTH = 100  # longest log line, timestamp included
+
+
 def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    """Print each line of msg after a timestamp, wrapped at WIDTH; wrapped parts are indented a little further."""
+    stamp = f"[{time.strftime('%H:%M:%S')}] "
+    for line in msg.split("\n"):
+        lead = " " * (len(line) - len(line.lstrip()))
+        parts = textwrap.wrap(line.strip(), WIDTH - len(stamp), initial_indent=lead, subsequent_indent=lead + "    ",
+                              break_on_hyphens=False) or [""]
+        for i, part in enumerate(parts):
+            print((stamp if i == 0 else " " * len(stamp)) + part, flush=True)
 
 
 class Progress:
-    """Throttled progress lines inside a long step: at most one per interval seconds, all in one format."""
+    """Progress lines inside a long step, one kind per loop. The first and the last line of each kind are always
+    logged; in between, at most one line per interval seconds."""
 
     def __init__(self, interval):
-        self.interval, self.last = interval, time.time()
+        self.interval, self.last = interval, 0.0
+        self.seen: set[str] = set()
+        self.pending: dict[str, str] = {}  # each kind's latest line not logged yet
 
-    def __call__(self, msg):
-        if time.time() - self.last >= self.interval:
-            self.last = time.time()
-            log(f"    ... {msg}")
+    def __call__(self, kind, msg):
+        if kind not in self.seen or time.time() - self.last >= self.interval:
+            self.seen.add(kind)
+            self.pending.pop(kind, None)
+            self._log(msg)
+        else:
+            self.pending[kind] = msg
+
+    def _log(self, msg):
+        self.last = time.time()
+        log(f"    ... {msg}")
+
+    def flush(self):
+        """Log every kind's last line, then start afresh (call at the end of a step)."""
+        for msg in self.pending.values():
+            self._log(msg)
+        self.seen, self.pending = set(), {}
 
 
 @contextmanager
-def step(name, summary):
-    """Run one step of a round, then log one line: its name, the summary it filled in, and its duration."""
+def step(name, summary, progress):
+    """Run one step of a round, then log its name, the headline it filled in (summary["text"]) and its duration,
+    and any detail lines (summary["lines"]) below."""
     t0 = time.time()
     yield
+    progress.flush()
     log(f"  {name}: {summary.get('text', '')} ({time.time() - t0:.1f}s)")
+    for line in summary.get("lines", []):
+        log(f"      {line}")
 
 
-def fmt(values, digits=4):
-    return " ".join(f"{v:.{digits}f}" for v in values)
+def fmt(values, digits=4, most=None):
+    """Numbers joined by spaces; past `most` of them, the rest are elided. None prints as -."""
+    shown = values if most is None else values[:most]
+    text = " ".join("-" if v is None else f"{v:.{digits}f}" for v in shown)
+    return text + (" ..." if most is not None and len(values) > most else "")
 
 
 @torch.no_grad()
@@ -142,10 +176,10 @@ def frontier_nodes(commits, selector, table, x, n_px, rho, cutoff, V):
     return sorted(out, key=lambda f: f[0], reverse=True)
 
 
-def fit_copies(modules, batches, loss_fn, score, epochs, patience, lr, weight_decay, progress, describe):
+def fit_copies(modules, batches, loss_fn, score, epochs, patience, lr, weight_decay, progress, kind, describe):
     """Train one module per copy in lockstep epochs, keeping every copy's weights from the epoch with the best
     held-out score (higher is better). batches(m) yields copy m's minibatches; loss_fn(m, batch) is its loss;
-    describe(epoch, score) is the progress line. -> (best score, best epoch)."""
+    describe(epoch, score) is the progress line, of the given kind. -> (best score, best epoch)."""
     opts = [torch.optim.AdamW([p for p in mod.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay)
             for mod in modules]
     best: dict[str, Any] = {"score": -math.inf, "epoch": 0, "states": [copy.deepcopy(m.state_dict()) for m in modules]}
@@ -162,7 +196,7 @@ def fit_copies(modules, batches, loss_fn, score, epochs, patience, lr, weight_de
             mod.eval()
         with torch.no_grad():
             s = score()
-        progress(describe(epoch, s))
+        progress(kind, describe(epoch, s))
         if s > best["score"]:
             best = {"score": s, "epoch": epoch, "states": [copy.deepcopy(m.state_dict()) for m in modules]}
             bad = 0
@@ -262,8 +296,9 @@ def main():
         c.requires_grad_(False)
     table, val_table = slice_table(copies, fold_of, X, Xv)
     held_out = [(fold_of == f).nonzero().squeeze(1) for f in range(Fo)]
-    log(f"device {device}, {N} training images in {Fo} folds, {Nv} val images, V={V}, {B} slices per round, "
-        f"{C} codes per step, rho={rho}" + (f"; resuming after round {first_round - 1}" if first_round > 1 else ""))
+    log(f"device {device}, {N} training images in {Fo} folds, {Nv} val images, V={V}, {B} targets per round, "
+        f"{C} codes for the selector, rho={rho}" + (f", label weight {args.label_weight}" if args.label_weight else "")
+        + (f"; resuming after round {first_round - 1}" if first_round > 1 else ""))
 
     best_val, bad_rounds = min([h["val_loss"] for h in state["history"]], default=math.inf), 0
     try:
@@ -273,13 +308,13 @@ def main():
             entry: dict[str, Any] = {"round": rnd}
 
             # A. the frontier: children of committed nodes (or the root, at first), scored by the loss they hold
-            summary: dict[str, str] = {}
-            with step("A frontier", summary), torch.no_grad():
+            summary: dict[str, Any] = {}
+            with step("A frontier", summary, progress), torch.no_grad():
                 frontier = frontier_nodes(commits, selector, table, Xc, P, rho, cutoff, V)
                 aims = [f for f in frontier if f[0] > 0][:B]
-                summary["text"] = (f"{len(commits)} committed nodes, {len(frontier)} on the frontier; targets "
-                                   + ", ".join(f"{code_text(z)} ({W:.0f} images, spread {D:.4f}, {left:.4f} after "
-                                               "its current question)" for _, z, W, D, left in aims))
+                summary["text"] = f"{len(commits)} committed nodes, {len(frontier)} on the frontier"
+                summary["lines"] = [f"target {code_text(z)}: {W:.0f} images, spread {D:.4f}, {left:.4f} after its "
+                                    "current question" for _, z, W, D, left in aims]
             entry["targets"] = [(list(z), W, D, left) for _, z, W, D, left in aims]
             if not aims:
                 log("stopping: no frontier node can be split")
@@ -288,7 +323,7 @@ def main():
             # B. one partition per target: the best V-means split of its posterior, extended to every image by
             # nearest class centroid
             summary = {}
-            with step("B partitions", summary), torch.no_grad():
+            with step("B partitions", summary, progress), torch.no_grad():
                 Bk = len(aims)
                 labels = torch.empty(Bk, N, dtype=torch.long, device=device)
                 weights = torch.zeros(N, Bk, device=device)  # each image's posterior weight in each target
@@ -300,11 +335,11 @@ def main():
                                              torch.ones(1, device=device), V)
                     best: tuple[float, torch.Tensor | None] = (-math.inf, None)
                     for s in range(args.restarts):
-                        where = f"B target {b + 1}/{Bk} {code_text(z)}, start {s + 1}/{args.restarts}"
+                        where = f"B target {code_text(z)} ({b + 1}/{Bk}), start {s + 1}/{args.restarts}"
                         lab, J, r = search.run(kmeanspp(Xc, V, gen, w), torch.zeros(1, device=device),
                                                args.hartigan_rounds, args.hartigan_tol,
                                                progress=lambda r, J, where=where:
-                                               progress(f"{where}, Hartigan round {r}: gain {J:.5f}"))
+                                               progress("B", f"{where}, Hartigan round {r}: gain {J:.5f}"))
                         rounds.append(r)
                         if J > best[0]:
                             best = (J, lab)
@@ -312,14 +347,15 @@ def main():
                     assert lab is not None
                     labels[b], weights[:, b] = search.centroid_labels(lab), w
                     implied.append(J)
-                summary["text"] = (f"implied gain at each target {fmt(implied, 5)}, "
-                                   f"{sum(rounds) / len(rounds):.1f} Hartigan rounds per start")
+                summary["text"] = f"{sum(rounds) / len(rounds):.1f} Hartigan rounds per start"
+                summary["lines"] = [f"target {code_text(z)}: implied gain {J:.5f}"
+                                    for (_, z, _, _, _), J in zip(aims, implied)]
             entry["implied_gain"] = implied
 
             # C. a new column learns the partitions, each weighted by its target's posterior; earlier columns stay
             # frozen. Then each target commits to its new slice.
             summary = {}
-            with step("C column", summary):
+            with step("C column", summary, progress):
                 columns = [c.add_column(Bk, device) for c in copies]
                 labeled = (weights.sum(1) > 0).nonzero().squeeze(1)
 
@@ -344,7 +380,7 @@ def main():
                     return -total / max(count, 1e-12)
 
                 score, epoch = fit_copies(columns, ce_batches, ce, held_out_ce, args.epochs, args.patience, args.lr,
-                                          args.weight_decay, progress,
+                                          args.weight_decay, progress, "C",
                                           lambda e, s: f"C epoch {e}: held-out cross-entropy {-s:.4f}")
                 for c in copies:
                     c.requires_grad_(False)
@@ -362,15 +398,16 @@ def main():
                     bank_best.append(float(g[:-1].max()) if len(others) else 0.0)
                     commits[z] = S + b
                 S += Bk
-                summary["text"] = (f"best epoch {epoch}, held-out cross-entropy {-score:.4f}, realized gain at each "
-                                   f"target {fmt(realized, 5)} (best older slice there {fmt(bank_best, 5)})")
+                summary["text"] = f"best epoch {epoch}, held-out cross-entropy {-score:.4f}"
+                summary["lines"] = [f"target {code_text(z)}: realized gain {g:.5f}, best older slice there {o:.5f}"
+                                    for (_, z, _, _, _), g, o in zip(aims, realized, bank_best)]
             entry.update(column_epochs=epoch, held_out_cross_entropy=-score, realized_gain=realized,
                          bank_best_gain=bank_best)
 
             # D. a fresh selector learns, depth by depth, which slice gains most after each prefix; committed
             # prefixes always ask their own slice, so only the others are its choices
             summary = {}
-            with step("D selector", summary):
+            with step("D selector", summary, progress):
                 sels = [SelectorNet(V, S, args.selector_width).to(device) for _ in range(Fo + 1)]
                 codes = CodeSet(table, Xc, cutoff, torch.randperm(N, generator=gen)[:C].to(device), P)
                 sample_fold = fold_of[codes.images]
@@ -390,7 +427,7 @@ def main():
                         break
                     with torch.no_grad():
                         G = codes.slice_gains(here, torch.arange(S, device=device),
-                                              lambda k, n: progress(f"D gains at depth {u}: prefix {k}/{n}"))
+                                              lambda k, n: progress("D gains", f"D gains at depth {u}: prefix {k}/{n}"))
                         local = codes.ids[:, u] - here[0]
                         targets.append(G[local])
                         masks.append(codes.used_mask(codes.ids[:, u], S))
@@ -425,7 +462,7 @@ def main():
                         return total
 
                     choice, _ = fit_copies(sels, sel_batches, mse, choices, args.selector_epochs, args.selector_patience,
-                                           args.selector_lr, 0.0, progress,
+                                           args.selector_lr, 0.0, progress, "D fit",
                                            lambda e, s, u=u: f"D depth {u}, epoch {e}: held-out gain of choices {s:.5f}")
                     for s in sels[:Fo]:
                         s.load_state_dict(sels[Fo].state_dict())
@@ -454,22 +491,20 @@ def main():
                         got = g.gather(1, pick[:, None]).squeeze(1)
                         captured.append(float(got.sum() / top.values.sum().clamp_min(1e-12)))
                 committed_share = [1 - float(f.float().mean()) for f in free]
-
-                def head(values):
-                    shown = " ".join("-" if v is None else f"{v:.2f}" for v in values[:8])
-                    return shown + (" ..." if len(values) > 8 else "")
-
-                summary["text"] = (f"codes stop at depth {T}, held-out gain of choices {choice:.5f}, "
-                                   f"{used} of {S} slices used"
-                                   + (f"; by depth: committed {head(committed_share)}, the selector picks the best "
-                                      f"slice {head(agree)}, gets {head(captured)} of its gain, "
-                                      f"drift {head(drift) if drift else '-'}" if agree else ""))
+                summary["text"] = f"codes stop at depth {T}, held-out gain of choices {choice:.5f}"
+                summary["lines"] = [f"{used} of {S} slices used"]
+                if agree:  # per depth, the first 12
+                    summary["lines"] += [f"share of prefixes committed    {fmt(committed_share, 2, 12)}",
+                                        f"selector picks the best slice  {fmt(agree, 2, 12)}",
+                                        f"share of the best gain it gets {fmt(captured, 2, 12)}"]
+                    if drift:
+                        summary["lines"].append(f"drift                          {fmt(drift, 2, 12)}")
             entry.update(T=T, selector_choice_gain=choice, slices_used=used, drift=drift, best_slice_agreement=agree,
                          best_gain_captured=captured, committed_share=committed_share)
 
             # E. score on held-out images
             summary = {}
-            with step("E val", summary), torch.no_grad():
+            with step("E val", summary, progress), torch.no_grad():
                 assert selector is not None
                 vgen = torch.Generator().manual_seed(args.seed + 7)
                 vtok = torch.zeros(Nv, 0, dtype=torch.long, device=device)
@@ -502,8 +537,8 @@ def main():
                         wrong[t] += last_wrong.sum()
                 L, wrong = (L / Nv).tolist(), (wrong / Nv).tolist()
                 val_loss = sum((1 - rho) * rho ** (t - 1) * L[t] for t in range(1, T + 1)) + rho**T * L[T]
-                summary["text"] = (f"loss {val_loss:.5f} (no code {L[0]:.5f}; by length {fmt(L[1:], 5)}), "
-                                   f"wrong digit {wrong[T]:.1%} at length {T}")
+                summary["text"] = f"loss {val_loss:.5f}, no code {L[0]:.5f}, wrong digit {wrong[T]:.1%} at length {T}"
+                summary["lines"] = [f"by length {fmt(L[1:], 5)}"]
             entry.update(val_loss=val_loss, val_loss_by_length=L, wrong_digit_by_length=wrong)
             state["history"].append(entry)
 
