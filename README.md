@@ -22,8 +22,12 @@ it can enumerate, and `benchmark.py` estimates its numbers from the encoder's to
   $\{1, \dots, V\}$, autoregressively: $q(z_{1:t} \mid x) = \prod_{u=1}^{t} q(z_u \mid x, z_{1:u-1})$, where
   $z_{1:t}$ is the length-$t$ prefix (the whole code, if it is shorter) and $z_{1:0}$ the empty one. $zc$ is
   the code $z$ with token $c$ appended.
-- $d(x, y) = \tfrac{1}{n_{\mathrm{px}}} \lVert x - y \rVert^2$ is mean squared pixel distance, with
-  $n_{\mathrm{px}}$ pixels per image.
+- $d(x, y) = \tfrac{1}{n_{\mathrm{px}}} \lVert x - y \rVert^2 + \lambda\, \mathbf{1}[\ell(x) \ne \ell(y)]$ is mean squared
+  pixel distance, with $n_{\mathrm{px}}$ pixels per image, plus $\lambda$ (`--label-weight`, default 0)
+  when the two images show different digits $\ell$. Two one-hot vectors that differ are $\sqrt 2$ apart,
+  so appending each image's one-hot digit, scaled by $\sqrt{\lambda n_{\mathrm{px}} / 2}$, to its pixels
+  turns $d$ into a plain squared distance, and everything below holds for it unchanged. The encoder never
+  sees a label: labels only enter the objective, through the training images in a posterior.
 - $p_t$ is a geometric distribution over code lengths $t \in \{1, 2, \dots\}$: how many tokens a decoder
   gets to see. Each further token is read with probability $\rho$ (`--k-decay`, default 0.8), so
   $p_t(t) = (1 - \rho)\,\rho^{t-1}$ and $P_{t \sim p_t}(t \ge u) = \rho^{u-1}$. It doesn't depend on the
@@ -250,8 +254,9 @@ on every training image, so any code's posterior is a lookup away.
    build logs how many changed, and how often the final selector picks the unused slice with the highest
    realized gain, at each depth.
 6. **Report.** On the val split: $\hat L_t$ for every length $t \le T$, and $\hat L$ (lengths past $T$
-   score the same as $T$); each new slice's implied and realized improvement; how many slices the
-   selector uses.
+   score the same as $T$), with the label term when $\lambda > 0$; the wrong-digit rate at length $T$, the
+   posterior's weight on training images of another digit, which compares runs with different $\lambda$;
+   each new slice's implied and realized improvement; how many slices the selector uses.
 
 The build stops after `--rounds` rounds, or when the val loss hasn't improved for `--round-patience`
 rounds. Every step logs when it starts, its progress and its duration.

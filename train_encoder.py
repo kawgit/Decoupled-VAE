@@ -31,7 +31,7 @@ import torch
 import torch.nn.functional as F
 
 from dvae.common import add_common_args, get_device, save_checkpoint
-from dvae.data import load_mnist, to_float
+from dvae.data import NUM_PIXELS, load_labels, load_mnist, to_float
 from dvae.knight import BlindKnightEncoder, SelectorNet, SliceNet
 from dvae.partition import CodeSet, PartitionSearch, kmeanspp
 
@@ -135,6 +135,8 @@ def main():
     p.add_argument("--slices-per-round", type=int, default=8, help="B: new partitions (one column) per round")
     p.add_argument("--codes", type=int, default=512, help="C: sampled training codes examined per step")
     p.add_argument("--weight-cutoff", type=float, default=1e-4, help="posterior weights below this are dropped")
+    p.add_argument("--label-weight", type=float, default=0.0,
+                   help="lambda: the distance between two images also counts this much when their digits differ")
     p.add_argument("--k-decay", type=float, default=0.8, help="rho: each further token is read with this probability")
     p.add_argument("--candidates", type=int, default=8, help="candidate partitions per kept one: B * this many codes")
     p.add_argument("--min-support", type=int, default=100, help="codes need this much posterior weight (expected images) to be split")
@@ -165,10 +167,20 @@ def main():
     device = get_device(args.device)
     X = to_float(load_mnist("train", args.data_root, device)[: args.limit_train])
     Xv = to_float(load_mnist("val", args.data_root, device)[: args.limit_val])
-    mean = X.flatten(1).mean(0)
-    Xc, Xvc = X.flatten(1) - mean, Xv.flatten(1) - mean  # centered pixels, for the objective's precision
+    labels = load_labels("train", args.data_root, device)[: args.limit_train]
+    val_labels = load_labels("val", args.data_root, device)[: args.limit_val]
+    onehot, val_onehot = F.one_hot(labels, 10).float(), F.one_hot(val_labels, 10).float()
+    # The objective's vectors: centered pixels and, with --label-weight, the scaled one-hot digit after them.
+    # Two different one-hots are sqrt(2) apart, so the squared distance gains lambda * n_px exactly when the
+    # digits differ, and every distance below (divided by n_px) gains lambda.
+    feats, val_feats = X.flatten(1), Xv.flatten(1)
+    if args.label_weight > 0:
+        scale = math.sqrt(args.label_weight * NUM_PIXELS / 2)
+        feats, val_feats = torch.cat([feats, scale * onehot], 1), torch.cat([val_feats, scale * val_onehot], 1)
+    mean = feats.mean(0)
+    Xc, Xvc = feats - mean, val_feats - mean  # centered, for the objective's precision
     N, Nv, V, Fo, B, C = len(X), len(Xv), args.vocab_size, args.folds, args.slices_per_round, args.codes
-    P, rho, cutoff = Xc.shape[1], args.k_decay, args.weight_cutoff
+    P, rho, cutoff = NUM_PIXELS, args.k_decay, args.weight_cutoff
     gen = torch.Generator().manual_seed(args.seed)
     progress = Progress(args.log_interval)
 
@@ -211,7 +223,7 @@ def main():
             # A. a sample of the encoder's codes, and the bank's best realized gain at each prefix
             summary: dict[str, str] = {}
             with step("A codes", summary), torch.no_grad():
-                codes = CodeSet(table, Xc, cutoff, torch.randperm(N, generator=gen)[:C].to(device))
+                codes = CodeSet(table, Xc, cutoff, torch.randperm(N, generator=gen)[:C].to(device), P)
                 for _ in range(T):
                     extend(codes, selector, gen)
                 all_codes = torch.arange(codes.n_codes, device=device)
@@ -313,7 +325,7 @@ def main():
             summary = {}
             with step("D selector", summary):
                 sels = [SelectorNet(V, S, args.selector_width).to(device) for _ in range(Fo + 1)]
-                codes = CodeSet(table, Xc, cutoff, torch.randperm(N, generator=gen)[:C].to(device))
+                codes = CodeSet(table, Xc, cutoff, torch.randperm(N, generator=gen)[:C].to(device), P)
                 sample_fold = fold_of[codes.images]
                 # per depth: every sample's gain per slice [C, S], used slices included (asking one again gains
                 # about nothing, and the selector must know that if its choices above ever change)
@@ -407,25 +419,30 @@ def main():
                     vtok, vsl = torch.cat([vtok, t], 1), torch.cat([vsl, h[:, None]], 1)
                 sq, vsq = Xc.pow(2).sum(1), Xvc.pow(2).sum(1)
                 L = torch.zeros(T + 1, device=device)
+                wrong = torch.zeros(T + 1, device=device)  # posterior weight on training images of another digit
                 rows_per = max(1, 2**24 // N)
                 for i in range(0, Nv, rows_per):
                     v = slice(i, i + rows_per)
                     w = torch.ones(len(vsq[v]), N, device=device)
                     alive = torch.ones(len(w), dtype=torch.bool, device=device)
-                    last = torch.zeros(len(w), device=device)
+                    last, last_wrong = torch.zeros(len(w), device=device), torch.zeros(len(w), device=device)
                     for t in range(T + 1):
                         if t > 0:
                             w = w * table[:, vsl[v, t - 1], vtok[v, t - 1]].T
                             w = torch.where(w >= cutoff, w, 0.0)
                         W = w.sum(1)
                         dist = (W * vsq[v] - 2 * (Xvc[v] * (w @ Xc)).sum(1) + w @ sq) / (P * W.clamp_min(1e-30))
+                        same = ((w @ onehot) * val_onehot[v]).sum(1) / W.clamp_min(1e-30)
                         alive &= W > 0  # past the longest prefix with weight, the loss stays where it was
                         last = torch.where(alive, dist, last)
+                        last_wrong = torch.where(alive, 1 - same, last_wrong)
                         L[t] += last.sum()
-                L = (L / Nv).tolist()
+                        wrong[t] += last_wrong.sum()
+                L, wrong = (L / Nv).tolist(), (wrong / Nv).tolist()
                 val_loss = sum((1 - rho) * rho ** (t - 1) * L[t] for t in range(1, T + 1)) + rho**T * L[T]
-                summary["text"] = f"loss {val_loss:.5f} (no code {L[0]:.5f}; by length {fmt(L[1:], 5)})"
-            entry.update(val_loss=val_loss, val_loss_by_length=L)
+                summary["text"] = (f"loss {val_loss:.5f} (no code {L[0]:.5f}; by length {fmt(L[1:], 5)}), "
+                                   f"wrong digit {wrong[T]:.1%} at length {T}")
+            entry.update(val_loss=val_loss, val_loss_by_length=L, wrong_digit_by_length=wrong)
             state["history"].append(entry)
 
             # save the encoder (final copy and selector) and the build state

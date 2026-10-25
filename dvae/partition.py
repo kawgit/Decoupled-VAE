@@ -16,9 +16,10 @@ CHUNK_ELEMENTS = 2**25  # floats in the largest temporary per vectorized chunk
 BIG_CODE = 256  # codes with at least this many posterior entries score moves by matmul instead of a gather
 
 
-def spread(W, MM, Q, W2, P):
-    """Spread of weightings from their sums (any matching shapes); only meaningful with two or more images."""
-    return 2 * (W * Q - MM) / (P * (W * W - W2)).clamp_min(1e-30)
+def spread(W, MM, Q, W2, n_px):
+    """Spread of weightings from their sums (any matching shapes); only meaningful with two or more images.
+    Squared distances are divided by n_px, the number of pixels."""
+    return 2 * (W * Q - MM) / (n_px * (W * W - W2)).clamp_min(1e-30)
 
 
 class CodeSet:
@@ -30,10 +31,12 @@ class CodeSet:
     prefix tokens, the slices that drew them and its code id at every depth are kept too.
     """
 
-    def __init__(self, table, x, cutoff, images):
-        """table [N, S, V]: every training image's held-out slice outputs; x [N, P]: centered training images;
-        images [C]: the sampled training images. Starts with the empty code, whose posterior is uniform."""
+    def __init__(self, table, x, cutoff, images, n_px=None):
+        """table [N, S, V]: every training image's held-out slice outputs; x [N, P]: centered training images,
+        possibly with extra features after the pixels; images [C]: the sampled training images; n_px: what
+        squared distances are divided by (default P). Starts with the empty code, whose posterior is uniform."""
         self.table, self.x, self.cutoff, self.images = table, x, cutoff, images
+        self.n_px = x.shape[1] if n_px is None else n_px
         self.sq = x.pow(2).sum(1)
         N, C, device = len(x), len(images), x.device
         self.tokens = torch.zeros(C, 0, dtype=torch.long, device=device)
@@ -70,7 +73,7 @@ class CodeSet:
         rows = max(1, CHUNK_ELEMENTS // P)
         for i in range(0, len(img), rows):
             M.index_add_(0, local[i:i + rows], w[i:i + rows, None] * self.x[img[i:i + rows]])
-        D = torch.where(n >= 2, spread(W, M.pow(2).sum(1), Q, W2, P), 0.0)
+        D = torch.where(n >= 2, spread(W, M.pow(2).sum(1), Q, W2, self.n_px), 0.0)
         return W, D, n
 
     def _offsets(self):
@@ -154,7 +157,7 @@ class CodeSet:
                 Q += torch.einsum("nhc,n->hc", A, self.sq[img])
                 n += (A > 0).sum(0)
                 M += torch.einsum("nhc,np->hcp", A, self.x[img])
-            cells = torch.where(n >= 2, spread(W, M.pow(2).sum(-1), Q, W2, P), self.D[z])
+            cells = torch.where(n >= 2, spread(W, M.pow(2).sum(-1), Q, W2, self.n_px), self.D[z])
             out[k] = self.D[z] - (W / self.W[z] * cells).sum(1)
         return out
 
@@ -187,7 +190,7 @@ class PartitionSearch:
     def __init__(self, codes: CodeSet, a, V, only=None):
         """a [n_codes]: each code's weight in J. only: restrict J to these codes (default: all of them)."""
         self.V, self.x, self.sq = V, codes.x, codes.sq
-        self.P = codes.x.shape[1]
+        self.P, self.n_px = codes.x.shape[1], codes.n_px
         active = codes.support >= 2
         if only is not None:
             active &= torch.isin(torch.arange(codes.n_codes, device=a.device), only)
@@ -222,7 +225,7 @@ class PartitionSearch:
         return W, M.pow(2).sum(-1), Q, W2, n, M
 
     def cell_spread(self, W, MM, Q, W2, n, Dz):
-        return torch.where(n >= 2, spread(W, MM, Q, W2, self.P), Dz)
+        return torch.where(n >= 2, spread(W, MM, Q, W2, self.n_px), Dz)
 
     def gains(self, st):
         W, MM, Q, W2, n, _ = st
