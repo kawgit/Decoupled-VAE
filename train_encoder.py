@@ -5,8 +5,10 @@ that never trained on it), so any code's posterior over the training images is a
 Each round:
   A. Codes. Sample C training images and an out-of-fold code for each, to depth T. At every distinct prefix,
      the bar: the bank's best realized gain among the slices not yet used along it.
-  B. Partitions. Pick B partitions, each independently maximizing the bank's improvement J over the examined
-     prefixes against the same bar: Hartigan's method from k-means++ starts (dvae/partition.py).
+  B. Partitions. Sample candidates*B distinct prefixes in proportion to their weight in J. For each, split its
+     posterior as well as possible (Hartigan's method from a weighted k-means++ start, dvae/partition.py), then
+     label every image by its nearest class centroid. Keep the B with the largest improvement J over all
+     examined prefixes against the bar.
   C. Column. Train a new SliceNet column on the partitions (F+1 fold copies, lockstep epochs, early stopping
      on held-out cross-entropy) and add its held-out outputs to the table.
   D. Selector. Fit a fresh selector depth by depth on a fresh sample of C codes, early-stopped on the held-out
@@ -135,7 +137,8 @@ def main():
     p.add_argument("--codes", type=int, default=512, help="C: sampled training codes examined per step")
     p.add_argument("--weight-cutoff", type=float, default=1e-4, help="posterior weights below this are dropped")
     p.add_argument("--k-decay", type=float, default=0.8, help="rho: each further token is read with this probability")
-    p.add_argument("--restarts", type=int, default=2, help="k-means++ starts per partition")
+    p.add_argument("--candidates", type=int, default=8, help="candidate partitions per kept one: B * this many codes")
+    p.add_argument("--min-support", type=int, default=100, help="codes need this much posterior weight (expected images) to be split")
     p.add_argument("--hartigan-rounds", type=int, default=100, help="cap on batched Hartigan move rounds per start")
     p.add_argument("--hartigan-tol", type=float, default=1e-4,
                    help="stop Hartigan when J rises by less than this fraction per round, over the last 5 rounds")
@@ -221,46 +224,53 @@ def main():
                 summary["text"] = (f"{codes.n_codes} distinct prefixes from {C} samples, "
                                    f"bank's weighted gain {float((a * bar).sum()):.5f}")
 
-            # B. B partitions, each on its own against the bank's bar, where the bank gains least
+            # B. candidate partitions, one per sampled code, each splitting that code's posterior as well as it can;
+            # keep the B that most improve the bank overall
             summary = {}
             with step("B partitions", summary), torch.no_grad():
                 search = PartitionSearch(codes, a, V)
                 bar_active = bar[search.code_ids]
-                labels = torch.empty(B, N, dtype=torch.long, device=device)
-                nu = torch.zeros(N, B, dtype=torch.bool, device=device)
-                implied, rounds = [], []
-                for b in range(B):
-                    best: tuple[float, torch.Tensor | None] = (-math.inf, None)
-                    for s in range(args.restarts):
-                        where = f"B partition {b + 1}/{B}, start {s + 1}/{args.restarts}"
-                        lab, J, r = search.run(kmeanspp(Xc, V, gen), bar_active, args.hartigan_rounds, args.hartigan_tol,
-                                               progress=lambda r, J, where=where:
-                                               progress(f"{where}, Hartigan round {r}: J {J:.5f}"))
-                        rounds.append(r)
-                        if J > best[0]:
-                            best = (J, lab)
-                    J, lab = best
-                    assert lab is not None
-                    labels[b] = lab
+                eligible = ((codes.W >= args.min_support) & (codes.support >= 2)).nonzero().squeeze(1)
+                n_cand = min(args.candidates * B, len(eligible))
+                aims = eligible[torch.multinomial(a[eligible].cpu(), n_cand, generator=gen).to(device)] if n_cand else eligible
+                cands: list[tuple[float, int, torch.Tensor]] = []
+                rounds = []
+                for k, z in enumerate(aims.tolist()):
+                    one = torch.zeros(codes.n_codes, device=device)
+                    one[z] = 1.0
+                    local = PartitionSearch(codes, one, V, only=torch.tensor([z], device=device))
+                    img, w = codes.posterior(z)
+                    weight = torch.zeros(N, device=device).index_add_(0, img, w)
+                    where = f"B candidate {k + 1}/{n_cand} (depth {int(codes.depth[z])})"
+                    lab, _, r = local.run(kmeanspp(Xc, V, gen, weight), torch.zeros(1, device=device),
+                                          args.hartigan_rounds, args.hartigan_tol,
+                                          progress=lambda r, J, where=where: progress(f"{where}, Hartigan round {r}"))
+                    rounds.append(r)
+                    lab = local.centroid_labels(lab)
+                    cands.append((search.objective(search.gains(search.stats(lab)), bar_active), z, lab))
+                cands.sort(key=lambda c: c[0], reverse=True)
+                kept = [c for c in cands[:B] if c[0] > 0]  # a partition that beats the bar nowhere would teach nothing
+                Bk = len(kept)
+                labels = torch.stack([c[2] for c in kept]) if kept else torch.empty(0, N, dtype=torch.long, device=device)
+                nu = torch.zeros(N, Bk, dtype=torch.bool, device=device)
+                for b, (_, _, lab) in enumerate(kept):
                     gains = search.gains(search.stats(lab))
                     beats = gains[search.e_code] > bar_active[search.e_code]
                     nu[search.e_img[beats], b] = True
-                    implied.append(J)
-                # a partition that beats the bar nowhere labels no image; its slice would never learn anything
-                keep = nu.any(0).nonzero().squeeze(1)
-                labels, nu, implied = labels[keep], nu[:, keep], [implied[b] for b in keep.tolist()]
-                summary["text"] = (f"implied J {fmt(implied, 5)}, {sum(rounds) / len(rounds):.1f} Hartigan rounds "
-                                   f"per start, {int(nu.any(1).sum())} images labeled"
-                                   + (f", {B - len(keep)} dropped (beat the bar nowhere)" if len(keep) < B else ""))
-            entry["implied_J"] = implied
-            if len(keep) == 0:
-                log("stopping: no partition beats the bank anywhere")
+                implied = [c[0] for c in kept]
+                where_kept = [(int(codes.depth[c[1]]), round(float(codes.W[c[1]]))) for c in kept]
+                summary["text"] = (f"{n_cand} candidates from {len(eligible)} eligible codes, "
+                                   f"{sum(rounds) / max(len(rounds), 1):.1f} Hartigan rounds each; kept "
+                                   + ", ".join(f"depth {d} ({s} images) J {J:.5f}"
+                                               for (d, s), J in zip(where_kept, implied)))
+            entry.update(implied_J=implied, targets=where_kept)
+            if Bk == 0:
+                log("stopping: no candidate partition beats the bank anywhere")
                 break
 
             # C. a new column learns the partitions; earlier columns stay frozen
             summary = {}
             with step("C column", summary):
-                Bk = len(keep)
                 columns = [c.add_column(Bk, device) for c in copies]
                 labeled = nu.any(1).nonzero().squeeze(1)
                 weights = nu.float()

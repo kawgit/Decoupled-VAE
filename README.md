@@ -206,23 +206,26 @@ on every training image, so any code's posterior is a lookup away.
    scored. In round 1 the bank is empty, $T = 0$, and the only code is the empty one.
 2. **Bar.** At every examined code, the bank's best realized gain: the highest $\hat G$ of a slice not yet
    used on that code, with its held-out outputs.
-3. **Partitions.** $B$ partitions, each picked on its own against the same bar, so their order doesn't
-   matter. Each maximizes the bank's improvement: over the examined codes at depths $0, \dots, T$, weighted
-   by count and depth, how far its implied gain beats the bar. Depth $T$ counts because a new slice can
-   follow the end of a code. Different k-means++ starts make the partitions differ.
-   - Within one code, a partition's implied loss is k-means' objective with $V$ clusters, with images
-     weighted by the code's posterior, up to the different-pairs correction. So the search starts as
-     k-means++ does: $V$ seed images sampled one at a time, each with probability proportional to its
-     squared distance to the nearest seed so far, and every image labeled by its nearest seed.
-   - Then Hartigan's method (`--restarts` k-means++ starts, keeping the best) with batched moves that are
-     kept only if the improvement rises. An image carries weight in several examined codes, so a move's
-     effect sums over them, exactly, from per-(code, class) sums. It stops when no move helps, or when the
-     last 5 rounds raised the improvement by less than `--hartigan-tol` of it per round.
-   - The bar is realized, from trained slices. The partition's gains are implied, which is optimistic,
+3. **Partitions.** Candidates first, one per code: sample `--candidates` $\times B$ distinct examined codes,
+   each with probability proportional to its weight in the improvement, $\omega_u n_z / C$, among the codes
+   whose posteriors weigh at least `--min-support` images.
+   - For each sampled code, split its posterior as well as possible: within one code, a partition's implied
+     loss is k-means' objective with $V$ clusters, with images weighted by the code's posterior, up to the
+     different-pairs correction. So the search starts as k-means++ does, from the code's own images: $V$
+     seeds sampled one at a time, each with probability proportional to its posterior weight times its
+     squared distance to the nearest seed so far. Then Hartigan's method with batched moves, kept only if
+     the code's gain rises. It stops when no move helps, or when the last 5 rounds raised the gain by
+     less than `--hartigan-tol` of it per round.
+   - Then label every training image by its nearest class centroid, a class's posterior-weighted mean
+     image at that code. That makes each class mean the same thing everywhere, and a nearest-centroid
+     rule is linear in the image, so a column can learn it.
+   - Score each candidate by the bank's improvement: over the examined codes at depths $0, \dots, T$,
+     weighted by count and depth, how far its implied gain beats the bar. Depth $T$ counts because a new
+     slice can follow the end of a code. Keep the $B$ best. Different target codes make them differ.
+   - The bar is realized, from trained slices. The partitions' gains are implied, which is optimistic,
      since a trained slice won't reproduce the classes exactly.
-   - Images with no weight in any code where the partition beats the bar get no label. Their class
-     doesn't matter. A partition that beats the bar nowhere labels no image and is dropped, since its slice
-     would learn nothing; if every partition is dropped, the build stops.
+   - Images with no weight in any code where a kept partition beats the bar get no label for it. A
+     candidate that beats the bar nowhere isn't kept; if none does, the build stops.
 4. **Column.** Train `--folds` + 1 copies of the new column by cross-entropy against the partitions'
    classes, skipping unlabeled images: fold copy $f$ on the training images outside fold $f$, a final
    copy on all. All copies share the epoch count, chosen by the pooled held-out cross-entropy. Slices see
@@ -274,19 +277,19 @@ Two versions follow: a concise one in equations, and a step-by-step one in pseud
 
 **One round**, with $S$ slices in the bank and the examined codes $Z_0, \dots, Z_T$:
 
-**1. Partitions**, for $b = 1, \dots, B$:
+**1. Partitions**, one candidate per sampled code $z$:
 
 ```math
-\lambda_b \;=\; \operatorname{Hartigan}_\lambda\, J(\lambda),
+\lambda^{(z)} \;=\; \operatorname{nearestCentroid}_z\Big(\operatorname{Hartigan}_\lambda\, \hat G(z, \lambda)\Big),
 \qquad
 J(\lambda) \;=\; \sum_{u=0}^{T} \omega_u\, \frac{1}{C} \sum_{z \in Z_u} n_z\, \big[\, \hat G(z, \lambda) - G^*_z \big]_+ ,
 \qquad
 G^*_z \;=\; \max\Big( 0,\; \max_{h \notin \mathrm{used}(z)}\, G_{zh} \Big),
 ```
 
-with each $\lambda_b$ from its own k-means++ starts. Image $j$ is labeled by $\lambda_b$ ($\nu_{jb} = 1$) when it
-has weight in some examined code $z$ with $\hat G(z, \lambda_b) > G^*_z$. Partitions that label no image are
-dropped, and $B$ below counts the ones kept.
+for each sampled code $z$, from a k-means++ start among its images. $\lambda_1, \dots, \lambda_B$ are the
+candidates with the highest $J$ (and $J > 0$). Image $j$ is labeled by $\lambda_b$ ($\nu_{jb} = 1$) when it has
+weight in some examined code $z$ with $\hat G(z, \lambda_b) > G^*_z$. $B$ below counts the partitions kept.
 
 **2. Column**: slices $S+1, \dots, S+B$, for every copy $m$:
 
@@ -391,34 +394,41 @@ calls them.
 
 ```math
 \begin{array}{l}
-\textbf{function } \mathrm{kmeansppStart}(): \\
+\textbf{function } \mathrm{kmeansppStart}(w): \\
+\quad \text{// in: } w \text{, a weight for every training image (shape } N \text{)} \\
 \quad \text{// out: } \lambda \text{, a starting class for every image (shape } N \text{): the nearest of } V \text{ well-spread seed images} \\
-\quad y_1 \leftarrow \text{a training image sampled uniformly} \\
-\quad \textbf{for } c = 2, \dots, V: \quad y_c \leftarrow \text{a training image } x_j \text{ sampled with probability} \propto \min_{c' < c} \lVert x_j - y_{c'} \rVert^2 \\
+\quad y_1 \leftarrow \text{a training image } x_j \text{ sampled with probability} \propto w_j \\
+\quad \textbf{for } c = 2, \dots, V: \quad y_c \leftarrow \text{a training image } x_j \text{ sampled with probability} \propto w_j \min_{c' < c} \lVert x_j - y_{c'} \rVert^2 \\
 \quad \textbf{return } \lambda \text{ with } \lambda_j = \arg\min_c \lVert x_j - y_c \rVert^2 \\[12pt]
-\textbf{function } \mathrm{hartigan}(\lambda, G^*): \\
-\quad \text{// in: } \lambda \text{, a starting class per image (shape } N \text{); } G^* \text{, the bar at every examined code (shape } |Z| \text{)} \\
-\quad \text{// out: } \lambda \text{, moved image by image until no single move raises } J = \mathrm{improvement}\big(\mathrm{impliedGain}(\cdot, \lambda), G^*\big) \\
-\quad \text{// (shape } N \text{), or until } J \text{ stalls} \\
+\textbf{function } \mathrm{hartigan}(\lambda, z): \\
+\quad \text{// in: } \lambda \text{, a starting class per image (shape } N \text{); a code } z \text{ (shape } |z| \text{)} \\
+\quad \text{// out: } \lambda \text{, moved image by image until no single move raises } \mathrm{impliedGain}(z, \lambda) \text{ (shape } N \text{),} \\
+\quad \text{// or until it stalls} \\
 \quad \textbf{repeat at most } \texttt{hartigan-rounds} \text{ times}: \\
-\qquad \Delta_{jc} \leftarrow \text{the exact change in } J \text{ from moving image } j \text{ to class } c \text{ (shape } N \times V \text{), summed over} \\
-\qquad\qquad \text{the examined codes where } j \text{ has weight, from per-(code, class) sums of } w,\ w\, x,\ w \lVert x \rVert^2,\ w^2 \\
+\qquad \Delta_{jc} \leftarrow \text{the exact change in the gain from moving image } j \text{ to class } c \text{ (shape } N \times V \text{; 0 off } z \text{'s posterior),} \\
+\qquad\qquad \text{from per-class sums of } w,\ w\, x,\ w \lVert x \rVert^2,\ w^2 \text{ over } z \text{'s posterior} \\
 \qquad \mathcal M \leftarrow \text{the moves } \big(j, \arg\max_c \Delta_{jc}\big) \text{ with } \max_c \Delta_{jc} > 0 \text{, largest first} \\
 \qquad \textbf{if } \mathcal M = \emptyset: \textbf{ break} \\
 \qquad n \leftarrow |\mathcal M| \\
-\qquad \textbf{loop}: \text{ apply the first } n \text{ moves; } \textbf{if } J \text{ rose}: \textbf{ break}; \textbf{ else } \text{undo them, } n \leftarrow \lceil n / 2 \rceil \\
-\qquad \textbf{if } \text{the last 5 rounds raised } J \text{ by less than } 5 \cdot \texttt{hartigan-tol} \cdot J: \textbf{ break} \\
+\qquad \textbf{loop}: \text{ apply the first } n \text{ moves; } \textbf{if } \text{the gain rose}: \textbf{ break}; \textbf{ else } \text{undo them, } n \leftarrow \lceil n / 2 \rceil \\
+\qquad \textbf{if } \text{the last 5 rounds raised the gain by less than } 5 \cdot \texttt{hartigan-tol} \text{ of it}: \textbf{ break} \\
 \quad \textbf{return } \lambda \\[12pt]
+\textbf{function } \mathrm{nearestCentroid}(\lambda, z): \\
+\quad \text{// in: } \lambda \text{, a class per image (shape } N \text{); a code } z \text{ (shape } |z| \text{)} \\
+\quad \text{// out: every image's nearest class centroid at } z \text{ (shape } N \text{): the same classes, extended to all images} \\
+\quad w \leftarrow \mathrm{weights}(z); \quad \mu_c \leftarrow \textstyle\sum_{j : \lambda_j = c} w_j x_j \big/ \sum_{j : \lambda_j = c} w_j \text{ for every class with weight (shape } V \times n_{\mathrm{px}} \text{)} \\
+\quad \textbf{return } \lambda' \text{ with } \lambda'_j = \arg\min_c \lVert x_j - \mu_c \rVert^2 \\[12pt]
 \textbf{function } \mathrm{pickPartitions}(G^*): \\
 \quad \text{// in: } G^* \text{, the bank's bar at every examined code (shape } |Z| \text{)} \\
 \quad \text{// out: } \lambda_1, \dots, \lambda_B \text{, the answer every image should give to each new question (shape } B \times N \text{);} \\
-\quad \text{// and } \nu \text{, whether an image's answer to each new question matters (shape } N \times B \text{, 0 or 1);} \\
-\quad \text{// partitions that label no image are dropped, so } B \text{ may shrink} \\
-\quad \textbf{for } b = 1, \dots, B: \qquad \text{// each on its own, against the same bar} \\
-\qquad \lambda_b \leftarrow \text{the } \mathrm{hartigan}(\mathrm{kmeansppStart}(), G^*) \text{ with the highest } \mathrm{improvement}\big(\mathrm{impliedGain}(\cdot, \lambda), G^*\big) \text{,} \\
-\qquad\qquad \text{over } \texttt{restarts} \text{ starts} \\
-\qquad \nu_{jb} \leftarrow 1 \text{ if } j \text{ has weight in some examined } z \text{ with } \mathrm{impliedGain}(z, \lambda_b) > G^*_z \text{, else } 0 \\
-\quad \text{drop every } b \text{ with no } \nu_{jb} = 1 \\
+\quad \text{// and } \nu \text{, whether an image's answer to each new question matters (shape } N \times B \text{, 0 or 1)} \\
+\quad A \leftarrow \texttt{candidates} \cdot B \text{ distinct examined codes whose posteriors weigh at least } \texttt{min-support} \text{ images,} \\
+\qquad\qquad \text{each sampled with probability} \propto \omega_u n_z / C \text{ (shape } |A| \text{)} \\
+\quad \textbf{for each } z \in A: \qquad \text{// one candidate per code: split its posterior as well as possible} \\
+\qquad \lambda^{(z)} \leftarrow \mathrm{nearestCentroid}\big(\mathrm{hartigan}(\mathrm{kmeansppStart}(\mathrm{weights}(z)), z),\ z\big) \\
+\qquad J^{(z)} \leftarrow \mathrm{improvement}\big(\mathrm{impliedGain}(\cdot, \lambda^{(z)}), G^*\big) \qquad \text{// how much it helps the bank overall} \\
+\quad \lambda_1, \dots, \lambda_B \leftarrow \text{the } \lambda^{(z)} \text{ with the highest } J^{(z)} \text{, among those with } J^{(z)} > 0 \\
+\quad \nu_{jb} \leftarrow 1 \text{ if } j \text{ has weight in some examined } z \text{ with } \mathrm{impliedGain}(z, \lambda_b) > G^*_z \text{, else } 0 \\
 \quad \textbf{return } (\lambda_1, \dots, \lambda_B),\ \nu
 \end{array}
 ```
@@ -490,7 +500,7 @@ S \leftarrow 0; \quad T \leftarrow 0 \qquad \text{// no slices yet: every code i
 \textbf{for } \text{round} = 1, 2, \dots, \texttt{rounds}: \\
 \quad \mathrm{sampleCodes}(T) \qquad \text{// A. a sample of the encoder's codes, to depth } T \\
 \quad G^* \leftarrow \mathrm{bankBest}() \qquad \text{// and how well the bank already does at each} \\
-\quad (\lambda, \nu) \leftarrow \mathrm{pickPartitions}(G^*) \qquad \text{// B. } B \text{ new questions, each where the bank is weakest} \\
+\quad (\lambda, \nu) \leftarrow \mathrm{pickPartitions}(G^*) \qquad \text{// B. the } B \text{ best of many one-code questions} \\
 \quad \mathrm{trainColumn}(\lambda, \nu) \qquad \text{// C. a new column learns to answer them} \\
 \quad \textbf{for } b = 1, \dots, B: \qquad \text{// how much of each promised improvement the trained slice delivers} \\
 \qquad \text{log } \mathrm{improvement}\big(\mathrm{impliedGain}(\cdot, \lambda_b), G^*\big) \text{ and } \mathrm{improvement}\big(\mathrm{gain}(\cdot, R_{\cdot, S-B+b, \cdot}), G^*\big) \\
@@ -525,6 +535,7 @@ python train_prior.py                                    # -> checkpoints/prior.
 python qa_generate.py -n 64                              # -> outputs/generate.png
 python qa_compress.py -n 16 -k 1 2 4 10 -m 8             # -> outputs/compress/k01.png ...
 python qa_compress_analytically.py -n 16 -m 8            # -> outputs/compress_analytically/k01.png ...
+python qa_latent_space.py                                # -> http://127.0.0.1:8000/
 python benchmark.py --decoder checkpoints/decoder_gray.pt checkpoints/decoder_binary.pt \
                     --encoder checkpoints/encoder.pt     # -> results/benchmark.{json,md}
 python analyze_encoder.py --encoder checkpoints/encoder.pt # -> results/usage_encoder.json
@@ -550,6 +561,11 @@ python analyze_encoder.py --encoder checkpoints/encoder.pt # -> results/usage_en
   `qa_compress_analytically.py` needs only the encoder: it decompresses by sampling `m` training images
   from the ideal decoder's posterior $\pi(y \mid z_{1:t}) \propto q(z_{1:t} \mid y)$ (`--posterior-mode`
   picks the $q$ used), and reports how many training images the posterior spreads over.
+- **Latent space browser:** `qa_latent_space.py` serves a local page (and opens it) for walking the
+  encoder's code tree one node at a time: the node and its children on the left, each with the mean image
+  of its posterior and its share of the parent's images, and the node's posterior on the right, heaviest
+  training images first. Every node is computed on request with the real selector, so any depth can be
+  browsed; children are fetched ahead of time, so stepping down is instant. Stop it with Ctrl-C.
 - **Benchmark:** `benchmark.py` scores each decoder on the data it was trained for: 8-bit MNIST, or
   the test set binarized with a fixed seed. It reports exact NLL, plus −ELBO and rate when you pass
   `--encoder`. When the code space is too large to enumerate (more than 2¹⁶ codes), it uses the encoder

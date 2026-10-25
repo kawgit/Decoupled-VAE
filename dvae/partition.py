@@ -108,6 +108,11 @@ class CodeSet:
         self.slices = torch.cat([self.slices, slices[:, None]], 1)
         self.ids = torch.cat([self.ids, (inv + start)[:, None]], 1)
 
+    def posterior(self, z):
+        """(images, weights) of code z's posterior."""
+        sel = self.e_code == z
+        return self.e_img[sel], self.e_w[sel]
+
     def used_mask(self, codes, n_slices):
         """[len(codes), n_slices]: True for the slices already asked along each code."""
         mask = torch.zeros(len(codes), n_slices, dtype=torch.bool, device=codes.device)
@@ -154,17 +159,22 @@ class CodeSet:
         return out
 
 
-def kmeanspp(x, V, generator):
-    """k-means++ start: V seed images, each drawn in proportion to its squared distance to the nearest seed
-    so far, and every image labeled by its nearest seed -> [N]."""
-    N = len(x)
-    seeds = [int(torch.randint(N, (1,), generator=generator))]
+def kmeanspp(x, V, generator, weight=None):
+    """k-means++ start: V seed images, each sampled in proportion to its weight [N] (default 1) times its
+    squared distance to the nearest seed so far, and every image labeled by its nearest seed -> [N]."""
+    w = (torch.ones(len(x), device=x.device) if weight is None else weight).cpu()
+    seeds = [int(torch.multinomial(w, 1, generator=generator))]
     dist = (x - x[seeds[0]]).pow(2).sum(1)
     for _ in range(1, V):
-        seeds.append(int(torch.multinomial(dist.clamp_min(0).cpu() + 1e-12, 1, generator=generator)))
+        p = w * dist.clamp_min(0).cpu()
+        seeds.append(int(torch.multinomial(p if p.sum() > 0 else w, 1, generator=generator)))
         dist = torch.minimum(dist, (x - x[seeds[-1]]).pow(2).sum(1))
-    sx = x[seeds]
-    return (x.pow(2).sum(1, keepdim=True) - 2 * x @ sx.T + sx.pow(2).sum(1)).argmin(1)
+    return nearest(x, x[seeds])
+
+
+def nearest(x, centers):
+    """Each image's nearest center [V', P] -> [N]."""
+    return (x.pow(2).sum(1, keepdim=True) - 2 * x @ centers.T + centers.pow(2).sum(1)).argmin(1)
 
 
 class PartitionSearch:
@@ -174,10 +184,13 @@ class PartitionSearch:
     with two or more images of weight take part; the others can't gain.
     """
 
-    def __init__(self, codes: CodeSet, a, V):
+    def __init__(self, codes: CodeSet, a, V, only=None):
+        """a [n_codes]: each code's weight in J. only: restrict J to these codes (default: all of them)."""
         self.V, self.x, self.sq = V, codes.x, codes.sq
         self.P = codes.x.shape[1]
         active = codes.support >= 2
+        if only is not None:
+            active &= torch.isin(torch.arange(codes.n_codes, device=a.device), only)
         self.code_ids = active.nonzero().squeeze(1)
         remap = torch.full((codes.n_codes,), -1, dtype=torch.long, device=a.device)
         remap[self.code_ids] = torch.arange(len(self.code_ids), device=a.device)
@@ -214,6 +227,13 @@ class PartitionSearch:
     def gains(self, st):
         W, MM, Q, W2, n, _ = st
         return self.Dz - (W / self.Wz[:, None] * self.cell_spread(W, MM, Q, W2, n, self.Dz[:, None])).sum(1)
+
+    def centroid_labels(self, labels):
+        """Relabel every image by its nearest class centroid at this search's first code: the classes' posterior-
+        weighted mean images there -> [N]. Classes empty at that code take no images."""
+        W, _, _, _, _, M = self.stats(labels)
+        full = W[0] > 0
+        return full.nonzero().squeeze(1)[nearest(self.x, M[0, full] / W[0, full, None])]
 
     def objective(self, G, bar):
         return float((self.a * (G - bar).clamp_min(0)).sum())

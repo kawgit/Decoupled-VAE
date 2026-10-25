@@ -16,6 +16,8 @@ import torch.nn.functional as F
 
 from .models import apply_mode
 
+ACTIVATION_BUDGET = 2**26  # floats of column activations held at once by one SliceNet forward pass
+
 
 def all_prefixes(depth, vocab_size, device):
     """Every length-depth prefix, in node order -> [V**depth, depth]."""
@@ -91,13 +93,20 @@ class SliceNet(nn.Module):
         return [{"n_slices": cast(Column, c).n_slices} for c in self.columns]
 
     def forward(self, x):
+        if not len(self.columns):
+            return x.new_zeros(len(x), 0, self.V)
+        # every column keeps its activations for the later columns' laterals, so memory grows with the
+        # number of columns: split the batch to stay within the budget
+        c1, c2 = self.width // 2, self.width
+        per_image = len(self.columns) * 2 * (c1 * 784 + c2 * 196 + c2 * 49 + self.hidden)
+        rows = max(1, ACTIVATION_BUDGET // per_image)
+        if len(x) > rows:
+            return torch.cat([self(x[i:i + rows]) for i in range(0, len(x), rows)])
         prev, out = [], []
         for column in self.columns:
             logits, acts = column(x, prev)
             prev.append(acts)
             out.append(logits)
-        if not out:
-            return x.new_zeros(len(x), 0, self.V)
         return torch.cat(out, 1)
 
 
