@@ -1,30 +1,20 @@
-"""Stage 1: build the staged encoder (dvae/staged.py) one code position at a time.
+"""Stage 1: build the blind knight encoder (dvae/knight.py) round by round (see README).
 
-For each position k (prefix length t = k-1):
-  1. Partitions. Sample P anchor images, each with one out-of-fold code (from the positions built so far,
-     on images they weren't trained on). Every anchor gets R reference draws, split evenly over its t+1
-     groups by the length of the prefix a code shares with the anchor's: each image is drawn in proportion
-     to its exact out-of-fold probability of landing in the group, and each draw weighs the group's mass
-     over its draws. For every anchor, build a partition of its references with Hartigan's method on the
-     partition's implied marginal decompression loss, with each reference's code truncated against the
-     anchor's (dvae/partition.py). Each partition labels any (image, code) by the class whose loss rises
-     least if the image joins it.
-  2. Encoders. Train num_folds + 1 StageNets with one head per partition, by cross-entropy against the
-     partitions' labels: fold model f on the training images outside fold f, the final model on all of
-     them. Each minibatch draws one fresh out-of-fold code per image (memoized). All copies share the
-     epoch count, chosen by the pooled held-out cross-entropy.
-  3. Costs. For every training image, with its held-out encoder, its term of the marginal decompression
-     loss under each partition (exact, all training images as references).
-  4. Selectors. Train num_folds + 1 SelectorNets to predict those costs from the code alone (MSE), with
-     the same fold split and shared epochs, early-stopped on the held-out marginal decompression loss of
-     the fold copies' choices (the cost of the partition each picks, pooled over images). Afterwards every
-     copy uses the final selector, so each token means the same thing in every copy. The encoder uses the
-     partition with the lowest predicted cost.
-  5. Report the marginal decompression loss on the val split: per the selector's choices, for the single
-     best partition, and with no code.
+A table holds every slice's held-out output on every training image (each image through the fold copy
+that never trained on it), so any code's posterior over the training images is a product of table entries.
+Each round:
+  A. Codes. Sample C training images and an out-of-fold code for each, to depth T. At every distinct prefix,
+     the bar: the bank's best realized gain among the slices not yet used along it.
+  B. Partitions. Pick B partitions one after another, each maximizing the bank's improvement J over the
+     examined prefixes: Hartigan's method from k-means++ starts (dvae/partition.py). Each pick raises the bar.
+  C. Column. Train a new SliceNet column on the partitions (F+1 fold copies, lockstep epochs, early stopping
+     on held-out cross-entropy) and add its held-out outputs to the table.
+  D. Selector. Fit a fresh selector depth by depth on a fresh sample of C codes, early-stopped on the held-out
+     gain of its choices; codes stop at depth T where the bank is used up or every prefix holds one image.
+  E. Report the val decompression loss.
 
-Saves the encoder after every position (--out, usable by the decoder/prior/QA scripts) and the full build
-state (--state, every fold model) so --resume can continue with the next position.
+Saves the encoder after every round (--out, usable by the decoder/prior/QA scripts) and the full build
+state (--state, every fold copy) so --resume continues with the next round.
 """
 
 import argparse
@@ -40,496 +30,391 @@ import torch.nn.functional as F
 
 from dvae.common import add_common_args, get_device, save_checkpoint
 from dvae.data import load_mnist, to_float
-from dvae.partition import AnchorPartition, node_costs
-from dvae.staged import SelectorNet, StagedEncoder, StageNet, node_ids
+from dvae.knight import BlindKnightEncoder, SelectorNet, SliceNet
+from dvae.partition import CodeSet, PartitionSearch, kmeanspp
 
-FORWARD_CHUNK = 2048  # images per forward pass when scoring or sampling
-
-
-_skipped = 0  # progress lines a Ticker dropped since the last printed line
+FORWARD_CHUNK = 2048  # images per forward pass when filling the table
 
 
 def log(msg):
-    """Print a timestamped line, noting how many progress lines were skipped since the previous one."""
-    global _skipped
-    if _skipped:
-        msg += f"  ({_skipped} similar message{'s' if _skipped > 1 else ''} skipped since the last line)"
-        _skipped = 0
-    print(f"  [{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-@contextmanager
-def timed(what):
-    """Log the start of an expensive step and how long it took."""
-    log(f"{what} ...")
-    t0 = time.time()
-    yield
-    log(f"{what}: done in {time.time() - t0:.1f}s")
-
-
-class Ticker:
-    """Throttled progress lines inside a long loop: at most one per interval seconds. The next printed line
-    of any kind says how many were skipped."""
+class Progress:
+    """Throttled progress lines inside a long step: at most one per interval seconds, all in one format."""
 
     def __init__(self, interval):
         self.interval, self.last = interval, time.time()
 
     def __call__(self, msg):
-        global _skipped
-        if time.time() - self.last < self.interval:
-            _skipped += 1
-            return
-        self.last = time.time()
-        log(msg)
+        if time.time() - self.last >= self.interval:
+            self.last = time.time()
+            log(f"    ... {msg}")
 
 
-def forward_chunked(model, x, prefix):
-    """model(x, prefix) in chunks -> logits [N, n_heads, V]."""
-    return torch.cat([model(x[i:i + FORWARD_CHUNK], prefix[i:i + FORWARD_CHUNK]) for i in range(0, len(x), FORWARD_CHUNK)])
+@contextmanager
+def step(name, summary):
+    """Run one step of a round, then log one line: its name, the summary it filled in, and its duration."""
+    t0 = time.time()
+    yield
+    log(f"  {name}: {summary.get('text', '')} ({time.time() - t0:.1f}s)")
 
 
-class CodeSampler:
-    """Samples codes through the positions built so far.
-
-    Training images go through the out-of-fold encoder and selector of their own fold, and the next-token
-    distribution of every (image, prefix) visited is memoized: positions are frozen once built and the
-    selector's choice depends on the prefix alone, so it never changes. The memo holds at most memo_cap
-    entries; when full it evicts the prefixes least likely to be reached. Other images (val) go through the
-    final models, without the memo. Each position's image features for every training image are cached
-    the first time they're needed, for the same reason.
-    """
-
-    def __init__(self, images, fold_of, vocab_size, n_folds, memo_cap):
-        self.images, self.fold_of, self.V, self.n_folds = images, fold_of, vocab_size, n_folds
-        self.memo_cap, self.memo, self.positions = memo_cap, {}, []
-        self.features: list[torch.Tensor | None] = []
-
-    def add_position(self, encoders, selectors):
-        for m in list(encoders) + list(selectors):
-            m.eval().requires_grad_(False)
-        self.positions.append((encoders, selectors))
-        self.features.append(None)
-
-    @torch.no_grad()
-    def train_features(self, t):
-        """Position t's image features [N, width] of every training image, from its out-of-fold encoder."""
-        cached = self.features[t]
-        if cached is None:
-            encoders, _ = self.positions[t]
-            device = self.images.device
-            cached = torch.empty(len(self.images), encoders[0].head[0].in_features, device=device)
-            for m in range(self.n_folds):
-                rows = (self.fold_of == m).nonzero().squeeze(1).to(device)
-                for i in range(0, len(rows), FORWARD_CHUNK):
-                    r = rows[i:i + FORWARD_CHUNK]
-                    cached[r] = encoders[m].features(self.images[r])
-            self.features[t] = cached
-        return cached
-
-    def _probs(self, t, x, prefix, model_idx):
-        """Next-token distributions [n, V] (on CPU) from position t's model_idx[i] encoder and selector."""
-        encoders, selectors = self.positions[t]
-        out = torch.empty(len(x), self.V)
-        for m in model_idx.unique().tolist():
-            rows = (model_idx == m).nonzero().squeeze(1)
-            rows_dev = rows.to(x.device)
-            logits = forward_chunked(encoders[m], x[rows_dev], prefix[rows_dev])
-            head = selectors[m].choose(prefix[rows_dev])
-            out[rows] = logits[torch.arange(len(rows_dev), device=x.device), head].softmax(-1).cpu()
-        return out
-
-    def _next_probs(self, t, x, prefix, model_idx, keys, path):
-        probs = torch.empty(len(x), self.V)
-        hits, hit_vals, misses = [], [], []
-        for row, key in enumerate(keys):
-            value = self.memo.get(key)
-            if value is None:
-                misses.append(row)
-            else:
-                hits.append(row)
-                hit_vals.append(value[0])
-        if hits:
-            probs[hits] = torch.tensor(hit_vals)
-        if misses:
-            rows = torch.tensor(misses)
-            rows_dev = rows.to(x.device)
-            p = self._probs(t, x[rows_dev], prefix[rows_dev], model_idx[rows])
-            probs[rows] = p
-            for j, row in enumerate(misses):
-                self.memo[keys[row]] = (tuple(p[j].tolist()), float(path[row]))
-        return probs
-
-    @torch.no_grad()
-    def sample_train(self, idx, depth, generator):
-        """One code [B, depth] per training image idx, drawn from its out-of-fold distribution."""
-        B, device = len(idx), idx.device
-        prefix = torch.zeros(B, 0, dtype=torch.long, device=device)
-        ids, folds = idx.tolist(), self.fold_of[idx.cpu()]
-        node = torch.zeros(B, dtype=torch.long)
-        path = torch.ones(B, dtype=torch.float64)
-        for t in range(depth):
-            keys = list(zip(ids, [t] * B, node.tolist()))
-            probs = self._next_probs(t, self.images[idx], prefix, folds, keys, path)
-            nxt = torch.multinomial(probs, 1, generator=generator).squeeze(1)
-            path = path * probs[torch.arange(B), nxt].double()
-            node = node * self.V + nxt
-            prefix = torch.cat([prefix, nxt.to(device)[:, None]], 1)
-        if len(self.memo) > self.memo_cap:  # keep the prefixes most likely to be reached
-            with timed(f"memo full ({len(self.memo)} entries): evicting the least likely prefixes"):
-                keep = sorted(self.memo.items(), key=lambda item: item[1][1], reverse=True)[: int(0.9 * self.memo_cap)]
-                self.memo = dict(keep)
-        return prefix
-
-    def sample_all_train(self, depth, generator, progress=None):
-        """One out-of-fold code for every training image -> [N, depth]."""
-        n = len(self.images)
-        idx = torch.arange(n, device=self.images.device)
-        out = []
-        for start in range(0, n, FORWARD_CHUNK):
-            if progress is not None:
-                progress(f"  codes for {start}/{n} images (memo {len(self.memo)})")
-            out.append(self.sample_train(idx[start:start + FORWARD_CHUNK], depth, generator))
-        return torch.cat(out)
-
-    @torch.no_grad()
-    def stage_probs(self, t, prefixes):
-        """Position t's next-token distributions [n, N, V] of every training image (out-of-fold models) after
-        each of the prefixes [n, t], from the cached image features."""
-        encoders, selectors = self.positions[t]
-        device = self.images.device
-        features = self.train_features(t)
-        out = torch.empty(len(prefixes), len(self.images), self.V, device=device)
-        for m in range(self.n_folds):
-            rows = (self.fold_of == m).nonzero().squeeze(1).to(device)
-            heads = selectors[m].choose(prefixes).tolist()
-            for i in range(0, len(rows), FORWARD_CHUNK):
-                r = rows[i:i + FORWARD_CHUNK]
-                feats = features[r]
-                for j, head in enumerate(heads):
-                    out[j, r] = encoders[m].logits(feats, prefixes[j:j + 1])[:, head].softmax(-1)
-        return out
-
-    @torch.no_grad()
-    def sample_final(self, x, depth, generator):
-        """Codes [N, depth] for other images, through the final models."""
-        prefix = torch.zeros(len(x), 0, dtype=torch.long, device=x.device)
-        final = torch.full((len(x),), self.n_folds, dtype=torch.long)
-        for t in range(depth):
-            nxt = torch.multinomial(self._probs(t, x, prefix, final), 1, generator=generator).squeeze(1)
-            prefix = torch.cat([prefix, nxt.to(x.device)[:, None]], 1)
-        return prefix
+def fmt(values, digits=4):
+    return " ".join(f"{v:.{digits}f}" for v in values)
 
 
 @torch.no_grad()
-def draw_references(sampler, anchor_codes, R, generator, progress):
-    """Reference draws for every anchor, split evenly over its t+1 truncated groups by shared prefix length.
+def slice_table(copies, fold_of, X, Xv):
+    """Every slice's output on every training image through its held-out copy [N, S, V], and on every val
+    image through the final copy [Nv, S, V]."""
+    for c in copies:
+        c.eval()
+    out = torch.empty(len(X), copies[0].n_slices, copies[0].V, device=X.device)
+    for f in range(len(copies) - 1):
+        rows = (fold_of == f).nonzero().squeeze(1)
+        for i in range(0, len(rows), FORWARD_CHUNK):
+            r = rows[i:i + FORWARD_CHUNK]
+            out[r] = copies[f](X[r]).softmax(-1)
+    val = torch.cat([copies[-1](Xv[i:i + FORWARD_CHUNK]).softmax(-1) for i in range(0, len(Xv), FORWARD_CHUNK)])
+    return out, val
 
-    Group s < t holds the codes that share exactly s tokens with the anchor; group t holds the full match.
-    An image's mass in group s is its exact out-of-fold probability of landing there,
-    q(a[:s] | y) * (1 - q(a_s | y, a[:s])), so each group gets R/(t+1) draws however small its mass. Images
-    are drawn with replacement in proportion to their mass, a mismatch group's token at position s among the
-    non-anchor tokens in proportion to q, and every draw weighs (group mass) / (draws in the group).
-    Returns, per anchor, (image indices, codes [n, t], weights), and the group masses [P, t+1].
-    """
-    P, t = anchor_codes.shape
-    device, N = sampler.images.device, len(sampler.images)
-    reach = torch.ones(P, N, device=device)  # q(a[:u] | y): the probability of following the anchor so far
-    masses = torch.zeros(P, t + 1)
-    refs: list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = [[] for _ in range(P)]
-    for u in range(t + 1):
-        n_draws = R // (t + 1) + (u < R % (t + 1))
-        if u < t:
-            progress(f"  group probabilities at prefix length {u}/{t}")
-            prefixes = anchor_codes[:, :u].cpu()
-            if u == 0:
-                uniq, inv = prefixes[:1], torch.zeros(P, dtype=torch.long)
-            else:
-                uniq, inv = torch.unique(prefixes, dim=0, return_inverse=True)
-            probs = sampler.stage_probs(u, uniq.to(device))  # [n_unique, N, V]
-        for a in range(P):
-            if u < t:
-                other = probs[inv[a]].clone()
-                other[:, anchor_codes[a, u]] = 0.0  # leaving the anchor's path at position u
-                mass = reach[a] * other.sum(1)
-            else:
-                other, mass = None, reach[a]
-            masses[a, u] = mass.sum().item()
-            if masses[a, u] > 0:
-                idx = torch.multinomial(mass.cpu(), n_draws, replacement=True, generator=generator).to(device)
-                codes = anchor_codes[a].expand(n_draws, t).clone()
-                if other is not None:
-                    codes[:, u] = torch.multinomial(other[idx].cpu(), 1, generator=generator).squeeze(1).to(device)
-                refs[a].append((idx, codes, torch.full((n_draws,), masses[a, u].item() / n_draws, device=device)))
-            if u < t:
-                reach[a] *= probs[inv[a], :, anchor_codes[a, u]]
-    out = [tuple(torch.cat(parts) for parts in zip(*r)) for r in refs]
-    return out, masses
+
+@torch.no_grad()
+def extend(codes: CodeSet, selector, gen):
+    """One more token for every sampled code: the selector picks an unused slice, the image answers it."""
+    h = selector.pick(codes.tokens, codes.slices)
+    probs = codes.table[codes.images, h]
+    tokens = torch.multinomial(probs.cpu(), 1, generator=gen).squeeze(1).to(probs.device)
+    codes.add_depth(h, tokens)
+
+
+def fit_copies(modules, batches, loss_fn, score, epochs, patience, lr, weight_decay, progress, describe):
+    """Train one module per copy in lockstep epochs, keeping every copy's weights from the epoch with the best
+    held-out score (higher is better). batches(m) yields copy m's minibatches; loss_fn(m, batch) is its loss;
+    describe(epoch, score) is the progress line. -> (best score, best epoch)."""
+    opts = [torch.optim.AdamW([p for p in mod.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay)
+            for mod in modules]
+    best: dict[str, Any] = {"score": -math.inf, "epoch": 0, "states": [copy.deepcopy(m.state_dict()) for m in modules]}
+    bad = 0
+    for epoch in range(1, epochs + 1):
+        for m, opt in enumerate(opts):
+            modules[m].train()
+            for batch in batches(m):
+                loss = loss_fn(m, batch)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+        for mod in modules:
+            mod.eval()
+        with torch.no_grad():
+            s = score()
+        progress(describe(epoch, s))
+        if s > best["score"]:
+            best = {"score": s, "epoch": epoch, "states": [copy.deepcopy(m.state_dict()) for m in modules]}
+            bad = 0
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+    for mod, st in zip(modules, best["states"]):
+        mod.load_state_dict(st)
+        mod.eval()
+    return best["score"], best["epoch"]
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common_args(p)
     p.add_argument("--vocab-size", type=int, default=16)
-    p.add_argument("--k-max", type=int, default=8)
+    p.add_argument("--k-max", type=int, default=8, help="code length the exported encoder gives the decoder and prior")
     p.add_argument("--folds", type=int, default=4)
-    p.add_argument("--anchors", type=int, default=32, help="P: anchor images, one partition each")
-    p.add_argument("--references", type=int, default=8192,
-                   help="R: reference draws per anchor, split evenly over its truncated groups")
-    p.add_argument("--hartigan-rounds", type=int, default=200, help="cap on batched Hartigan move rounds per partition")
-    p.add_argument("--width", type=int, default=128)
+    p.add_argument("--rounds", type=int, default=50)
+    p.add_argument("--round-patience", type=int, default=3, help="stop after this many rounds without a better val loss")
+    p.add_argument("--slices-per-round", type=int, default=8, help="B: new slices (one column) per round")
+    p.add_argument("--codes", type=int, default=2048, help="C: sampled training codes examined per step")
+    p.add_argument("--weight-cutoff", type=float, default=1e-4, help="posterior weights below this are dropped")
+    p.add_argument("--k-decay", type=float, default=0.8, help="rho: each further token is read with this probability")
+    p.add_argument("--restarts", type=int, default=4, help="k-means++ starts per partition")
+    p.add_argument("--hartigan-rounds", type=int, default=100, help="cap on batched Hartigan move rounds per start")
+    p.add_argument("--column-width", type=int, default=32)
+    p.add_argument("--column-hidden", type=int, default=64)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.01)
-    p.add_argument("--epochs", type=int, default=20, help="max encoder epochs per position")
-    p.add_argument("--patience", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=20, help="max column epochs per round")
+    p.add_argument("--patience", type=int, default=2)
     p.add_argument("--selector-width", type=int, default=128)
-    p.add_argument("--selector-batch-size", type=int, default=1024)
+    p.add_argument("--selector-batch-size", type=int, default=256)
     p.add_argument("--selector-lr", type=float, default=1e-3)
-    p.add_argument("--selector-epochs", type=int, default=100, help="max selector epochs per position")
+    p.add_argument("--selector-epochs", type=int, default=100, help="max selector epochs per depth")
     p.add_argument("--selector-patience", type=int, default=5)
-    p.add_argument("--memo-cap", type=int, default=2_000_000)
-    p.add_argument("--log-interval", type=float, default=5.0, help="seconds between progress lines")
+    p.add_argument("--log-interval", type=float, default=10.0, help="seconds between progress lines")
     p.add_argument("--limit-train", type=int, default=None, help="use only the first N training images (smoke tests)")
     p.add_argument("--limit-val", type=int, default=None)
     p.add_argument("--out", default="checkpoints/encoder.pt")
     p.add_argument("--state", default="checkpoints/encoder_build.pt")
-    p.add_argument("--resume", action="store_true", help="continue from --state with the next position")
+    p.add_argument("--resume", action="store_true", help="continue from --state with the next round")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
     device = get_device(args.device)
-    with timed("loading MNIST"):
-        X = to_float(load_mnist("train", args.data_root, device)[: args.limit_train])
-        Xv = to_float(load_mnist("val", args.data_root, device)[: args.limit_val])
+    X = to_float(load_mnist("train", args.data_root, device)[: args.limit_train])
+    Xv = to_float(load_mnist("val", args.data_root, device)[: args.limit_val])
     mean = X.flatten(1).mean(0)
     Xc, Xvc = X.flatten(1) - mean, Xv.flatten(1) - mean  # centered pixels, for the objective's precision
-    N, Nv, V, Fo, P = len(X), len(Xv), args.vocab_size, args.folds, args.anchors
-    R = args.references
-    log(f"device {device}, {N} training images in {Fo} folds, {Nv} val images, V={V}, k_max={args.k_max}, "
-        f"{P} anchors, {R} reference draws per anchor")
+    N, Nv, V, Fo, B, C = len(X), len(Xv), args.vocab_size, args.folds, args.slices_per_round, args.codes
+    P, rho, cutoff = Xc.shape[1], args.k_decay, args.weight_cutoff
+    gen = torch.Generator().manual_seed(args.seed)
+    progress = Progress(args.log_interval)
 
-    state: dict[str, Any] = {"args": vars(args), "stages": [], "history": []}
-    if args.resume and not os.path.exists(args.state):
-        log(f"--resume: no build state at {args.state} (no position was finished), so starting from position 1")
+    def new_copy():
+        return SliceNet(V, (), args.column_width, args.column_hidden).to(device)
+
+    state: dict[str, Any] = {"args": vars(args), "history": []}
+    copies = [new_copy() for _ in range(Fo + 1)]
+    selector: SelectorNet | None = None
+    T, first_round = 0, 1
     if args.resume and os.path.exists(args.state):
         state = torch.load(args.state, map_location="cpu", weights_only=False)
-        fold_of = state["fold_of"]
-        log(f"resuming from {args.state}: {len(state['stages'])} positions built")
+        fold_of = state["fold_of"].to(device)
+        for c, st in zip(copies, state["copies"]):
+            for cfg in state["columns"]:
+                c.add_column(cfg["n_slices"], device)
+            c.load_state_dict(st)
+        selector = SelectorNet(V, copies[0].n_slices, args.selector_width).to(device)
+        selector.load_state_dict(state["selector"])
+        T, first_round = state["T"], len(state["history"]) + 1
     else:
-        fold_of = torch.randperm(N, generator=torch.Generator().manual_seed(args.seed)) % Fo
-        state["fold_of"] = fold_of
-    sampler = CodeSampler(X, fold_of, V, Fo, args.memo_cap)
-    cfgs, final_encoders, final_selectors = [], [], []
-    if state["stages"]:
-        log(f"rebuilding the {len(state['stages'])} saved positions ({Fo + 1} encoders and selectors each)")
-    for t, st in enumerate(state["stages"]):
-        cfg = st["cfg"]
-        encs, sels = [], []
-        for enc_state, sel_state in zip(st["encoder_states"], st["selector_states"]):
-            e = StageNet(V, t, cfg["n_heads"], cfg["width"]).to(device)
-            e.load_state_dict(enc_state)
-            s = SelectorNet(V, t, cfg["n_heads"], cfg["selector_width"]).to(device)
-            s.load_state_dict(sel_state)
-            encs.append(e)
-            sels.append(s)
-        sampler.add_position(encs, sels)
-        cfgs.append(cfg)
-        final_encoders.append(st["encoder_states"][Fo])
-        final_selectors.append(st["selector_states"][Fo])
+        if args.resume:
+            log(f"--resume: no build state at {args.state}, starting from round 1")
+        fold_of = (torch.randperm(N, generator=gen) % Fo).to(device)
+        state["fold_of"] = fold_of.cpu()
+    for c in copies:
+        c.requires_grad_(False)
+    table, val_table = slice_table(copies, fold_of, X, Xv)
+    held_out = [(fold_of == f).nonzero().squeeze(1) for f in range(Fo)]
+    log(f"device {device}, {N} training images in {Fo} folds, {Nv} val images, V={V}, {B} slices per round, "
+        f"{C} codes per step, rho={rho}" + (f"; resuming after round {first_round - 1}" if first_round > 1 else ""))
 
-    # mean distance with no code, for reference: val image vs all training images
-    k0 = ((Xvc.pow(2).sum(1) - 2 * Xvc @ Xc.mean(0) + Xc.pow(2).sum(1).mean()) / Xc.shape[1]).mean().item()
-    all_idx = torch.arange(N, device=device)
-    train_sets = [all_idx[(fold_of != f).to(device)] for f in range(Fo)] + [all_idx]
-    held_out = [(fold_of == f).nonzero().squeeze(1).to(device) for f in range(Fo)]
-
+    best_val, bad_rounds = min([h["val_loss"] for h in state["history"]], default=math.inf), 0
     try:
-        for t in range(len(state["stages"]), args.k_max):
-            t0 = time.time()
-            log(f"=== position {t + 1} of {args.k_max} (prefix length {t})")
-            gen = torch.Generator().manual_seed(args.seed * 1000 + t)
-            tick = Ticker(args.log_interval)
+        for rnd in range(first_round, args.rounds + 1):
+            S = copies[0].n_slices
+            log(f"round {rnd}: {S} slices in the bank, codes reach depth {T}")
+            entry: dict[str, Any] = {"round": rnd}
 
-            # 1. anchor partitions
-            with timed(f"sampling {P} anchors with out-of-fold codes"):
-                anchor_idx = torch.randperm(N, generator=gen)[:P].to(device)
-                anchor_codes = sampler.sample_train(anchor_idx, t, gen)
-            with timed(f"drawing {R} references per anchor, evenly over its {t + 1} groups by shared prefix length"):
-                refs, masses = draw_references(sampler, anchor_codes, R, gen, tick)
-            log("group masses in images (mean over anchors, shared prefix length 0.." + f"{t}, last = full match): "
-                + " ".join(f"{m:.1f}" for m in masses.mean(0).tolist()))
-            with timed(f"building {P} anchor partitions (Hartigan on {R} references each)"):
-                parts = []
-                for a, (ref_idx, ref_codes, ref_w) in enumerate(refs):
-                    tick(f"  partition {a + 1}/{P}")
-                    parts.append(AnchorPartition(anchor_codes[a], Xc[ref_idx], ref_codes, V, gen, args.hartigan_rounds,
-                                                 ref_w))
-            losses = [pt.total_loss() / masses[a].sum().item() for a, pt in enumerate(parts)]
-            log(f"partitions: {sum(len(pt.table.nodes) for pt in parts) / P:.1f} groups on average, "
-                f"{sum(pt.rounds for pt in parts) / P:.1f} Hartigan rounds on average, estimated loss per image "
-                f"{min(losses):.5f}..{max(losses):.5f}")
+            # A. a sample of the encoder's codes, and the bank's best realized gain at each prefix
+            summary: dict[str, str] = {}
+            with step("A codes", summary), torch.no_grad():
+                codes = CodeSet(table, Xc, cutoff, torch.randperm(N, generator=gen)[:C].to(device))
+                for _ in range(T):
+                    extend(codes, selector, gen)
+                all_codes = torch.arange(codes.n_codes, device=device)
+                G = codes.slice_gains(all_codes, torch.arange(S, device=device),
+                                      lambda k, n: progress(f"A bank gains: prefix {k}/{n}"))
+                G = G.masked_fill(codes.used_mask(all_codes, S), -torch.inf)
+                bar = G.max(1).values.clamp_min(0) if S else torch.zeros(codes.n_codes, device=device)
+                a = rho ** codes.depth.float() * codes.count / C
+                summary["text"] = (f"{codes.n_codes} distinct prefixes from {C} samples, "
+                                   f"bank's weighted gain {float((a * bar).sum()):.5f}")
 
-            def targets(idx, codes):
-                return torch.stack([pt.labels(Xc[idx], codes) for pt in parts], 1)
+            # B. B partitions, each where the bank (and this round's earlier picks) gain least
+            summary = {}
+            with step("B partitions", summary), torch.no_grad():
+                search = PartitionSearch(codes, a, V)
+                bar_now = bar[search.code_ids]
+                labels = torch.empty(B, N, dtype=torch.long, device=device)
+                nu = torch.zeros(N, B, dtype=torch.bool, device=device)
+                bars, implied, rounds = [], [], []
+                for b in range(B):
+                    best: tuple[float, torch.Tensor | None] = (-math.inf, None)
+                    for s in range(args.restarts):
+                        progress(f"B partition {b + 1}/{B}, start {s + 1}/{args.restarts}")
+                        lab, J, r = search.run(kmeanspp(Xc, V, gen), bar_now, args.hartigan_rounds)
+                        rounds.append(r)
+                        if J > best[0]:
+                            best = (J, lab)
+                    J, lab = best
+                    assert lab is not None
+                    labels[b] = lab
+                    gains = search.gains(search.stats(lab))
+                    beats = gains[search.e_code] > bar_now[search.e_code]
+                    nu[search.e_img[beats], b] = True
+                    bars.append(bar_now)
+                    implied.append(J)
+                    bar_now = torch.maximum(bar_now, gains)
+                summary["text"] = (f"implied J {fmt(implied, 5)}, {sum(rounds) / len(rounds):.1f} Hartigan rounds "
+                                   f"per start, {int(nu.any(1).sum())} images labeled")
+            entry["implied_J"] = implied
 
-            with timed("held-out codes and partition labels for every training image"):
-                eval_codes = sampler.sample_all_train(t, torch.Generator().manual_seed(args.seed * 1000 + t + 500), tick)
-                eval_targets = targets(all_idx, eval_codes)
+            # C. a new column learns the partitions; earlier columns stay frozen
+            summary = {}
+            with step("C column", summary):
+                columns = [c.add_column(B, device) for c in copies]
+                labeled = nu.any(1).nonzero().squeeze(1)
+                weights = nu.float()
 
-            # 2. encoders: F+1 multi-head StageNets, lockstep epochs, early stopping on held-out cross-entropy
-            encoders = [StageNet(V, t, P, args.width).to(device) for _ in range(Fo + 1)]
-            opts = [torch.optim.AdamW(m.parameters(), lr=args.lr, weight_decay=args.weight_decay) for m in encoders]
-            best: dict[str, Any] = {"score": math.inf}
-            bad = 0
-            for epoch in range(1, args.epochs + 1):
-                with timed(f"encoder epoch {epoch}: training {Fo + 1} models with {P} heads each"):
-                    losses = []
-                    for m, (model, opt) in enumerate(zip(encoders, opts)):
-                        model.train()
-                        order = train_sets[m][torch.randperm(len(train_sets[m]), generator=gen).to(device)]
-                        for b in order.split(args.batch_size):
-                            codes = sampler.sample_train(b, t, gen)
-                            loss = F.cross_entropy(model(X[b], codes).reshape(-1, V), targets(b, codes).reshape(-1))
-                            opt.zero_grad(set_to_none=True)
-                            loss.backward()
-                            opt.step()
-                            losses.append(loss.item())
-                            tick(f"  model {m + 1}/{Fo + 1} cross-entropy {sum(losses[-50:]) / len(losses[-50:]):.4f} "
-                                 f"(memo {len(sampler.memo)})")
-                with torch.no_grad():
-                    total = 0.0
+                def ce(m, idx):
+                    logits = copies[m](X[idx])[:, S:]  # [n, B, V]
+                    loss = F.cross_entropy(logits.reshape(-1, V), labels[:, idx].T.reshape(-1), reduction="none")
+                    w = weights[idx].reshape(-1)
+                    return (loss * w).sum() / w.sum().clamp_min(1)
+
+                def ce_batches(m):
+                    rows = labeled if m == Fo else labeled[fold_of[labeled] != m]
+                    order = rows[torch.randperm(len(rows), generator=gen).to(device)]
+                    return order.split(args.batch_size)
+
+                def held_out_ce():
+                    total, count = 0.0, 0.0
                     for f in range(Fo):
-                        encoders[f].eval()
-                        logits = forward_chunked(encoders[f], X[held_out[f]], eval_codes[held_out[f]])
-                        total += F.cross_entropy(logits.reshape(-1, V), eval_targets[held_out[f]].reshape(-1),
-                                                 reduction="sum").item()
-                    held_ce = total / (N * P)
-                improved = held_ce < best["score"]
-                log(f"encoder epoch {epoch}: train cross-entropy {sum(losses) / len(losses):.4f}, held-out {held_ce:.4f}"
-                    f"{'  *best*' if improved else ''}")
-                if improved:
-                    best = {"score": held_ce, "epoch": epoch, "states": [copy.deepcopy(m.state_dict()) for m in encoders]}
-                    bad = 0
-                else:
-                    bad += 1
-                    if bad >= args.patience:
+                        rows = labeled[fold_of[labeled] == f]
+                        for idx in rows.split(FORWARD_CHUNK):
+                            total += float(ce(f, idx)) * float(weights[idx].sum())
+                            count += float(weights[idx].sum())
+                    return -total / max(count, 1.0)
+
+                score, epoch = fit_copies(columns, ce_batches, ce, held_out_ce, args.epochs, args.patience, args.lr,
+                                          args.weight_decay, progress,
+                                          lambda e, s: f"C epoch {e}: held-out cross-entropy {-s:.4f}")
+                for c in copies:
+                    c.requires_grad_(False)
+                table, val_table = slice_table(copies, fold_of, X, Xv)
+                codes.table = table
+                new = torch.arange(S, S + B, device=device)
+                realized_gains = codes.slice_gains(search.code_ids, new, lambda k, n: progress(f"C realized gains: prefix {k}/{n}"))
+                realized = [search.objective(realized_gains[:, b], bars[b]) for b in range(B)]
+                S += B
+                summary["text"] = f"best epoch {epoch}, held-out cross-entropy {-score:.4f}, realized J {fmt(realized, 5)}"
+            entry.update(column_epochs=epoch, held_out_cross_entropy=-score, realized_J=realized)
+
+            # D. a fresh selector learns, depth by depth, which slice gains most after each prefix
+            summary = {}
+            with step("D selector", summary):
+                sels = [SelectorNet(V, S, args.selector_width).to(device) for _ in range(Fo + 1)]
+                codes = CodeSet(table, Xc, cutoff, torch.randperm(N, generator=gen)[:C].to(device))
+                sample_fold = fold_of[codes.images]
+                targets: list[torch.Tensor] = []  # per depth: every sample's gain per slice [C, S]
+                masks: list[torch.Tensor] = []  # per depth: True for slices already used [C, S]
+                drift: list[float] = []
+                scale, choice = 1.0, 0.0
+                for u in range(S + 1):
+                    if u >= 1:
+                        extend(codes, sels[Fo], gen)
+                    here = codes.codes_at(u)
+                    if u == S or bool((codes.support[here] < 2).all()):
+                        T = u
                         break
-            for m, s in zip(encoders, best["states"]):
-                m.load_state_dict(s)
-                m.eval()
-            encoder_epochs = best["epoch"]
-
-            # 3. held-out marginal decompression loss of every training image under every partition
-            with torch.no_grad(), timed(f"held-out marginal decompression loss of every training image under each of {P} "
-                                        "partitions"):
-                q = torch.empty(N, P, V, device=device)
-                for f in range(Fo):
-                    q[held_out[f]] = forward_chunked(encoders[f], X[held_out[f]], eval_codes[held_out[f]]).softmax(-1)
-                eval_ids = node_ids(eval_codes, V)
-                ones = torch.ones(N, device=device)
-                cost = torch.empty(N, P, device=device)
-                for a in range(P):
-                    tick(f"  partition {a + 1}/{P}")
-                    cost[:, a] = node_costs(Xc, all_idx, eval_ids, q[:, a], Xc, all_idx, eval_ids, q[:, a], ones, all_idx)
-            mean_cost = cost.mean(0)
-            log(f"held-out loss per partition: best {mean_cost.min():.5f}, worst {mean_cost.max():.5f}, "
-                f"per-image best (oracle) {cost.min(1).values.mean():.5f}")
-
-            # 4. selectors: F+1 SelectorNets regressing the costs from the code, early stopping on the held-out
-            # loss of their choices
-            selectors = [SelectorNet(V, t, P, args.selector_width).to(device) for _ in range(Fo + 1)]
-            for s in selectors:
-                with torch.no_grad():
-                    s.out.bias.copy_(mean_cost)  # start from each partition's mean cost
-            sel_opts = [torch.optim.AdamW(s.parameters(), lr=args.selector_lr) for s in selectors]
-            best_sel: dict[str, Any] = {"score": math.inf}
-            bad = 0
-            with timed(f"training {Fo + 1} selectors"):
-                for epoch in range(1, args.selector_epochs + 1):
-                    for m, (sel, opt) in enumerate(zip(selectors, sel_opts)):
-                        sel.train()
-                        order = train_sets[m][torch.randperm(len(train_sets[m]), generator=gen).to(device)]
-                        for b in order.split(args.selector_batch_size):
-                            loss = F.mse_loss(sel(eval_codes[b]), cost[b])
-                            opt.zero_grad(set_to_none=True)
-                            loss.backward()
-                            opt.step()
                     with torch.no_grad():
-                        mse, choice = 0.0, 0.0
-                        for f in range(Fo):
-                            pred = selectors[f].eval()(eval_codes[held_out[f]])
-                            mse += F.mse_loss(pred, cost[held_out[f]], reduction="sum").item()
-                            choice += cost[held_out[f]].gather(1, pred.argmin(-1, keepdim=True)).sum().item()
-                        mse, choice = mse / (N * P), choice / N
-                    improved = choice < best_sel["score"]
-                    tick(f"  selector epoch {epoch}: held-out loss of choices {choice:.4f}, MSE {mse:.3e}"
-                         f"{'  *best*' if improved else ''}")
-                    if improved:
-                        best_sel = {"score": choice, "mse": mse, "epoch": epoch,
-                                    "states": [copy.deepcopy(s.state_dict()) for s in selectors]}
-                        bad = 0
-                    else:
-                        bad += 1
-                        if bad >= args.selector_patience:
-                            break
-            for s, st in zip(selectors, best_sel["states"]):
-                s.load_state_dict(st)
-                s.eval()
-            log(f"selectors: best epoch {best_sel['epoch']}, held-out loss of choices {best_sel['score']:.4f}, "
-                f"MSE {best_sel['mse']:.3e}")
-            # Every copy codes with the final selector from here on: the fold selectors only chose the epoch.
-            # One choice per code keeps each token's meaning the same in every copy (partitions can be tied
-            # mirror images, so independent choices could flip it).
-            for s in selectors[:Fo]:
-                s.load_state_dict(selectors[Fo].state_dict())
-            sampler.add_position(encoders, selectors)
+                        G = codes.slice_gains(here, torch.arange(S, device=device),
+                                              lambda k, n: progress(f"D gains at depth {u}: prefix {k}/{n}"))
+                        local = codes.ids[:, u] - here[0]
+                        targets.append(G[local])
+                        masks.append(codes.used_mask(codes.ids[:, u], S))
+                    if u == 0:
+                        scale = float(targets[0].abs().mean()) or 1.0
+                        for s in sels:
+                            with torch.no_grad():
+                                s.out.bias.copy_(targets[0][0] / scale)
+                    depths = list(range(u + 1))
 
-            # 5. report on the val split: val images coded by the final models, training images (coded out of
-            # fold) as references; the selector's choices vs the single best partition vs no code
-            with torch.no_grad(), timed("val report (final encoder and selector, val split)"):
-                val_codes = sampler.sample_final(Xv, t, torch.Generator().manual_seed(args.seed + 7 + t))
-                val_ids = node_ids(val_codes, V)
-                qv = forward_chunked(encoders[Fo], Xv, val_codes).softmax(-1)
-                vrows = torch.arange(Nv, device=device)
-                no_ref = torch.full((Nv,), -1, dtype=torch.long, device=device)
-                single = int(mean_cost.argmin())
-                report = {}
-                for label, pa, pr in [("selector", selectors[Fo].choose(val_codes), selectors[Fo].choose(eval_codes)),
-                                      ("single best", torch.full((Nv,), single, device=device),
-                                       torch.full((N,), single, device=device))]:
-                    report[label] = node_costs(Xvc, vrows, val_ids, qv[vrows, pa], Xc, all_idx, eval_ids,
-                                               q[all_idx, pr], ones, no_ref).mean().item()
-                chosen = torch.bincount(selectors[Fo].choose(eval_codes), minlength=P)
-            entry = {"position": t + 1, "encoder_epochs": encoder_epochs, "selector_epochs": best_sel["epoch"],
-                     "held_out_cross_entropy": best["score"], "held_out_loss_per_partition": mean_cost.tolist(),
-                     "selector_choice_loss": best_sel["score"],
-                     "selector_mse": best_sel["mse"], "val_selector": report["selector"],
-                     "val_single_best": report["single best"], "k0": k0, "seconds": time.time() - t0}
+                    def sel_batches(m, depths=depths):
+                        out = []
+                        for d in depths:
+                            rows = torch.arange(C, device=device)
+                            rows = rows if m == Fo else rows[sample_fold != m]
+                            order = rows[torch.randperm(len(rows), generator=gen).to(device)]
+                            out += [(d, idx) for idx in order.split(args.selector_batch_size)]
+                        return [out[i] for i in torch.randperm(len(out), generator=gen).tolist()]
+
+                    def mse(m, batch):
+                        d, idx = batch
+                        pred = sels[m](codes.tokens[idx, :d])
+                        free = ~masks[d][idx]
+                        return ((pred - targets[d][idx] / scale).pow(2) * free).sum() / free.sum().clamp_min(1)
+
+                    def choices(depths=depths):
+                        total = 0.0
+                        for d in depths:
+                            got = torch.zeros(C, device=device)
+                            for f in range(Fo):
+                                rows = (sample_fold == f).nonzero().squeeze(1)
+                                pick = sels[f](codes.tokens[rows, :d]).masked_fill(masks[d][rows], -torch.inf).argmax(1)
+                                got[rows] = targets[d][rows, pick]
+                            total += rho**d * float(got.mean())
+                        return total
+
+                    choice, _ = fit_copies(sels, sel_batches, mse, choices, args.selector_epochs, args.selector_patience,
+                                           args.selector_lr, 0.0, progress,
+                                           lambda e, s, u=u: f"D depth {u}, epoch {e}: held-out gain of choices {s:.5f}")
+                    for s in sels[:Fo]:
+                        s.load_state_dict(sels[Fo].state_dict())
+                    with torch.no_grad():
+                        if u >= 1:
+                            path = sels[Fo].path(codes.tokens[:, :u])
+                            drift = (path != codes.slices[:, :u]).float().mean(0).tolist()
+                selector = sels[Fo]
+                used = codes.slices.unique().numel() if T else 0
+                summary["text"] = (f"codes stop at depth {T}, held-out gain of choices {choice:.5f}, "
+                                   f"{used} of {S} slices used" + (f", drift {fmt(drift, 2)}" if drift else ""))
+            entry.update(T=T, selector_choice_gain=choice, slices_used=used, drift=drift)
+
+            # E. score on held-out images
+            summary = {}
+            with step("E val", summary), torch.no_grad():
+                assert selector is not None
+                vgen = torch.Generator().manual_seed(args.seed + 7)
+                vtok = torch.zeros(Nv, 0, dtype=torch.long, device=device)
+                vsl = vtok.clone()
+                for _ in range(T):
+                    h = selector.pick(vtok, vsl)
+                    probs = val_table[torch.arange(Nv, device=device), h]
+                    t = torch.multinomial(probs.cpu(), 1, generator=vgen).to(device)
+                    vtok, vsl = torch.cat([vtok, t], 1), torch.cat([vsl, h[:, None]], 1)
+                sq, vsq = Xc.pow(2).sum(1), Xvc.pow(2).sum(1)
+                L = torch.zeros(T + 1, device=device)
+                rows_per = max(1, 2**24 // N)
+                for i in range(0, Nv, rows_per):
+                    v = slice(i, i + rows_per)
+                    w = torch.ones(len(vsq[v]), N, device=device)
+                    alive = torch.ones(len(w), dtype=torch.bool, device=device)
+                    last = torch.zeros(len(w), device=device)
+                    for t in range(T + 1):
+                        if t > 0:
+                            w = w * table[:, vsl[v, t - 1], vtok[v, t - 1]].T
+                            w = torch.where(w >= cutoff, w, 0.0)
+                        W = w.sum(1)
+                        dist = (W * vsq[v] - 2 * (Xvc[v] * (w @ Xc)).sum(1) + w @ sq) / (P * W.clamp_min(1e-30))
+                        alive &= W > 0  # past the longest prefix with weight, the loss stays where it was
+                        last = torch.where(alive, dist, last)
+                        L[t] += last.sum()
+                L = (L / Nv).tolist()
+                val_loss = sum((1 - rho) * rho ** (t - 1) * L[t] for t in range(1, T + 1)) + rho**T * L[T]
+                summary["text"] = f"loss {val_loss:.5f} (no code {L[0]:.5f}; by length {fmt(L[1:], 5)})"
+            entry.update(val_loss=val_loss, val_loss_by_length=L)
             state["history"].append(entry)
-            log(f"position {t + 1} done in {entry['seconds']:.0f}s: val loss at k={t + 1}: selector {report['selector']:.5f}, "
-                f"single best partition {report['single best']:.5f}, no code {k0:.5f}; partitions the selector uses "
-                f"(training codes): {(chosen > 0).sum().item()} of {P}")
 
-            with timed(f"saving {args.out} and {args.state}"):
-                cfg = dict(n_heads=P, width=args.width, selector_width=args.selector_width)
-                state["stages"].append({"cfg": cfg,
-                                        "encoder_states": [copy.deepcopy(m.state_dict()) for m in encoders],
-                                        "selector_states": [copy.deepcopy(s.state_dict()) for s in selectors]})
-                torch.save(state, args.state)
-                cfgs.append(cfg)
-                final_encoders.append(copy.deepcopy(encoders[Fo].state_dict()))
-                final_selectors.append(copy.deepcopy(selectors[Fo].state_dict()))
-                encoder = StagedEncoder(V, len(cfgs), cfgs)
-                for net, s in zip(encoder.nets, final_encoders):
-                    net.load_state_dict(s)
-                for net, s in zip(encoder.selectors, final_selectors):
-                    net.load_state_dict(s)
-                save_checkpoint(args.out, "encoder", encoder, args=vars(args), history=state["history"])
+            # save the encoder (final copy and selector) and the build state
+            assert selector is not None
+            encoder = BlindKnightEncoder(V, min(args.k_max, S), copies[Fo].config, args.column_width, args.column_hidden,
+                                         args.selector_width)
+            encoder.slices.load_state_dict(copies[Fo].state_dict())
+            encoder.selector.load_state_dict(selector.state_dict())
+            save_checkpoint(args.out, "encoder", encoder.to(device), args=vars(args), history=state["history"])
+            state.update(copies=[c.state_dict() for c in copies], columns=copies[0].config,
+                         selector=selector.state_dict(), T=T)
+            torch.save(state, args.state)
+
+            if val_loss < best_val:
+                best_val, bad_rounds = val_loss, 0
+            else:
+                bad_rounds += 1
+                if bad_rounds >= args.round_patience:
+                    log(f"stopping: no better val loss for {bad_rounds} rounds (best {best_val:.5f})")
+                    break
     except KeyboardInterrupt:
-        if state["stages"]:
-            log(f"interrupted; {len(state['stages'])} completed positions are in {args.state} (continue with --resume)")
-        else:
-            log("interrupted before any position finished; nothing was saved (start again without --resume)")
+        log(f"interrupted; {len(state['history'])} finished rounds are in {args.state} (continue with --resume)")
 
 
 if __name__ == "__main__":

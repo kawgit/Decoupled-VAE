@@ -1,4 +1,4 @@
-"""Prior p(z) and decoder p(x|z) for a discrete 1-D latent of k_max tokens over a vocab of V (encoder: dvae/staged.py).
+"""Prior p(z) and decoder p(x|z) for a discrete 1-D latent of k_max tokens over a vocab of V (encoder: dvae/knight.py).
 
 Codes are indexed as base-V numbers with z_1 as the most significant digit, so the children of
 prefix node j at depth t are nodes j*V .. j*V+V-1 at depth t+1.
@@ -252,4 +252,4 @@ class Decoder(nn.Module):
         return img.view(-1, 1, 28, 28)
 
 
-MODELS = {"prior": Prior, "decoder": Decoder}  # the encoder lives in dvae/staged.py
+MODELS = {"prior": Prior, "decoder": Decoder}  # the encoder lives in dvae/knight.py

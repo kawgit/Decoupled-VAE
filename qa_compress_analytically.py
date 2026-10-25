@@ -22,19 +22,14 @@ CHUNK = 8192  # training images per forward pass
 def prefix_log_q(encoder, Y, codes, mode, top_p):
     """log q(z_1:t | y) of every training image y [N, 1, 28, 28] for each code's prefixes: entry t is [n, N].
 
-    Each position's image features are computed once and shared by all the codes.
+    Every slice's output on the training images is computed once and shared by all the codes.
     """
-    n, k_max = codes.shape
-    out = [torch.zeros(n, len(Y), device=Y.device)]
-    for t, net in enumerate(encoder.stage_nets[:k_max]):
-        feats = torch.cat([net.features(Y[i:i + CHUNK]) for i in range(0, len(Y), CHUNK)])
-        step = torch.empty(n, len(Y), device=Y.device)
-        for j in range(n):
-            prefix, token = codes[j:j + 1, :t], codes[j, t]
-            for i in range(0, len(Y), CHUNK):
-                logits = encoder.stage_logits(t, feats[i:i + CHUNK], prefix)
-                step[j, i:i + CHUNK] = apply_mode(logits, mode, top_p)[:, token]
-        out.append(out[-1] + step)
+    logp = torch.cat([apply_mode(encoder.features(Y[i:i + CHUNK]), mode, top_p)
+                      for i in range(0, len(Y), CHUNK)])  # [N, S, V]
+    path = encoder.selector.path(codes)  # the slice asked at every position of each code
+    out = [torch.zeros(len(codes), len(Y), device=Y.device)]
+    for t in range(codes.shape[1]):
+        out.append(out[-1] + logp[:, path[:, t], codes[:, t]].T)
     return out
 
 

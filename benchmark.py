@@ -110,13 +110,13 @@ def top_codes_and_samples(encoder, test, B, S, args, device):
     progress = Progress("beam search and sampling (images)")
     for idx in batches(len(test), max(1, args.encoder_chunk // rows), False, device, drop_last=False):
         x, n = to_float(test[idx]), len(idx)
-        feats = [net.features(x) for net in encoder.stage_nets]
+        feats = encoder.features(x)  # every slice's logits, shared by all prefixes
         # beam search
         beam, beam_lq = torch.zeros(n, 1, 0, dtype=torch.long, device=device), torch.zeros(n, 1, device=device)
         for t in range(k):
             b = beam.shape[1]
             img = torch.arange(n, device=device).repeat_interleave(b)
-            lq = beam_lq[:, :, None] + next_log_q(encoder, t, feats[t][img], beam.flatten(0, 1), args).view(n, b, V)
+            lq = beam_lq[:, :, None] + next_log_q(encoder, t, feats[img], beam.flatten(0, 1), args).view(n, b, V)
             keep = min(B, b * V)
             beam_lq, pick = lq.flatten(1).topk(keep, 1)
             parent, token = pick // V, pick % V
@@ -130,7 +130,7 @@ def top_codes_and_samples(encoder, test, B, S, args, device):
             prefix = torch.zeros(n * S, 0, dtype=torch.long, device=device)
             lq, lr = torch.zeros(n * S, device=device), torch.zeros(n * S, device=device)
             for t in range(k):
-                logp = next_log_q(encoder, t, feats[t][img], prefix, args)  # [nS, V]
+                logp = next_log_q(encoder, t, feats[img], prefix, args)  # [nS, V]
                 on_path = (top[:, :, :t] == prefix[:, None, :]).all(-1)  # top codes inside this node's subtree
                 child = top[:, :, t]
                 count = torch.zeros(n * S, V, device=device).scatter_add_(1, child, on_path.float())

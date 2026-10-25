@@ -14,9 +14,9 @@ import torch
 
 from .models import MODELS as _MODELS
 from .models import MODES
-from .staged import StagedEncoder
+from .knight import BlindKnightEncoder
 
-MODELS = {**_MODELS, "encoder": StagedEncoder}
+MODELS = {**_MODELS, "encoder": BlindKnightEncoder}
 
 
 # Cap what the MPS allocator may take (relative to macOS's recommended GPU working set, ~13 GB on an
