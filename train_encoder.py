@@ -315,8 +315,10 @@ def main():
                 sels = [SelectorNet(V, S, args.selector_width).to(device) for _ in range(Fo + 1)]
                 codes = CodeSet(table, Xc, cutoff, torch.randperm(N, generator=gen)[:C].to(device))
                 sample_fold = fold_of[codes.images]
-                targets: list[torch.Tensor] = []  # per depth: every sample's gain per slice [C, S]
-                masks: list[torch.Tensor] = []  # per depth: True for slices already used [C, S]
+                # per depth: every sample's gain per slice [C, S], used slices included (asking one again gains
+                # about nothing, and the selector must know that if its choices above ever change)
+                targets: list[torch.Tensor] = []
+                masks: list[torch.Tensor] = []  # per depth: True for slices already used [C, S], for picking only
                 drift: list[float] = []
                 scale, choice = 1.0, 0.0
                 for u in range(S + 1):
@@ -334,9 +336,6 @@ def main():
                         masks.append(codes.used_mask(codes.ids[:, u], S))
                     if u == 0:
                         scale = float(targets[0].abs().mean()) or 1.0
-                        for s in sels:
-                            with torch.no_grad():
-                                s.out.bias.copy_(targets[0][0] / scale)
                     depths = list(range(u + 1))
 
                     def sel_batches(m, depths=depths):
@@ -350,9 +349,7 @@ def main():
 
                     def mse(m, batch):
                         d, idx = batch
-                        pred = sels[m](codes.tokens[idx, :d])
-                        free = ~masks[d][idx]
-                        return ((pred - targets[d][idx] / scale).pow(2) * free).sum() / free.sum().clamp_min(1)
+                        return (sels[m](codes.tokens[idx, :d]) - targets[d][idx] / scale).pow(2).mean()
 
                     def choices(depths=depths):
                         total = 0.0
@@ -376,9 +373,25 @@ def main():
                             drift = (path != codes.slices[:, :u]).float().mean(0).tolist()
                 selector = sels[Fo]
                 used = codes.slices.unique().numel() if T else 0
+                agree, captured = [], []  # how often the final selector picks the slice that really gains most,
+                with torch.no_grad():     # and how much of that slice's gain its picks get (near-ties cost little)
+                    for d in range(len(targets)):
+                        g = targets[d].masked_fill(masks[d], -torch.inf)
+                        pick = sels[Fo](codes.tokens[:, :d]).masked_fill(masks[d], -torch.inf).argmax(1)
+                        best = g.max(1)
+                        agree.append(float((pick == best.indices).float().mean()))
+                        got = g.gather(1, pick[:, None]).squeeze(1)
+                        captured.append(float(got.sum() / best.values.sum().clamp_min(1e-12)))
+
+                def head(values):
+                    return fmt(values[:8], 2) + (" ..." if len(values) > 8 else "")
+
                 summary["text"] = (f"codes stop at depth {T}, held-out gain of choices {choice:.5f}, "
-                                   f"{used} of {S} slices used" + (f", drift {fmt(drift, 2)}" if drift else ""))
-            entry.update(T=T, selector_choice_gain=choice, slices_used=used, drift=drift)
+                                   f"{used} of {S} slices used"
+                                   + (f"; by depth: picks the best slice {head(agree)}, gets {head(captured)} of its "
+                                      f"gain, drift {head(drift) if drift else '-'}" if agree else ""))
+            entry.update(T=T, selector_choice_gain=choice, slices_used=used, drift=drift, best_slice_agreement=agree,
+                         best_gain_captured=captured)
 
             # E. score on held-out images
             summary = {}

@@ -240,13 +240,15 @@ on every training image, so any code's posterior is a lookup away.
    at depth $u$ depend on the selector's choices above it. For $u = 0, 1, \dots$:
    - extend the sampled codes by one token with the selector so far; stop, with $T = u$, if the bank is used
      up or every depth-$u$ code is reached by a single image;
-   - at every distinct depth-$u$ prefix, the realized gain of every unused slice;
-   - fit `--folds` + 1 copies by MSE on the gains at depths $0, \dots, u$, early-stopped on the held-out
-     gain of their choices, weighted by depth. A sample belongs to its image's fold. Then every copy uses
-     the final selector.
+   - at every distinct depth-$u$ prefix, the realized gain of every slice, used ones included: asking a
+     slice again gains about nothing, and the selector has to know that in case its choices above change;
+   - fit `--folds` + 1 copies by MSE on those gains at depths $0, \dots, u$, early-stopped on the held-out
+     gain of their choices (only unused slices can be chosen), weighted by depth. A sample belongs to its
+     image's fold. Then every copy uses the final selector.
 
    Fitting a deeper depth can change choices at shallower ones after their codes were rolled out; the
-   build logs how many changed.
+   build logs how many changed, and how often the final selector picks the unused slice with the highest
+   realized gain, at each depth.
 6. **Report.** On the val split: $\hat L_t$ for every length $t \le T$, and $\hat L$ (lengths past $T$
    score the same as $T$); each new slice's implied and realized improvement; how many slices the
    selector uses.
@@ -309,11 +311,11 @@ s^m_{\mathrm{new}} \;=\; \operatorname{fit}_s\;
 
 **3. Selector**: reinitialized, with $C$ fresh samples. For $u = 0, 1, \dots$: extend every $z_d$ by one
 token with the current $\sigma^\star$; stop with $T = u$ if the bank is used up or every code in $Z_u$ is
-reached by a single image; else compute $G_{zh}$ for every $z \in Z_u$ and $h \notin \mathrm{used}(z)$, and
+reached by a single image; else compute $G_{zh}$ for every $z \in Z_u$ and every slice $h$, used or not, and
 
 ```math
 \sigma^m \;=\; \operatorname{fit}_\sigma\;
-  \mathbb{E}_{d : f(j_d) \ne m}\, \sum_{u' \le u}\, \mathbb{E}_{h \notin \mathrm{used}}\, \big(\sigma(z_{d,1:u'})_h - G_{z_{d,1:u'} h}\big)^2
+  \mathbb{E}_{d : f(j_d) \ne m}\, \sum_{u' \le u}\, \mathbb{E}_h\, \big(\sigma(z_{d,1:u'})_h - G_{z_{d,1:u'} h}\big)^2
 \;\big\|\;
   \mathbb{E}_d \sum_{u' \le u} \omega_{u'}\, G_{z_{d,1:u'} \hat h},
 \qquad
@@ -380,8 +382,8 @@ calls them.
 \quad \textbf{return } \mathrm{spread}(w) - \textstyle\sum_c \big(\sum_j w^c_j \big/ \sum_j w_j\big)\, D_c \\[12pt]
 \textbf{function } \mathrm{sliceGains}(z): \\
 \quad \text{// in: a code } z \text{ (shape } |z| \text{)} \\
-\quad \text{// out: } G_{z \cdot} \text{, the realized gain at } z \text{ of every slice not yet used on it (shape } S \text{, used slices left out)} \\
-\quad \textbf{return } G_{zh} = \mathrm{gain}(z, R_{\cdot h \cdot}) \text{ for every } h \notin \mathrm{used}(z) \\[12pt]
+\quad \text{// out: } G_{z \cdot} \text{, the realized gain at } z \text{ of every slice (shape } S \text{); a slice already used on } z \text{ gains about nothing} \\
+\quad \textbf{return } G_{zh} = \mathrm{gain}(z, R_{\cdot h \cdot}) \text{ for every slice } h \\[12pt]
 \textbf{function } \mathrm{impliedGain}(z, \lambda): \\
 \quad \text{// in: a code } z \text{ (shape } |z| \text{); } \lambda \text{, a class for every training image (shape } N \text{, each in } \{1, \dots, V\} \text{)} \\
 \quad \text{// out: the gain at } z \text{ of a slice that reproduced } \lambda \text{ exactly (one number)} \\
@@ -392,7 +394,7 @@ calls them.
 \quad \textbf{return } \textstyle\sum_{u=0}^{T} \omega_u\, \frac{1}{C} \sum_{z \in Z_u} n_z \big[ g_z - G^*_z \big]_+ \\[12pt]
 \textbf{function } \mathrm{bankBest}(): \\
 \quad \text{// out: } G^* \text{, the bank's best realized gain at every examined code (shape } |Z| \text{)} \\
-\quad \textbf{return } G^*_z = \max\big(0,\; \max_h \mathrm{sliceGains}(z)_h\big) \text{ for every } z \in Z
+\quad \textbf{return } G^*_z = \max\big(0,\; \max_{h \notin \mathrm{used}(z)} \mathrm{sliceGains}(z)_h\big) \text{ for every } z \in Z
 \end{array}
 ```
 
@@ -477,12 +479,14 @@ calls them.
         \qquad \text{// nothing deeper can be asked or scored} \\
 \qquad G_{z \cdot} \leftarrow \mathrm{sliceGains}(z) \text{ for every } z \in Z_u; \quad \mathcal D \leftarrow \mathcal D \cup \big\{ (d, u) : d = 1, \dots, C \big\} \\
 \qquad \text{// fit every copy on depths } 0, \dots, u \text{, warm-started from the last depth; a sample belongs to its image's fold} \\
-\qquad \mathrm{MSE}(\sigma, \mathcal B) = \mathbb{E}_{(d, u') \in \mathcal B}\, \mathbb{E}_{h \notin \mathrm{used}(z_{d,1:u'})} \big( \sigma(z_{d,1:u'})_h - G_{z_{d,1:u'} h} \big)^2 \\
+\qquad \mathrm{MSE}(\sigma, \mathcal B) = \mathbb{E}_{(d, u') \in \mathcal B}\, \mathbb{E}_h \big( \sigma(z_{d,1:u'})_h - G_{z_{d,1:u'} h} \big)^2
+        \qquad \text{// every slice, used ones included} \\
 \qquad \mathrm{choices}(\sigma^1, \dots, \sigma^F) = \textstyle\sum_{u' \le u} \omega_{u'}\, \mathbb{E}_d\, G_{z_{d,1:u'} \hat h},
         \quad \hat h = \arg\max_{h \notin \mathrm{used}(z_{d,1:u'})} \sigma^{f(j_d)}(z_{d,1:u'})_h \\
 \qquad \mathrm{fitCopies}\big(\sigma,\ \mathrm{MSE},\ \mathrm{choices},\ \texttt{selector-patience}\big) \\
 \qquad \sigma^m \leftarrow \sigma^\star \text{ for every fold copy } m \qquad \text{// } \eta \text{ now uses this fit} \\
 \qquad \text{log the drift: the fraction of } (d, u' < u) \text{ whose } \eta(z_{d,1:u'}) \text{ is no longer the slice that drew } z_{d,u'+1} \\
+\quad \text{log how often } \sigma^\star \text{ picks the unused slice with the highest } G \text{, at every depth} \\
 \quad \textbf{return } \sigma^\star, T \\[12pt]
 \textbf{function } \mathrm{evaluate}(): \\
 \quad \text{// out: } \hat L_t \text{, how far a val image's decompressed version lands from it on average, given } t \text{ tokens (shape } T \text{);} \\
