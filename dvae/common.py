@@ -101,9 +101,17 @@ def load_checkpoint(path, kind, device):
 
 
 def check_same_codes(a, b, what):
-    for key in ("vocab_size", "k_max"):
-        if a[key] != b[key]:
-            raise ValueError(f"{what}: {key} mismatch ({a[key]} vs {b[key]})")
+    """Two models that read codes (prior, decoder) must agree on the vocab, the code length and the slice count."""
+    for key in ("vocab_size", "k_max", "n_slices"):
+        if a.get(key) != b.get(key):
+            raise ValueError(f"{what}: {key} mismatch ({a.get(key)} vs {b.get(key)})")
+
+
+def check_encoder(encoder, cfg, what):
+    """A prior or decoder must read the codes of the encoder whose slices it was trained with."""
+    for key, value in (("vocab_size", encoder.V), ("n_slices", encoder.n_slices)):
+        if cfg.get(key) != value:
+            raise ValueError(f"{what}: {key} mismatch with the encoder ({cfg.get(key)} vs {value})")
 
 
 class _GracefulInterrupt:

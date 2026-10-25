@@ -5,13 +5,14 @@ import math
 
 import torch
 
-from dvae.common import add_common_args, add_mode_args, check_same_codes, get_device, load_checkpoint
+from dvae.common import add_common_args, add_mode_args, check_encoder, check_same_codes, get_device, load_checkpoint
 from dvae.viz import code_str, save_grid
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     add_common_args(p)
+    p.add_argument("--encoder", default="checkpoints/encoder.pt", help="supplies the slice asked at each position")
     p.add_argument("--prior", default="checkpoints/prior.pt")
     p.add_argument("--decoder", default="checkpoints/decoder_gray.pt")
     p.add_argument("-n", type=int, default=64)
@@ -23,13 +24,15 @@ def main():
 
     torch.manual_seed(args.seed)
     device = get_device(args.device)
+    encoder, _ = load_checkpoint(args.encoder, "encoder", device)
     prior, _ = load_checkpoint(args.prior, "prior", device)
     decoder, _ = load_checkpoint(args.decoder, "decoder", device)
     check_same_codes(prior.config, decoder.config, "prior vs decoder")
+    check_encoder(encoder, prior.config, "prior")
 
     with torch.no_grad():
-        codes = prior.sample(args.n, mode=args.prior_mode, top_p=args.prior_top_p)
-        images = decoder.render(decoder(codes), args.render)
+        codes = prior.sample(args.n, encoder, mode=args.prior_mode, top_p=args.prior_top_p)
+        images = decoder.render(decoder(codes, encoder.slice_path(codes)), args.render)
     save_grid(images, args.out, nrow=math.ceil(math.sqrt(args.n)))
     print(f"saved {args.n} samples to {args.out}")
     print("codes (row-major):")

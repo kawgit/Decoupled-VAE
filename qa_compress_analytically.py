@@ -11,7 +11,6 @@ import torch
 
 from dvae.common import add_common_args, add_mode_args, get_device, load_checkpoint
 from dvae.data import load_mnist, to_float
-from dvae.models import apply_mode
 from dvae.viz import code_str, save_grid
 from qa_compress import default_ks
 
@@ -24,9 +23,8 @@ def prefix_log_q(encoder, Y, codes, mode, top_p):
 
     Every slice's output on the training images is computed once and shared by all the codes.
     """
-    logp = torch.cat([apply_mode(encoder.features(Y[i:i + CHUNK]), mode, top_p)
-                      for i in range(0, len(Y), CHUNK)])  # [N, S, V]
-    path = encoder.selector.path(codes)  # the slice asked at every position of each code
+    logp = torch.cat([encoder.answers(Y[i:i + CHUNK], mode, top_p) for i in range(0, len(Y), CHUNK)])  # [N, S+1, V]
+    path = encoder.slice_path(codes)  # the slice asked at every position of each code
     out = [torch.zeros(len(codes), len(Y), device=Y.device)]
     for t in range(codes.shape[1]):
         out.append(out[-1] + logp[:, path[:, t], codes[:, t]].T)
@@ -38,8 +36,10 @@ def main():
     add_common_args(p)
     p.add_argument("--encoder", default="checkpoints/encoder.pt")
     p.add_argument("-n", type=int, default=16, help="number of test images")
+    p.add_argument("--k-max", type=int, default=8, help="code length")
     p.add_argument("-k", type=int, nargs="+", default=None,
-                   help="prefix lengths to keep (default: every k up to k_max=10, else powers of 2 and k_max)")
+                   help="prefix lengths to keep (default: every k up to k_max if it's at most 10, else powers of 2 "
+                        "and k_max)")
     p.add_argument("-m", type=int, default=8, help="posterior draws per image")
     add_mode_args(p, "encoder", default="greedy")
     add_mode_args(p, "posterior")
@@ -49,7 +49,7 @@ def main():
     torch.manual_seed(args.seed)
     device = get_device(args.device)
     encoder, _ = load_checkpoint(args.encoder, "encoder", device)
-    k_max = encoder.config["k_max"]
+    k_max = args.k_max
     ks = args.k or default_ks(k_max)
     if any(k < 0 or k > k_max for k in ks):
         print(f"skipping k outside 0..{k_max}: {[k for k in ks if k < 0 or k > k_max]}")
@@ -63,7 +63,7 @@ def main():
     x = to_float(test[pick])
     gen = torch.Generator().manual_seed(args.seed + 1)
     with torch.no_grad():
-        codes = encoder.sample(x, mode=args.encoder_mode, top_p=args.encoder_top_p)
+        codes = encoder.sample(x, k_max, mode=args.encoder_mode, top_p=args.encoder_top_p)
         log_q = prefix_log_q(encoder, train, codes[:, :max(ks)], args.posterior_mode, args.posterior_top_p)
         for k in ks:
             lq = log_q[k]

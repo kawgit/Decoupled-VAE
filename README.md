@@ -8,10 +8,11 @@ On this branch the encoder is a **blind knight encoder**. A SliceNet offers many
 images, and a SelectorNet picks one slice per token from the code so far, never seeing the image. Lowering
 the expected decompression loss on unseen images is like slicing at an opponent you can't see.
 
-Default vocab: `V=16`. The encoder build decides how long codes get (below); the decoder and prior read
-their first `k_max` tokens (default 8, i.e. 16⁸ ≈ 4.3 billion codes). Beyond 2¹⁶ codes, `analyze_encoder.py`
-analyzes only the prefixes it can enumerate, and `benchmark.py` estimates its numbers from the encoder's
-top and sampled codes.
+Default vocab: `V=16`. The encoder has no code length of its own: it asks one slice per token, and once
+every slice is used the token is always 0. Each script that consumes codes picks a length, `--k-max`: the
+decoder and prior fix theirs at training time (default 8, i.e. 16⁸ ≈ 4.3 billion codes), and the scripts that
+use them read it from their checkpoints. Beyond 2¹⁶ codes, `analyze_encoder.py` analyzes only the prefixes
+it can enumerate, and `benchmark.py` estimates its numbers from the encoder's top and sampled codes.
 
 ## The objective
 
@@ -185,7 +186,12 @@ Every image with the same prefix uses the same slice, so a token means the same 
 One slice can be picked at many prefixes and depths: the slices are a shared bank of questions, and a
 code is a path down a decision tree whose questions come from the bank. A slice sees only the image, so
 asking it twice along one code gets the same answer again; $\mathrm{used}(z)$, which follows from $z$
-alone, rules that out. A code therefore ends when the bank is used up, after $S$ tokens.
+alone, rules that out. Once the bank is used up, after $S$ tokens, every further token is 0.
+
+**The decoder and prior read the slices too.** At every position they're told which slice the selector
+asks there (a separate index once the bank is used up). That index follows from the code's earlier tokens
+through the selector, so the encoder supplies it: when they train, when the prior samples, and when the
+benchmark enumerates codes.
 
 **SliceNet grows by columns.** Each build round adds one column holding up to $B$ (`--slices-per-round`)
 new slices. A column is a small conv stack with one head per slice. Its layer $l$ reads its own layer
@@ -529,9 +535,9 @@ The device is picked automatically (cuda → mps → cpu); override it with `--d
 
 ```bash
 python train_encoder.py                                  # -> checkpoints/encoder.pt (+ encoder_build.pt)
-python train_decoder.py                                  # -> checkpoints/decoder_gray.pt   (8-bit pixels)
-python train_decoder.py --likelihood binary              # -> checkpoints/decoder_binary.pt (binarized)
-python train_prior.py                                    # -> checkpoints/prior.pt
+python train_decoder.py --k-max 8                        # -> checkpoints/decoder_gray.pt   (8-bit pixels)
+python train_decoder.py --k-max 8 --likelihood binary    # -> checkpoints/decoder_binary.pt (binarized)
+python train_prior.py --k-max 8                          # -> checkpoints/prior.pt
 python qa_generate.py -n 64                              # -> outputs/generate.png
 python qa_compress.py -n 16 -k 1 2 4 10 -m 8             # -> outputs/compress/k01.png ...
 python qa_compress_analytically.py -n 16 -m 8            # -> outputs/compress_analytically/k01.png ...
@@ -548,6 +554,8 @@ python analyze_encoder.py --encoder checkpoints/encoder.pt # -> results/usage_en
     `--rounds`). Ctrl-C loses only the round in progress.
   - For quick tests, `--limit-train` and `--limit-val` use fewer images.
 - **Decoder and prior training:**
+  - Train them with the same `--k-max`; the scripts that use both check that they match each other and
+    the encoder's bank.
   - They early-stop on their val loss (a fixed 5k split of the MNIST train set) and keep the best
     checkpoint at `--out`. Set the learning rate with `--lr`.
   - Ctrl-C saves `*_latest.pt`. Continue with `--resume checkpoints/<name>_latest.pt`; flags you add
@@ -567,15 +575,15 @@ python analyze_encoder.py --encoder checkpoints/encoder.pt # -> results/usage_en
   training images first. Every node is computed on request with the real selector, so any depth can be
   browsed; children are fetched ahead of time, so stepping down is instant. Stop it with Ctrl-C.
 - **Benchmark:** `benchmark.py` scores each decoder on the data it was trained for: 8-bit MNIST, or
-  the test set binarized with a fixed seed. It reports exact NLL, plus −ELBO and rate when you pass
-  `--encoder`. When the code space is too large to enumerate (more than 2¹⁶ codes), it uses the encoder
-  (default `checkpoints/encoder.pt`): the top `--beam` codes per image under q are summed exactly, and
+  the test set binarized with a fixed seed. It always loads the encoder (`--encoder`, default
+  `checkpoints/encoder.pt`), which supplies the slices, and reports exact NLL, −ELBO and rate. When the code
+  space is too large to enumerate (more than 2¹⁶ codes), it estimates them with the encoder: the top `--beam` codes per image under q are summed exactly, and
   `--samples` more are sampled from q outside them. That gives an unbiased estimate of p(x), reported as
   `nll_is` (an upper bound on the NLL on average), plus a guaranteed upper bound from the top codes
   alone (`nll_top_bound`) and the −ELBO, distortion and rate. The decoder runs once per distinct code.
   Use `--limit` for a quicker partial run.
-- **Latent usage:** `analyze_encoder.py` reports, for each prefix length k, how many bits carry
-  information about the image and about the digit label, and how many codes are used.
+- **Latent usage:** `analyze_encoder.py` reports, for each prefix length k up to its `--k-max`, how many
+  bits carry information about the image and about the digit label, and how many codes are used.
 
 ## Layout
 

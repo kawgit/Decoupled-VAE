@@ -36,13 +36,14 @@ def main():
     p.add_argument("--encoder", default="checkpoints/encoder.pt")
     p.add_argument("--split", choices=["train", "val", "test"], default="val")
     add_mode_args(p, "encoder")
+    p.add_argument("--k-max", type=int, default=8, help="longest prefix to analyze")
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--out", default=None, help="JSON output (default: results/usage_<encoder name>.json)")
     args = p.parse_args()
 
     device = get_device(args.device)
     encoder, _ = load_checkpoint(args.encoder, "encoder", device)
-    V, k_max = encoder.config["vocab_size"], encoder.config["k_max"]
+    V, k_max = encoder.V, args.k_max
     depth = max((t for t in range(1, k_max + 1) if V**t <= MAX_CODES), default=0)
     if depth == 0:
         raise SystemExit(f"{V} codes per token is too many to enumerate exactly")
@@ -60,8 +61,7 @@ def main():
     used = [torch.zeros(w, dtype=torch.bool, device=device) for w in widths]
     with torch.no_grad():
         for idx in batches(N, args.batch_size, False, device, drop_last=False):
-            tree = encoder.prefix_logprobs(to_float(images[idx]), args.encoder_mode, args.encoder_top_p,
-                                           depth=depth)
+            tree = encoder.prefix_logprobs(to_float(images[idx]), depth, args.encoder_mode, args.encoder_top_p)
             for t in range(1, depth + 1):
                 q = tree[t].exp()  # [n, V**t]
                 agg[t] += q.sum(0)

@@ -129,7 +129,6 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common_args(p)
     p.add_argument("--vocab-size", type=int, default=16)
-    p.add_argument("--k-max", type=int, default=8, help="code length the exported encoder gives the decoder and prior")
     p.add_argument("--folds", type=int, default=4)
     p.add_argument("--rounds", type=int, default=50)
     p.add_argument("--round-patience", type=int, default=3, help="stop after this many rounds without a better val loss")
@@ -418,8 +417,7 @@ def main():
 
             # save the encoder (final copy and selector) and the build state
             assert selector is not None
-            encoder = BlindKnightEncoder(V, min(args.k_max, S), copies[Fo].config, args.column_width, args.column_hidden,
-                                         args.selector_width)
+            encoder = BlindKnightEncoder(V, copies[Fo].config, args.column_width, args.column_hidden, args.selector_width)
             encoder.slices.load_state_dict(copies[Fo].state_dict())
             encoder.selector.load_state_dict(selector.state_dict())
             save_checkpoint(args.out, "encoder", encoder.to(device), args=vars(args), history=state["history"])

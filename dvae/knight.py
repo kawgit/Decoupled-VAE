@@ -2,7 +2,8 @@
 
 At every position the selector picks the unused slice with the highest predicted gain from the code so far,
 and the image answers it with a token from that slice. A slice's answer doesn't depend on the code, so
-asking it twice along one code adds nothing; a code ends when every slice is used. Built by train_encoder.py.
+asking it twice along one code adds nothing; once every slice is used, the token is always 0. Built by
+train_encoder.py.
 
 Codes are indexed as base-V numbers with z_1 most significant, so node j at depth t has children
 j*V .. j*V+V-1 at depth t+1.
@@ -149,60 +150,95 @@ class SelectorNet(nn.Module):
         return used
 
 
-class BlindKnightEncoder(nn.Module):
-    """q(z|x): the selector picks a slice from the code so far, the image answers it. Codes are k_max long.
+def with_none(t):
+    """Append the "no slice" row to every image's per-slice logits or log-probs [n, S, V] -> [n, S + 1, V]: once
+    the bank is used up, the token is always 0."""
+    none = torch.full_like(t[:, :1], -torch.inf)
+    none[..., 0] = 0.0
+    return torch.cat([t, none], 1)
 
-    columns: one dict per SliceNet column (n_slices). Same interface the other scripts use.
+
+class BlindKnightEncoder(nn.Module):
+    """q(z|x): the selector picks a slice from the code so far, the image answers it. Once every slice is used,
+    the token is always 0. Codes have no fixed length: callers choose it.
+
+    Slice indices run over 0..S-1, and S stands for "no slice" past the end of the bank. columns: one dict per
+    SliceNet column (n_slices). k_max is accepted, and ignored, so older checkpoints still load.
     """
 
-    def __init__(self, vocab_size=2, k_max=0, columns=(), width=32, hidden=64, selector_width=128):
+    def __init__(self, vocab_size=2, columns=(), width=32, hidden=64, selector_width=128, k_max=None):
         super().__init__()
         columns = list(columns)
-        self.config = dict(vocab_size=vocab_size, k_max=k_max, columns=columns, width=width, hidden=hidden,
+        self.config = dict(vocab_size=vocab_size, columns=columns, width=width, hidden=hidden,
                            selector_width=selector_width)
-        self.V, self.k_max = vocab_size, k_max
+        self.V = vocab_size
         self.slices = SliceNet(vocab_size, columns, width, hidden)
         self.selector = SelectorNet(vocab_size, self.slices.n_slices, selector_width)
-        assert k_max <= self.slices.n_slices, "a code can't be longer than the bank"
+
+    @property
+    def n_slices(self):
+        return self.slices.n_slices
 
     def features(self, x):
         """Every slice's logits for every image [n, S, V]; shared by all prefixes."""
         return self.slices(x)
 
+    def answers(self, x, mode="actual", top_p=0.9):
+        """Log-probs of every slice's answer for every image, plus the "no slice" row [n, S + 1, V]."""
+        return with_none(apply_mode(self.features(x), mode, top_p))
+
+    def slice_path(self, codes):
+        """The slice asked at every position of each code [n, t] -> [n, t] (S past the end of the bank)."""
+        S, t = self.n_slices, codes.shape[1]
+        path = self.selector.path(codes[:, :S])
+        return torch.cat([path, path.new_full((len(codes), max(t - S, 0)), S)], 1)
+
+    def next_slices(self, prefix):
+        """The slice asked after each prefix [n, t] -> [n] (S once the bank is used up)."""
+        if prefix.shape[1] >= self.n_slices:
+            return prefix.new_full((len(prefix),), self.n_slices)
+        return self.selector.pick(prefix, self.selector.path(prefix))
+
+    def tree_slices(self, depth, device, chunk=65536):
+        """The slice asked after every prefix of the code tree: entry t is [V**t], for t below depth."""
+        out, used = [], torch.zeros(1, 0, dtype=torch.long, device=device)
+        for t in range(depth):
+            if t >= self.n_slices:
+                out.append(torch.full((self.V**t,), self.n_slices, dtype=torch.long, device=device))
+                continue
+            prefixes = all_prefixes(t, self.V, device)
+            nxt = torch.cat([self.selector.pick(prefixes[i:i + chunk], used[i:i + chunk])
+                             for i in range(0, len(prefixes), chunk)])
+            out.append(nxt)
+            used = torch.cat([used, nxt[:, None]], 1).repeat_interleave(self.V, 0)
+        return out
+
     def stage_logits(self, t, feats, prefix):
-        """Logits of the slice asked after each prefix [n, t] -> [n, V]."""
-        nxt = self.selector.pick(prefix, self.selector.path(prefix))
-        return feats[torch.arange(len(feats), device=feats.device), nxt]
+        """Logits of the slice asked after each prefix [n, t] -> [n, V]; feats from features()."""
+        return with_none(feats)[torch.arange(len(feats), device=feats.device), self.next_slices(prefix)]
 
     def log_prob(self, x, codes, mode="actual", top_p=0.9):
-        """Per-token log-probs of codes [N, k_max] -> [N, k_max]."""
-        logp = apply_mode(self.features(x), mode, top_p)  # [N, S, V]
-        path = self.selector.path(codes)
+        """Per-token log-probs of codes [N, t] -> [N, t]."""
         rows = torch.arange(len(x), device=x.device)[:, None]
-        return logp[rows, path, codes]
+        return self.answers(x, mode, top_p)[rows, self.slice_path(codes), codes]
 
     @torch.no_grad()
-    def sample(self, x, mode="actual", top_p=0.9, generator=None):
-        logp = apply_mode(self.features(x), mode, top_p)
+    def sample(self, x, length, mode="actual", top_p=0.9, generator=None):
+        """Codes [N, length] for images x."""
+        logp = self.answers(x, mode, top_p)
         rows = torch.arange(len(x), device=x.device)
         codes = torch.zeros(len(x), 0, dtype=torch.long, device=x.device)
         used = codes.clone()
-        for _ in range(self.k_max):
-            h = self.selector.pick(codes, used)
+        for u in range(length):
+            h = self.selector.pick(codes, used) if u < self.n_slices else codes.new_full((len(x),), self.n_slices)
             nxt = torch.multinomial(logp[rows, h].exp(), 1, generator=generator)
             codes, used = torch.cat([codes, nxt], 1), torch.cat([used, h[:, None]], 1)
         return codes
 
-    def prefix_logprobs(self, x, mode="actual", top_p=0.9, chunk=65536, depth=None):
-        """Enumerate the code tree: entry t is [N, V**t], the log-prob of every length-t prefix, for t up to
-        depth (default k_max)."""
-        logp = apply_mode(self.features(x), mode, top_p)  # [N, S, V]
+    def prefix_logprobs(self, x, depth, mode="actual", top_p=0.9):
+        """Enumerate the code tree: entry t is [N, V**t], the log-prob of every length-t prefix, for t up to depth."""
+        logp = self.answers(x, mode, top_p)  # [N, S + 1, V]
         out = [torch.zeros(len(x), 1, device=x.device)]
-        used = torch.zeros(1, 0, dtype=torch.long, device=x.device)  # slices asked along every node so far
-        for t in range(self.k_max if depth is None else depth):
-            prefixes = all_prefixes(t, self.V, x.device)
-            nxt = torch.cat([self.selector.pick(prefixes[i:i + chunk], used[i:i + chunk])
-                             for i in range(0, len(prefixes), chunk)])
+        for nxt in self.tree_slices(depth, x.device):
             out.append((out[-1][:, :, None] + logp[:, nxt]).flatten(1))
-            used = torch.cat([used, nxt[:, None]], 1).repeat_interleave(self.V, 0)
         return out

@@ -1,10 +1,11 @@
 """Benchmark test-set likelihood of prior + decoder(s).
 
-When the code space is small enough to enumerate, we report the exact negative log-likelihood
--log sum_z p(z) p(x|z). With --encoder we also report the negative ELBO under q(z|x) (any q gives a
-valid bound, so --encoder-mode greedy/topp are fine too), split into distortion and rate.
+The prior and decoder read the slice the encoder's selector asks at each position, so the encoder (--encoder)
+is always loaded. When the code space is small enough to enumerate, we report the exact negative
+log-likelihood -log sum_z p(z) p(x|z), and the negative ELBO under q(z|x) (any q gives a valid bound, so
+--encoder-mode greedy/topp are fine too), split into distortion and rate.
 
-When it is too large, every number is estimated with the encoder (--encoder, default checkpoints/encoder.pt):
+When it is too large, every number is estimated with the encoder:
 the top --beam codes per image under q(z|x), found by beam search, are summed exactly, and --samples codes are
 drawn from q restricted to the codes outside them. Then
 
@@ -29,7 +30,7 @@ from typing import NamedTuple
 
 import torch
 
-from dvae.common import add_common_args, add_mode_args, check_same_codes, get_device, load_checkpoint
+from dvae.common import add_common_args, add_mode_args, check_encoder, check_same_codes, get_device, load_checkpoint
 from dvae.data import NUM_PIXELS, batches, binary_target, gray_target, load_mnist, to_float
 from dvae.models import apply_mode
 
@@ -45,12 +46,12 @@ def all_codes(V, k_max, device):
 
 
 @torch.no_grad()
-def decoder_log_likelihoods(decoder, codes, target, code_chunk, image_chunk):
-    """log p(x|z) for every test image and code -> [N, C]."""
+def decoder_log_likelihoods(decoder, codes, slices, target, code_chunk, image_chunk):
+    """log p(x|z) for every test image and code (with its slices) -> [N, C]."""
     out = torch.empty(len(target), len(codes), device=target.device)
     pix = torch.arange(NUM_PIXELS, device=target.device)[None]
     for c0 in range(0, len(codes), code_chunk):
-        logits = decoder(codes[c0:c0 + code_chunk])
+        logits = decoder(codes[c0:c0 + code_chunk], slices[c0:c0 + code_chunk])
         if decoder.likelihood == "gray":
             logp = logits.log_softmax(-1)  # [c, 784, 256]
             for i0 in range(0, len(target), image_chunk):
@@ -93,7 +94,7 @@ def next_log_q(encoder, t, feats, prefix, args):
 
 
 @torch.no_grad()
-def top_codes_and_samples(encoder, test, B, S, args, device):
+def top_codes_and_samples(encoder, test, k, B, S, args, device):
     """For every test image: its top-B codes under q(z|x) (beam search) and S codes sampled from q restricted
     to the codes outside them.
 
@@ -103,7 +104,7 @@ def top_codes_and_samples(encoder, test, B, S, args, device):
     top codes are never drawn; using the actual sampling probability keeps the estimate unbiased even where
     rounding makes it differ slightly from q / q(rest).
     """
-    V, k = encoder.V, encoder.k_max
+    V = encoder.V
     gen = torch.Generator(device=device).manual_seed(args.seed)
     rows = max(B, S, 1)
     out = {key: [] for key in ("top", "top_log_q", "samples", "sample_log_q", "sample_log_r")}
@@ -166,21 +167,22 @@ def distinct_codes(codes):
 
 
 @torch.no_grad()
-def prior_log_probs(prior, codes, chunk):
-    """log p(z) of codes [U, k] -> [U]."""
-    return torch.cat([prior.log_prob(codes[i:i + chunk]).sum(1) for i in range(0, len(codes), chunk)])
+def prior_log_probs(prior, codes, slices, chunk):
+    """log p(z) of codes [U, k] with their slices [U, k] -> [U]."""
+    return torch.cat([prior.log_prob(codes[i:i + chunk], slices[i:i + chunk]).sum(1)
+                      for i in range(0, len(codes), chunk)])
 
 
 @torch.no_grad()
-def pair_log_likelihoods(decoder, codes, pair_code, pair_img, target, code_chunk, pair_chunk):
-    """log p(x|z) for (image, code) pairs, decoding each distinct code [U, k] once -> [M]."""
+def pair_log_likelihoods(decoder, codes, slices, pair_code, pair_img, target, code_chunk, pair_chunk):
+    """log p(x|z) for (image, code) pairs, decoding each distinct code [U, k] (with its slices) once -> [M]."""
     out = torch.empty(len(pair_code), device=codes.device)
     order = pair_code.argsort()
     sorted_code = pair_code[order]
     pix = torch.arange(NUM_PIXELS, device=codes.device)[None]
     progress = Progress(f"decoding {len(codes)} distinct codes for {len(pair_code)} (image, code) pairs")
     for c0 in range(0, len(codes), code_chunk):
-        logits = decoder(codes[c0:c0 + code_chunk])
+        logits = decoder(codes[c0:c0 + code_chunk], slices[c0:c0 + code_chunk])
         lo, hi = torch.searchsorted(sorted_code, torch.tensor([c0, c0 + code_chunk], device=codes.device)).tolist()
         if decoder.likelihood == "gray":
             logp = logits.log_softmax(-1)  # [c, 784, 256]
@@ -202,9 +204,8 @@ def main():
     add_common_args(p)
     p.add_argument("--prior", default="checkpoints/prior.pt")
     p.add_argument("--decoder", nargs="+", default=["checkpoints/decoder_gray.pt"])
-    p.add_argument("--encoder", default=None,
-                   help=f"also report the ELBO under this q(z|x); required (default {DEFAULT_ENCODER}) when the "
-                        "code space is too large to enumerate")
+    p.add_argument("--encoder", default=DEFAULT_ENCODER,
+                   help="supplies the slices the prior and decoder read; also gives the ELBO under its q(z|x)")
     add_mode_args(p, "encoder")
     p.add_argument("--binarize-seed", type=int, default=0)
     p.add_argument("--limit", type=int, default=None, help="score only the first N test images")
@@ -224,7 +225,6 @@ def main():
     V, k_max = prior.config["vocab_size"], prior.config["k_max"]
     exact = V**k_max <= MAX_CODES
     if not exact:
-        args.encoder = args.encoder or DEFAULT_ENCODER
         if args.beam >= V**k_max:
             args.samples = 0  # the beam holds every code: nothing is left to sample
         print(f"{V}**{k_max} codes is too many to enumerate exactly: estimating from the top {args.beam} codes "
@@ -236,28 +236,25 @@ def main():
 
     est: Estimate | None = None
     with torch.no_grad():
-        encoder = None
-        if args.encoder:
-            encoder, _ = load_checkpoint(args.encoder, "encoder", device)
-            check_same_codes(encoder.config, prior.config, "encoder vs prior")
+        encoder, _ = load_checkpoint(args.encoder, "encoder", device)
+        check_encoder(encoder, prior.config, "prior")
         if exact:
             codes = all_codes(V, k_max, device)
-            log_pz = prior.prefix_logprobs()[k_max]  # [C]
-            log_q = None
-            if encoder is not None:
-                log_q = torch.cat([encoder.prefix_logprobs(to_float(test[idx]), args.encoder_mode,
-                                                           args.encoder_top_p)[k_max]
-                                   for idx in batches(N, 128, False, device, drop_last=False)])
+            code_slices = encoder.slice_path(codes)
+            log_pz = prior.prefix_logprobs(encoder)[k_max]  # [C]
+            log_q = torch.cat([encoder.prefix_logprobs(to_float(test[idx]), k_max, args.encoder_mode,
+                                                       args.encoder_top_p)[k_max]
+                               for idx in batches(N, 128, False, device, drop_last=False)])
         else:
-            assert encoder is not None
-            top, top_lq, smp, smp_lq, smp_lr = top_codes_and_samples(encoder, test, args.beam, args.samples, args,
-                                                                     device)
+            top, top_lq, smp, smp_lq, smp_lr = top_codes_and_samples(encoder, test, k_max, args.beam, args.samples,
+                                                                     args, device)
             B, S = top.shape[1], smp.shape[1]
             uniq, pair_code = distinct_codes(torch.cat([top, smp], 1).flatten(0, 1))
             print(f"{len(uniq)} distinct codes among {len(pair_code)} (image, code) pairs", flush=True)
             est = Estimate(B, S, uniq, pair_code, torch.arange(N, device=device).repeat_interleave(B + S),
                            torch.cat([top_lq, smp_lq], 1),
-                           prior_log_probs(prior, uniq, args.pair_chunk)[pair_code].view(N, B + S), smp_lr,
+                           prior_log_probs(prior, uniq, encoder.slice_path(uniq), args.pair_chunk)[pair_code]
+                           .view(N, B + S), smp_lr,
                            (1 - top_lq.exp().sum(1)).clamp(min=0))
 
     rows = []
@@ -272,20 +269,20 @@ def main():
         row = {"decoder": path, "variant": variant, "num_images": N}
         elbo_terms = None  # (distortion, rate), each [N]
         if exact:
-            log_px_z = decoder_log_likelihoods(decoder, codes, target, args.code_chunk, args.image_chunk)  # [N, C]
+            log_px_z = decoder_log_likelihoods(decoder, codes, code_slices, target, args.code_chunk,
+                                               args.image_chunk)  # [N, C]
             nll = -torch.logsumexp(log_px_z + log_pz, 1)  # exact -log p(x), [N]
             row["nll_nats"] = nll.mean().item()
-            if log_q is not None:
-                q = log_q.exp()
-                safe_log_q = torch.where(q > 0, log_q, torch.zeros_like(log_q))
-                distortion = -(q * torch.where(q > 0, log_px_z, torch.zeros_like(log_px_z))).sum(1)
-                rate = (q * (safe_log_q - torch.where(q > 0, log_pz, torch.zeros_like(log_q)))).sum(1)  # KL(q || p)
-                elbo_terms = distortion, rate
+            q = log_q.exp()
+            safe_log_q = torch.where(q > 0, log_q, torch.zeros_like(log_q))
+            distortion = -(q * torch.where(q > 0, log_px_z, torch.zeros_like(log_px_z))).sum(1)
+            rate = (q * (safe_log_q - torch.where(q > 0, log_pz, torch.zeros_like(log_q)))).sum(1)  # KL(q || p)
+            elbo_terms = distortion, rate
         else:
             assert est is not None
             B, S = est.B, est.S
-            log_px_z = pair_log_likelihoods(decoder, est.codes, est.pair_code, est.pair_img, target, args.code_chunk,
-                                            args.pair_chunk).view(N, B + S)
+            log_px_z = pair_log_likelihoods(decoder, est.codes, encoder.slice_path(est.codes), est.pair_code,
+                                            est.pair_img, target, args.code_chunk, args.pair_chunk).view(N, B + S)
             log_joint = log_px_z + est.log_pz  # log p(z) p(x|z)
             top_mass = torch.logsumexp(log_joint[:, :B], 1)  # log sum over the top codes: <= log p(x)
             log_px = top_mass
