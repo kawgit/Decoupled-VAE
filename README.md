@@ -518,7 +518,7 @@ Notes:
 ## Setup
 
 ```bash
-source .venv/bin/activate   # torch + torchvision; MNIST downloads to data/ on first run
+source .venv/bin/activate   # torch + torchvision + matplotlib; MNIST downloads to data/ on first run
 ```
 
 The device is picked automatically (cuda → mps → cpu); override it with `--device`.
@@ -544,6 +544,9 @@ python analyze_encoder.py --encoder checkpoints/encoder.pt # -> results/usage_en
     built encoder.
   - `checkpoints/encoder_build.pt` keeps every fold copy. Continue with `--resume` (and a larger
     `--rounds`). Ctrl-C loses only the round in progress.
+  - `outputs/encoder_build.png` (`--plot`) is redrawn after every round. On the left, one line per round
+    shows the val decompression loss at every code length, darker for later rounds. On the right is the
+    val loss by round.
   - For quick tests, `--limit-train` and `--limit-val` use fewer images.
 - **Decoder and prior training:**
   - Train them with the same `--k-max`; the scripts that use both check that they match each other and

@@ -9,6 +9,7 @@ Codes are indexed as base-V numbers with z_1 most significant, so node j at dept
 j*V .. j*V+V-1 at depth t+1.
 """
 
+import math
 from typing import cast
 
 import torch
@@ -18,6 +19,12 @@ import torch.nn.functional as F
 from .models import apply_mode
 
 ACTIVATION_BUDGET = 2**26  # floats of column activations held at once by one SliceNet forward pass
+
+
+def activation_shapes(width, hidden):
+    """Shape of one image's activations at each of a column's 4 layers, channels first."""
+    c1, c2 = width // 2, width
+    return [(c1, 28, 28), (c2, 14, 14), (c2, 7, 7), (hidden,)]
 
 
 def all_prefixes(depth, vocab_size, device):
@@ -47,20 +54,20 @@ class Column(nn.Module):
             nn.Linear(hidden, n_slices * vocab_size),         # -> logits
         ])
         # lateral l feeds layer l + 1 from every earlier column's layer l (1x1 convs on the feature maps)
-        ins = [c1, c2, c2, hidden]
         self.laterals = nn.ModuleList(
             (nn.Conv2d(n_prev * c, c, 1) if i < 3 else nn.Linear(n_prev * c, c)) if n_prev else nn.Identity()
-            for i, c in enumerate(ins))
+            for i, (c, *_) in enumerate(activation_shapes(width, hidden)))
         self.n_prev = n_prev
 
     def forward(self, x, prev):
-        """x [n, 1, 28, 28]; prev: every earlier column's activations, one list of 4 per column.
+        """x [n, 1, 28, 28]; prev: the earlier columns' activations at each of the 4 layers, concatenated along
+        channels in column order (None without earlier columns).
         -> (logits [n, n_slices, V], this column's 4 activations)."""
         acts = []
         h = x - 0.5
         for i, layer in enumerate(self.layers):
             if i > 0 and self.n_prev:
-                h = h + self.laterals[i - 1](torch.cat([p[i - 1] for p in prev], 1))
+                h = h + self.laterals[i - 1](prev[i - 1])
             if i == 3:
                 h = h.flatten(1)
             h = layer(h)
@@ -98,15 +105,28 @@ class SliceNet(nn.Module):
             return x.new_zeros(len(x), 0, self.V)
         # every column keeps its activations for the later columns' laterals, so memory grows with the
         # number of columns: split the batch to stay within the budget
-        c1, c2 = self.width // 2, self.width
-        per_image = len(self.columns) * 2 * (c1 * 784 + c2 * 196 + c2 * 49 + self.hidden)
+        shapes = activation_shapes(self.width, self.hidden)
+        per_image = len(self.columns) * 2 * sum(math.prod(s) for s in shapes)
         rows = max(1, ACTIVATION_BUDGET // per_image)
         if len(x) > rows:
             return torch.cat([self(x[i:i + rows]) for i in range(0, len(x), rows)])
-        prev, out = [], []
-        for column in self.columns:
-            logits, acts = column(x, prev)
-            prev.append(acts)
+        K, out = len(self.columns), []
+        if torch.is_grad_enabled() and any(p.requires_grad for c in self.columns[:-1] for p in c.parameters()):
+            # autograd through earlier columns: concatenate afresh for each column
+            acts: list[list[torch.Tensor]] = []
+            for k, column in enumerate(self.columns):
+                logits, a = column(x, [torch.cat([p[i] for p in acts], 1) for i in range(4)] if k else None)
+                acts.append(a)
+                out.append(logits)
+            return torch.cat(out, 1)
+        # Otherwise each column's activations go into its own channels of one buffer per layer, and every later
+        # column reads the prefix of earlier columns: a write per column rather than a concatenation per pair.
+        bufs = [x.new_empty(len(x), (K - 1) * c, *rest) for c, *rest in shapes]
+        for k, column in enumerate(self.columns):
+            logits, a = column(x, [b[:, :k * s[0]] for b, s in zip(bufs, shapes)] if k else None)
+            if k < K - 1:
+                for b, s, h in zip(bufs, shapes, a):
+                    b[:, k * s[0]:(k + 1) * s[0]] = h
             out.append(logits)
         return torch.cat(out, 1)
 

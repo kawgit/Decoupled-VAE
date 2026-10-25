@@ -36,6 +36,7 @@ from dvae.common import add_common_args, get_device, save_checkpoint
 from dvae.data import NUM_PIXELS, load_labels, load_mnist, to_float
 from dvae.knight import BlindKnightEncoder, SelectorNet, SliceNet, knight_path, knight_pick
 from dvae.partition import CodeSet, PartitionSearch, kmeanspp, posterior_gains, spread
+from dvae.plots import plot_build
 
 FORWARD_CHUNK = 2048  # images per forward pass when filling the table
 
@@ -180,8 +181,8 @@ def fit_copies(modules, batches, loss_fn, score, epochs, patience, lr, weight_de
     """Train one module per copy in lockstep epochs, keeping every copy's weights from the epoch with the best
     held-out score (higher is better). batches(m) yields copy m's minibatches; loss_fn(m, batch) is its loss;
     describe(epoch, score) is the progress line, of the given kind. -> (best score, best epoch)."""
-    opts = [torch.optim.AdamW([p for p in mod.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay)
-            for mod in modules]
+    opts = [torch.optim.AdamW([p for p in mod.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay,
+                              foreach=True) for mod in modules]
     best: dict[str, Any] = {"score": -math.inf, "epoch": 0, "states": [copy.deepcopy(m.state_dict()) for m in modules]}
     bad = 0
     for epoch in range(1, epochs + 1):
@@ -244,6 +245,7 @@ def main():
     p.add_argument("--limit-val", type=int, default=None)
     p.add_argument("--out", default="checkpoints/encoder.pt")
     p.add_argument("--state", default="checkpoints/encoder_build.pt")
+    p.add_argument("--plot", default="outputs/encoder_build.png", help="progress plot, redrawn after every round")
     p.add_argument("--resume", action="store_true", help="continue from --state with the next round")
     args = p.parse_args()
 
@@ -553,6 +555,7 @@ def main():
             state.update(copies=[c.state_dict() for c in copies], columns=copies[0].config,
                          selector=selector.state_dict(), commits=commit_list, T=T)
             torch.save(state, args.state)
+            plot_build(state["history"], args.plot)
 
             if val_loss < best_val:
                 best_val, bad_rounds = val_loss, 0
