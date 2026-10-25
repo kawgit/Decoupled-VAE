@@ -187,17 +187,17 @@ code is a path down a decision tree whose questions come from the bank. A slice 
 asking it twice along one code gets the same answer again; $\mathrm{used}(z)$, which follows from $z$
 alone, rules that out. A code therefore ends when the bank is used up, after $S$ tokens.
 
-**SliceNet grows by columns.** Each build round adds one column holding $B$ (`--slices-per-round`) new
-slices. A column is a small conv stack with $B$ heads. Its layer $l$ reads its own layer $l-1$ plus a
-learned projection of every earlier column's layer $l-1$ (progressive-network laterals). Earlier columns
-are frozen, so adding a column never changes an earlier slice's output.
+**SliceNet grows by columns.** Each build round adds one column holding up to $B$ (`--slices-per-round`)
+new slices. A column is a small conv stack with one head per slice. Its layer $l$ reads its own layer
+$l-1$ plus a learned projection of every earlier column's layer $l-1$ (progressive-network laterals).
+Earlier columns are frozen, so adding a column never changes an earlier slice's output.
 
 **SelectorNet is rebuilt every round**: its output grows with the bank, and a fresh net keeps it plastic.
 
 ## How the encoder is built
 
-`train_encoder.py` grows the bank round by round. Each round adds the $B$ slices that most improve the
-encoder, then retrains the selector to use them. Throughout, a table holds every slice's held-out output
+`train_encoder.py` grows the bank round by round. Each round adds up to $B$ slices that improve the
+encoder most, then retrains the selector to use them. Throughout, a table holds every slice's held-out output
 on every training image, so any code's posterior is a lookup away.
 
 1. **Codes.** Examine a sample of the encoder's codes: $C$ training images with an out-of-fold code each,
@@ -206,21 +206,23 @@ on every training image, so any code's posterior is a lookup away.
    scored. In round 1 the bank is empty, $T = 0$, and the only code is the empty one.
 2. **Bar.** At every examined code, the bank's best realized gain: the highest $\hat G$ of a slice not yet
    used on that code, with its held-out outputs.
-3. **Partitions.** $B$ partitions, picked one after another. Each maximizes the bank's improvement: over
-   the examined codes at depths $0, \dots, T$, weighted by count and depth, how far its implied gain beats
-   the bar. Depth $T$ counts because a new slice can follow the end of a code. Each pick raises the bar
-   for the next.
+3. **Partitions.** $B$ partitions, each picked on its own against the same bar, so their order doesn't
+   matter. Each maximizes the bank's improvement: over the examined codes at depths $0, \dots, T$, weighted
+   by count and depth, how far its implied gain beats the bar. Depth $T$ counts because a new slice can
+   follow the end of a code. Different k-means++ starts make the partitions differ.
    - Within one code, a partition's implied loss is k-means' objective with $V$ clusters, with images
      weighted by the code's posterior, up to the different-pairs correction. So the search starts as
      k-means++ does: $V$ seed images sampled one at a time, each with probability proportional to its
      squared distance to the nearest seed so far, and every image labeled by its nearest seed.
    - Then Hartigan's method (`--restarts` k-means++ starts, keeping the best) with batched moves that are
      kept only if the improvement rises. An image carries weight in several examined codes, so a move's
-     effect sums over them, exactly, from per-(code, class) sums.
+     effect sums over them, exactly, from per-(code, class) sums. It stops when no move helps, or when the
+     last 5 rounds raised the improvement by less than `--hartigan-tol` of it per round.
    - The bar is realized, from trained slices. The partition's gains are implied, which is optimistic,
      since a trained slice won't reproduce the classes exactly.
    - Images with no weight in any code where the partition beats the bar get no label. Their class
-     doesn't matter.
+     doesn't matter. A partition that beats the bar nowhere labels no image and is dropped, since its slice
+     would learn nothing; if every partition is dropped, the build stops.
 4. **Column.** Train `--folds` + 1 copies of the new column by cross-entropy against the partitions'
    classes, skipping unlabeled images: fold copy $f$ on the training images outside fold $f$, a final
    copy on all. All copies share the epoch count, chosen by the pooled held-out cross-entropy. Slices see
@@ -275,17 +277,16 @@ Two versions follow: a concise one in equations, and a step-by-step one in pseud
 **1. Partitions**, for $b = 1, \dots, B$:
 
 ```math
-\lambda_b \;=\; \operatorname{Hartigan}_\lambda\, J_b(\lambda),
+\lambda_b \;=\; \operatorname{Hartigan}_\lambda\, J(\lambda),
 \qquad
-J_b(\lambda) \;=\; \sum_{u=0}^{T} \omega_u\, \frac{1}{C} \sum_{z \in Z_u} n_z\, \big[\, \hat G(z, \lambda) - G^*_{b,z} \big]_+ ,
+J(\lambda) \;=\; \sum_{u=0}^{T} \omega_u\, \frac{1}{C} \sum_{z \in Z_u} n_z\, \big[\, \hat G(z, \lambda) - G^*_z \big]_+ ,
+\qquad
+G^*_z \;=\; \max\Big( 0,\; \max_{h \notin \mathrm{used}(z)}\, G_{zh} \Big),
 ```
 
-```math
-G^*_{b,z} \;=\; \max\Big( 0,\; \max_{h \notin \mathrm{used}(z)}\, G_{zh},\; \max_{b' < b}\, \hat G(z, \lambda_{b'}) \Big),
-```
-
-with Hartigan started from a k-means++ labeling. Image $j$ is labeled by $\lambda_b$ ($\nu_{jb} = 1$) when
-it has weight in some examined code $z$ with $\hat G(z, \lambda_b) > G^*_{b,z}$.
+with each $\lambda_b$ from its own k-means++ starts. Image $j$ is labeled by $\lambda_b$ ($\nu_{jb} = 1$) when it
+has weight in some examined code $z$ with $\hat G(z, \lambda_b) > G^*_z$. Partitions that label no image are
+dropped, and $B$ below counts the ones kept.
 
 **2. Column**: slices $S+1, \dots, S+B$, for every copy $m$:
 
@@ -397,7 +398,8 @@ calls them.
 \quad \textbf{return } \lambda \text{ with } \lambda_j = \arg\min_c \lVert x_j - y_c \rVert^2 \\[12pt]
 \textbf{function } \mathrm{hartigan}(\lambda, G^*): \\
 \quad \text{// in: } \lambda \text{, a starting class per image (shape } N \text{); } G^* \text{, the bar at every examined code (shape } |Z| \text{)} \\
-\quad \text{// out: } \lambda \text{, moved image by image until no single move raises } J = \mathrm{improvement}\big(\mathrm{impliedGain}(\cdot, \lambda), G^*\big) \text{ (shape } N \text{)} \\
+\quad \text{// out: } \lambda \text{, moved image by image until no single move raises } J = \mathrm{improvement}\big(\mathrm{impliedGain}(\cdot, \lambda), G^*\big) \\
+\quad \text{// (shape } N \text{), or until } J \text{ stalls} \\
 \quad \textbf{repeat at most } \texttt{hartigan-rounds} \text{ times}: \\
 \qquad \Delta_{jc} \leftarrow \text{the exact change in } J \text{ from moving image } j \text{ to class } c \text{ (shape } N \times V \text{), summed over} \\
 \qquad\qquad \text{the examined codes where } j \text{ has weight, from per-(code, class) sums of } w,\ w\, x,\ w \lVert x \rVert^2,\ w^2 \\
@@ -405,19 +407,19 @@ calls them.
 \qquad \textbf{if } \mathcal M = \emptyset: \textbf{ break} \\
 \qquad n \leftarrow |\mathcal M| \\
 \qquad \textbf{loop}: \text{ apply the first } n \text{ moves; } \textbf{if } J \text{ rose}: \textbf{ break}; \textbf{ else } \text{undo them, } n \leftarrow \lceil n / 2 \rceil \\
+\qquad \textbf{if } \text{the last 5 rounds raised } J \text{ by less than } 5 \cdot \texttt{hartigan-tol} \cdot J: \textbf{ break} \\
 \quad \textbf{return } \lambda \\[12pt]
 \textbf{function } \mathrm{pickPartitions}(G^*): \\
 \quad \text{// in: } G^* \text{, the bank's bar at every examined code (shape } |Z| \text{)} \\
 \quad \text{// out: } \lambda_1, \dots, \lambda_B \text{, the answer every image should give to each new question (shape } B \times N \text{);} \\
-\quad \text{// } \nu \text{, whether an image's answer to each new question matters (shape } N \times B \text{, 0 or 1);} \\
-\quad \text{// and } G^*_1, \dots, G^*_B \text{, the bar each partition was picked against (shape } B \times |Z| \text{)} \\
-\quad \textbf{for } b = 1, \dots, B: \\
-\qquad G^*_b \leftarrow G^* \\
+\quad \text{// and } \nu \text{, whether an image's answer to each new question matters (shape } N \times B \text{, 0 or 1);} \\
+\quad \text{// partitions that label no image are dropped, so } B \text{ may shrink} \\
+\quad \textbf{for } b = 1, \dots, B: \qquad \text{// each on its own, against the same bar} \\
 \qquad \lambda_b \leftarrow \text{the } \mathrm{hartigan}(\mathrm{kmeansppStart}(), G^*) \text{ with the highest } \mathrm{improvement}\big(\mathrm{impliedGain}(\cdot, \lambda), G^*\big) \text{,} \\
 \qquad\qquad \text{over } \texttt{restarts} \text{ starts} \\
 \qquad \nu_{jb} \leftarrow 1 \text{ if } j \text{ has weight in some examined } z \text{ with } \mathrm{impliedGain}(z, \lambda_b) > G^*_z \text{, else } 0 \\
-\qquad G^*_z \leftarrow \max\big(G^*_z,\; \mathrm{impliedGain}(z, \lambda_b)\big) \text{ for every examined } z \qquad \text{// raise the bar for the next partition} \\
-\quad \textbf{return } (\lambda_1, \dots, \lambda_B),\ \nu,\ (G^*_1, \dots, G^*_B)
+\quad \text{drop every } b \text{ with no } \nu_{jb} = 1 \\
+\quad \textbf{return } (\lambda_1, \dots, \lambda_B),\ \nu
 \end{array}
 ```
 
@@ -488,10 +490,10 @@ S \leftarrow 0; \quad T \leftarrow 0 \qquad \text{// no slices yet: every code i
 \textbf{for } \text{round} = 1, 2, \dots, \texttt{rounds}: \\
 \quad \mathrm{sampleCodes}(T) \qquad \text{// A. a sample of the encoder's codes, to depth } T \\
 \quad G^* \leftarrow \mathrm{bankBest}() \qquad \text{// and how well the bank already does at each} \\
-\quad (\lambda, \nu, G^*_{1:B}) \leftarrow \mathrm{pickPartitions}(G^*) \qquad \text{// B. } B \text{ new questions, each where the bank is weakest} \\
+\quad (\lambda, \nu) \leftarrow \mathrm{pickPartitions}(G^*) \qquad \text{// B. } B \text{ new questions, each where the bank is weakest} \\
 \quad \mathrm{trainColumn}(\lambda, \nu) \qquad \text{// C. a new column learns to answer them} \\
 \quad \textbf{for } b = 1, \dots, B: \qquad \text{// how much of each promised improvement the trained slice delivers} \\
-\qquad \text{log } \mathrm{improvement}\big(\mathrm{impliedGain}(\cdot, \lambda_b), G^*_b\big) \text{ and } \mathrm{improvement}\big(\mathrm{gain}(\cdot, R_{\cdot, S-B+b, \cdot}), G^*_b\big) \\
+\qquad \text{log } \mathrm{improvement}\big(\mathrm{impliedGain}(\cdot, \lambda_b), G^*\big) \text{ and } \mathrm{improvement}\big(\mathrm{gain}(\cdot, R_{\cdot, S-B+b, \cdot}), G^*\big) \\
 \quad (\sigma^\star, T) \leftarrow \mathrm{fitSelector}() \qquad \text{// D. the knight learns when to ask them} \\
 \quad (\hat L_{1:T}, \hat L) \leftarrow \mathrm{evaluate}() \qquad \text{// E. score on held-out images} \\
 \quad \text{log } T,\ \hat L_1, \dots, \hat L_T,\ \hat L \text{, and how many slices } \eta \text{ picks at some examined code} \\

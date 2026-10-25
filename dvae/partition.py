@@ -13,6 +13,7 @@ Pass centered pixels for precision.
 import torch
 
 CHUNK_ELEMENTS = 2**25  # floats in the largest temporary per vectorized chunk
+BIG_CODE = 256  # codes with at least this many posterior entries score moves by matmul instead of a gather
 
 
 def spread(W, MM, Q, W2, P):
@@ -184,6 +185,12 @@ class PartitionSearch:
         self.e_code, self.e_img, self.e_w = remap[codes.e_code[keep]], codes.e_img[keep], codes.e_w[keep]
         self.Wz, self.Dz, self.a = codes.W[self.code_ids], codes.D[self.code_ids], a[self.code_ids]
         self.Z = len(self.code_ids)
+        # entries stay sorted by code: big codes get one matmul each when scoring moves, small ones a gather
+        counts = torch.bincount(self.e_code, minlength=self.Z)
+        starts = torch.cumsum(counts, 0) - counts
+        big = counts >= BIG_CODE
+        self.big_blocks = list(zip(big.nonzero().squeeze(1).tolist(), starts[big].tolist(), (starts + counts)[big].tolist()))
+        self.small_rows = (~big[self.e_code]).nonzero().squeeze(1)
 
     def stats(self, labels):
         """Per (code, class): W, |M|^2, Q, W2, support, and M itself [Z, V, P]."""
@@ -211,16 +218,27 @@ class PartitionSearch:
     def objective(self, G, bar):
         return float((self.a * (G - bar).clamp_min(0)).sum())
 
+    def dots(self, M):
+        """Each entry's image . every class sum in its code -> [E, V]."""
+        out = torch.empty(len(self.e_code), self.V, device=self.x.device)
+        for z, start, stop in self.big_blocks:
+            out[start:stop] = self.x[self.e_img[start:stop]] @ M[z].T
+        rows = max(1, CHUNK_ELEMENTS // (self.V * self.P))
+        for i in range(0, len(self.small_rows), rows):
+            r = self.small_rows[i:i + rows]
+            out[r] = torch.einsum("ep,evp->ev", self.x[self.e_img[r]], M[self.e_code[r]])
+        return out
+
     def deltas(self, labels, st, G, bar):
         """Exact change in J from moving each image to each class -> [N, V] (0 for its own class)."""
         W, MM, Q, W2, n, M = st
-        V, P, N = self.V, self.P, len(self.x)
+        V, N = self.V, len(self.x)
         out = torch.zeros(N, V, device=self.x.device)
-        rows = max(1, CHUNK_ELEMENTS // (V * P))
+        all_dots = self.dots(M)
+        rows = max(1, CHUNK_ELEMENTS // (8 * V))
         for i in range(0, len(self.e_code), rows):
             z, j, w = self.e_code[i:i + rows], self.e_img[i:i + rows], self.e_w[i:i + rows]
-            xj, sq = self.x[j], self.sq[j]
-            dots = torch.einsum("ep,evp->ev", xj, M[z])  # each image . every class sum in the code
+            sq, dots = self.sq[j], all_dots[i:i + rows]
             a = labels[j][:, None]
             Dz = self.Dz[z][:, None]
             old = W[z] * self.cell_spread(W[z], MM[z], Q[z], W2[z], n[z], Dz)  # [e, V]
@@ -240,11 +258,13 @@ class PartitionSearch:
             out.index_add_(0, j, gain)
         return out
 
-    def run(self, labels, bar, max_rounds):
-        """Hartigan from the given labels [N] against the bar [Z] -> (labels, J, rounds)."""
+    def run(self, labels, bar, max_rounds, tol=0.0, window=5, progress=None):
+        """Hartigan from the given labels [N] against the bar [Z] -> (labels, J, rounds). Stops when no move
+        helps, after max_rounds, or when the last `window` rounds together raised J by less than
+        window * tol * J. progress(round, J) is called after every round."""
         st = self.stats(labels)
         J = self.objective(self.gains(st), bar)
-        rounds = 0
+        history, rounds = [J], 0
         for rounds in range(1, max_rounds + 1):
             delta = self.deltas(labels, st, self.gains(st), bar)
             delta.scatter_(1, labels[:, None], -torch.inf)
@@ -264,5 +284,10 @@ class PartitionSearch:
                     break
                 k //= 2
             if k == 0:
+                break
+            if progress is not None:
+                progress(rounds, J)
+            history.append(J)
+            if len(history) > window and J - history[-window - 1] < window * tol * abs(J):
                 break
         return labels, J, rounds

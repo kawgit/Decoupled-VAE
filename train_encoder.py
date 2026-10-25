@@ -5,8 +5,8 @@ that never trained on it), so any code's posterior over the training images is a
 Each round:
   A. Codes. Sample C training images and an out-of-fold code for each, to depth T. At every distinct prefix,
      the bar: the bank's best realized gain among the slices not yet used along it.
-  B. Partitions. Pick B partitions one after another, each maximizing the bank's improvement J over the
-     examined prefixes: Hartigan's method from k-means++ starts (dvae/partition.py). Each pick raises the bar.
+  B. Partitions. Pick B partitions, each independently maximizing the bank's improvement J over the examined
+     prefixes against the same bar: Hartigan's method from k-means++ starts (dvae/partition.py).
   C. Column. Train a new SliceNet column on the partitions (F+1 fold copies, lockstep epochs, early stopping
      on held-out cross-entropy) and add its held-out outputs to the table.
   D. Selector. Fit a fresh selector depth by depth on a fresh sample of C codes, early-stopped on the held-out
@@ -131,12 +131,14 @@ def main():
     p.add_argument("--folds", type=int, default=4)
     p.add_argument("--rounds", type=int, default=50)
     p.add_argument("--round-patience", type=int, default=3, help="stop after this many rounds without a better val loss")
-    p.add_argument("--slices-per-round", type=int, default=8, help="B: new slices (one column) per round")
-    p.add_argument("--codes", type=int, default=2048, help="C: sampled training codes examined per step")
+    p.add_argument("--slices-per-round", type=int, default=8, help="B: new partitions (one column) per round")
+    p.add_argument("--codes", type=int, default=512, help="C: sampled training codes examined per step")
     p.add_argument("--weight-cutoff", type=float, default=1e-4, help="posterior weights below this are dropped")
     p.add_argument("--k-decay", type=float, default=0.8, help="rho: each further token is read with this probability")
-    p.add_argument("--restarts", type=int, default=4, help="k-means++ starts per partition")
+    p.add_argument("--restarts", type=int, default=2, help="k-means++ starts per partition")
     p.add_argument("--hartigan-rounds", type=int, default=100, help="cap on batched Hartigan move rounds per start")
+    p.add_argument("--hartigan-tol", type=float, default=1e-4,
+                   help="stop Hartigan when J rises by less than this fraction per round, over the last 5 rounds")
     p.add_argument("--column-width", type=int, default=32)
     p.add_argument("--column-hidden", type=int, default=64)
     p.add_argument("--batch-size", type=int, default=256)
@@ -219,19 +221,21 @@ def main():
                 summary["text"] = (f"{codes.n_codes} distinct prefixes from {C} samples, "
                                    f"bank's weighted gain {float((a * bar).sum()):.5f}")
 
-            # B. B partitions, each where the bank (and this round's earlier picks) gain least
+            # B. B partitions, each on its own against the bank's bar, where the bank gains least
             summary = {}
             with step("B partitions", summary), torch.no_grad():
                 search = PartitionSearch(codes, a, V)
-                bar_now = bar[search.code_ids]
+                bar_active = bar[search.code_ids]
                 labels = torch.empty(B, N, dtype=torch.long, device=device)
                 nu = torch.zeros(N, B, dtype=torch.bool, device=device)
-                bars, implied, rounds = [], [], []
+                implied, rounds = [], []
                 for b in range(B):
                     best: tuple[float, torch.Tensor | None] = (-math.inf, None)
                     for s in range(args.restarts):
-                        progress(f"B partition {b + 1}/{B}, start {s + 1}/{args.restarts}")
-                        lab, J, r = search.run(kmeanspp(Xc, V, gen), bar_now, args.hartigan_rounds)
+                        where = f"B partition {b + 1}/{B}, start {s + 1}/{args.restarts}"
+                        lab, J, r = search.run(kmeanspp(Xc, V, gen), bar_active, args.hartigan_rounds, args.hartigan_tol,
+                                               progress=lambda r, J, where=where:
+                                               progress(f"{where}, Hartigan round {r}: J {J:.5f}"))
                         rounds.append(r)
                         if J > best[0]:
                             best = (J, lab)
@@ -239,24 +243,30 @@ def main():
                     assert lab is not None
                     labels[b] = lab
                     gains = search.gains(search.stats(lab))
-                    beats = gains[search.e_code] > bar_now[search.e_code]
+                    beats = gains[search.e_code] > bar_active[search.e_code]
                     nu[search.e_img[beats], b] = True
-                    bars.append(bar_now)
                     implied.append(J)
-                    bar_now = torch.maximum(bar_now, gains)
+                # a partition that beats the bar nowhere labels no image; its slice would never learn anything
+                keep = nu.any(0).nonzero().squeeze(1)
+                labels, nu, implied = labels[keep], nu[:, keep], [implied[b] for b in keep.tolist()]
                 summary["text"] = (f"implied J {fmt(implied, 5)}, {sum(rounds) / len(rounds):.1f} Hartigan rounds "
-                                   f"per start, {int(nu.any(1).sum())} images labeled")
+                                   f"per start, {int(nu.any(1).sum())} images labeled"
+                                   + (f", {B - len(keep)} dropped (beat the bar nowhere)" if len(keep) < B else ""))
             entry["implied_J"] = implied
+            if len(keep) == 0:
+                log("stopping: no partition beats the bank anywhere")
+                break
 
             # C. a new column learns the partitions; earlier columns stay frozen
             summary = {}
             with step("C column", summary):
-                columns = [c.add_column(B, device) for c in copies]
+                Bk = len(keep)
+                columns = [c.add_column(Bk, device) for c in copies]
                 labeled = nu.any(1).nonzero().squeeze(1)
                 weights = nu.float()
 
                 def ce(m, idx):
-                    logits = copies[m](X[idx])[:, S:]  # [n, B, V]
+                    logits = copies[m](X[idx])[:, S:]  # [n, Bk, V]
                     loss = F.cross_entropy(logits.reshape(-1, V), labels[:, idx].T.reshape(-1), reduction="none")
                     w = weights[idx].reshape(-1)
                     return (loss * w).sum() / w.sum().clamp_min(1)
@@ -282,10 +292,11 @@ def main():
                     c.requires_grad_(False)
                 table, val_table = slice_table(copies, fold_of, X, Xv)
                 codes.table = table
-                new = torch.arange(S, S + B, device=device)
-                realized_gains = codes.slice_gains(search.code_ids, new, lambda k, n: progress(f"C realized gains: prefix {k}/{n}"))
-                realized = [search.objective(realized_gains[:, b], bars[b]) for b in range(B)]
-                S += B
+                new = torch.arange(S, S + Bk, device=device)
+                realized_gains = codes.slice_gains(search.code_ids, new,
+                                                   lambda k, n: progress(f"C realized gains: prefix {k}/{n}"))
+                realized = [search.objective(realized_gains[:, b], bar_active) for b in range(Bk)]
+                S += Bk
                 summary["text"] = f"best epoch {epoch}, held-out cross-entropy {-score:.4f}, realized J {fmt(realized, 5)}"
             entry.update(column_epochs=epoch, held_out_cross_entropy=-score, realized_J=realized)
 
