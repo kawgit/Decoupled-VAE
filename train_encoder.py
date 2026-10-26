@@ -360,6 +360,9 @@ def main():
             with step("C column", summary, progress):
                 columns = [c.add_column(Bk, device) for c in copies]
                 labeled = (weights.sum(1) > 0).nonzero().squeeze(1)
+                # each copy's training rows and each fold's held-out rows, fixed for the round
+                train_rows = [labeled[fold_of[labeled] != m] for m in range(Fo)] + [labeled]
+                held_rows = [labeled[fold_of[labeled] == f] for f in range(Fo)]
 
                 def ce(m, idx):
                     logits = copies[m](X[idx])[:, S:]  # [n, Bk, V]
@@ -368,17 +371,17 @@ def main():
                     return (loss * w).sum() / w.sum().clamp_min(1e-12)
 
                 def ce_batches(m):
-                    rows = labeled if m == Fo else labeled[fold_of[labeled] != m]
+                    rows = train_rows[m]
                     order = rows[torch.randperm(len(rows), generator=gen).to(device)]
                     return order.split(args.batch_size)
 
                 def held_out_ce():
+                    parts = [torch.stack([ce(f, idx), weights[idx].sum()])
+                             for f in range(Fo) for idx in held_rows[f].split(FORWARD_CHUNK)]
                     total, count = 0.0, 0.0
-                    for f in range(Fo):
-                        rows = labeled[fold_of[labeled] == f]
-                        for idx in rows.split(FORWARD_CHUNK):
-                            total += float(ce(f, idx)) * float(weights[idx].sum())
-                            count += float(weights[idx].sum())
+                    for loss, w in torch.stack(parts).tolist() if parts else []:  # one sync per pass
+                        total += loss * w
+                        count += w
                     return -total / max(count, 1e-12)
 
                 score, epoch = fit_copies(columns, ce_batches, ce, held_out_ce, args.epochs, args.patience, args.lr,
@@ -416,8 +419,11 @@ def main():
                 # per depth: every sample's gain per slice [C, S], used slices included (asking one again gains
                 # about nothing, and the selector must know that if its choices above ever change)
                 targets: list[torch.Tensor] = []
+                scaled: list[torch.Tensor] = []  # per depth: targets / scale, what the selector regresses on
                 masks: list[torch.Tensor] = []  # per depth: True for slices already used [C, S], for picking only
                 free: list[torch.Tensor] = []  # per depth: True for samples whose prefix has no committed slice [C]
+                pick_rows: list[list[torch.Tensor]] = []  # per depth, per fold: the free samples [n]
+                fit_rows = [torch.arange(C)[sample_fold.cpu() != m] for m in range(Fo)] + [torch.arange(C)]
                 drift: list[float] = []
                 scale, choice = 1.0, 0.0
                 for u in range(S + 1):
@@ -435,33 +441,34 @@ def main():
                         masks.append(codes.used_mask(codes.ids[:, u], S))
                         free.append(torch.tensor([tuple(r) not in commits for r in codes.tokens.tolist()],
                                                  dtype=torch.bool, device=device))
+                        pick_rows.append([((sample_fold == f) & free[u]).nonzero().squeeze(1) for f in range(Fo)])
                     if u == 0:
                         scale = float(targets[0].abs().mean()) or 1.0
+                    scaled.append(targets[u] / scale)
                     depths = list(range(u + 1))
 
                     def sel_batches(m, depths=depths):
-                        out = []
-                        for d in depths:
-                            rows = torch.arange(C, device=device)
-                            rows = rows if m == Fo else rows[sample_fold != m]
-                            order = rows[torch.randperm(len(rows), generator=gen).to(device)]
-                            out += [(d, idx) for idx in order.split(args.selector_batch_size)]
+                        # orders drawn on the CPU and sent over in one copy; one batch list per depth
+                        rows = fit_rows[m]
+                        moved = torch.cat([rows[torch.randperm(len(rows), generator=gen)] for _ in depths]).to(device)
+                        out = [(d, idx) for i, d in enumerate(depths)
+                               for idx in moved[i * len(rows):(i + 1) * len(rows)].split(args.selector_batch_size)]
                         return [out[i] for i in torch.randperm(len(out), generator=gen).tolist()]
 
                     def mse(m, batch):
                         d, idx = batch
-                        return (sels[m](codes.tokens[idx, :d]) - targets[d][idx] / scale).pow(2).mean()
+                        return (sels[m](codes.tokens[idx, :d]) - scaled[d][idx]).pow(2).mean()
 
                     def choices(depths=depths):
-                        total = 0.0
+                        sums = []
                         for d in depths:
                             got = torch.zeros(C, device=device)
-                            for f in range(Fo):
-                                rows = ((sample_fold == f) & free[d]).nonzero().squeeze(1)
+                            for f, rows in enumerate(pick_rows[d]):
                                 pick = sels[f](codes.tokens[rows, :d]).masked_fill(masks[d][rows], -torch.inf).argmax(1)
                                 got[rows] = targets[d][rows, pick]
-                            total += rho**d * float(got.sum()) / C  # committed prefixes add nothing to choose
-                        return total
+                            sums.append(got.sum())
+                        # committed prefixes add nothing to choose; one sync per evaluation
+                        return sum(rho**d * s / C for d, s in zip(depths, torch.stack(sums).tolist()))
 
                     choice, _ = fit_copies(sels, sel_batches, mse, choices, args.selector_epochs, args.selector_patience,
                                            args.selector_lr, 0.0, progress, "D fit",
