@@ -296,6 +296,10 @@ def main():
     p.add_argument("--resume", action="store_true", help="continue from --state with the next position")
     args = p.parse_args()
 
+    # The build state is saved before save_checkpoint(), so prepare both destinations up front.
+    for path in (args.out, args.state):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
     torch.manual_seed(args.seed)
     device = get_device(args.device)
     with timed("loading MNIST"):

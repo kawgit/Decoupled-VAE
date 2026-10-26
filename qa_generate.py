@@ -6,6 +6,7 @@ import math
 import torch
 
 from dvae.common import add_common_args, add_mode_args, check_same_codes, get_device, load_checkpoint
+from dvae.experiments import save_qa_metadata
 from dvae.viz import code_str, save_grid
 
 
@@ -31,6 +32,7 @@ def main():
         codes = prior.sample(args.n, mode=args.prior_mode, top_p=args.prior_top_p)
         images = decoder.render(decoder(codes), args.render)
     save_grid(images, args.out, nrow=math.ceil(math.sqrt(args.n)))
+    save_qa_metadata(args.out + ".json", args, codes, prior_config=prior.config, decoder_config=decoder.config)
     print(f"saved {args.n} samples to {args.out}")
     print("codes (row-major):")
     for i, c in enumerate(codes):

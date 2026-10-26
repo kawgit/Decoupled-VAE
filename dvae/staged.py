@@ -69,8 +69,11 @@ class StageNet(nn.Module):
 class SelectorNet(nn.Module):
     """Predicts, from the prefix z alone, an image's marginal decompression loss under each of n_heads partitions.
 
-    The encoder uses the partition with the lowest prediction, so every image with the same prefix uses the
-    same partition and the new token means the same thing for all of them.
+    The prefix is encoded with a shared recurrent block that reads the token sequence left-to-right and then
+    predicts one scalar loss per candidate partition. This is much easier to train for longer prefixes than a
+    flat MLP over the entire prefix vector, because the same recurrent weights are reused across all prefix
+    lengths and positions. The encoder uses the partition with the lowest prediction, so every image with the
+    same prefix uses the same partition and the new token means the same thing for all of them.
     """
 
     def __init__(self, vocab_size, depth, n_heads, width=128):
@@ -79,16 +82,17 @@ class SelectorNet(nn.Module):
         slots = max(depth, 1)  # depth 0: a constant input, so the prediction is one learned vector
         self.emb = nn.Embedding(vocab_size, width)
         self.pos = nn.Parameter(torch.randn(slots, width) * 0.02)
-        self.mlp = nn.Sequential(nn.Linear(slots * width, width), nn.GELU(), nn.Linear(width, width), nn.GELU())
+        self.rnn = nn.GRU(width, width, batch_first=True)
         self.out = nn.Linear(width, n_heads)
 
     def forward(self, prefix):
         """prefix [N, depth] -> predicted loss per partition [N, n_heads]."""
         if self.depth == 0:
-            e = self.pos.flatten().expand(prefix.shape[0], -1)
+            e = self.pos[:1].expand(prefix.shape[0], 1, -1)
         else:
-            e = (self.emb(prefix) + self.pos).flatten(1)
-        return self.out(self.mlp(e))
+            e = self.emb(prefix) + self.pos[: prefix.shape[1]]
+        _, h = self.rnn(e)
+        return self.out(h.squeeze(0))
 
     def choose(self, prefix):
         return self(prefix).argmin(-1)

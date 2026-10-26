@@ -3,12 +3,14 @@ rest, decode. For each k, saves a grid where each row is [original | m decompres
 """
 
 import argparse
+import math
 import os
 
 import torch
 
 from dvae.common import add_common_args, add_mode_args, check_same_codes, get_device, load_checkpoint
 from dvae.data import load_mnist, to_float
+from dvae.experiments import save_qa_metadata
 from dvae.viz import code_str, save_grid
 
 
@@ -54,14 +56,28 @@ def main():
     x = to_float(test[pick])
     with torch.no_grad():
         codes = encoder.sample(x, mode=args.encoder_mode, top_p=args.encoder_top_p)
+        completions = {}
+        metrics = {}
         for k in ks:
             prefix = codes[:, :k].repeat_interleave(args.m, 0)
             full = prior.sample(len(prefix), prefix=prefix, mode=args.prior_mode, top_p=args.prior_top_p)
+            completions[str(k)] = full.cpu().tolist()
             recon = decoder.render(decoder(full), args.render).view(args.n, args.m, 1, 28, 28)
+            per_image_mse = (recon - x[:, None]).square().mean(dim=(1, 2, 3, 4))
+            metrics[str(k)] = {
+                "raw_prefix_bits": k * math.log2(encoder.config["vocab_size"]),
+                "mean_pixel_mse": per_image_mse.mean().item(),
+                "per_image_pixel_mse": per_image_mse.cpu().tolist(),
+            }
             grid = torch.cat([x.unsqueeze(1), recon], 1).flatten(0, 1)
             path = os.path.join(args.out_dir, f"k{k:02d}.png")
             save_grid(grid, path, nrow=args.m + 1)
             print(f"k={k}: saved {path}")
+    os.makedirs(args.out_dir, exist_ok=True)
+    save_qa_metadata(os.path.join(args.out_dir, "metadata.json"), args, codes,
+                     test_indices=pick.cpu().tolist(), prefix_lengths=ks, completions=completions,
+                     metrics=metrics,
+                     encoder_config=encoder.config, prior_config=prior.config, decoder_config=decoder.config)
     print("encoder codes (one per row):")
     for i, c in enumerate(codes):
         print(f"  {i:3d} {code_str(c)}")

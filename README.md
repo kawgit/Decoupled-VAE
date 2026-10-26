@@ -344,6 +344,77 @@ python analyze_encoder.py --encoder checkpoints/encoder.pt # -> results/usage_en
 - **Latent usage:** `analyze_encoder.py` reports, for each prefix length k, how many bits carry
   information about the image and about the digit label, and how many codes are used.
 
+## Keeping architecture experiments
+
+Before retraining or replacing results, archive the current files:
+
+```bash
+python record_experiment.py --name current-results-v1 \
+  --notes "Describe the architecture and training settings here; note any uncertainty about older images or training source."
+```
+
+Use a name that describes the checkpoints, not just the code currently open in the editor. The command
+copies the three model checkpoints, `outputs/`, and `results/` when present. It also records checkpoint
+hashes, configurations, training arguments, histories, tensor shapes, environment versions, Git commit,
+uncommitted changes, and a source snapshot in `experiments/<name>/`. It refuses to overwrite an existing
+experiment. Missing artifacts are listed. Archives are local and ignored by Git; copy them to backed-up
+storage if you need durable storage. Training/latest checkpoints are not included by default. To retain
+encoder resume state, add `--include-build-state checkpoints/encoder_build.pt`.
+
+Source and environment are captured at archive time. They do not establish which source trained an old
+checkpoint. In particular, a checkpoint trained with an MLP selector cannot be loaded directly into a
+GRU selector. Restore the matching source in a separate checkout to evaluate the old architecture.
+
+For a new experiment, use separate training paths from the start:
+
+```bash
+python train_encoder.py --out checkpoints/gru/encoder.pt --state checkpoints/gru/encoder_build.pt
+python train_decoder.py --encoder checkpoints/gru/encoder.pt --out checkpoints/gru/decoder_gray.pt
+python train_prior.py --encoder checkpoints/gru/encoder.pt --out checkpoints/gru/prior.pt
+
+python qa_generate.py --prior checkpoints/gru/prior.pt --decoder checkpoints/gru/decoder_gray.pt \
+  --seed 0 --render mean -n 64 --out outputs/gru/generate.png
+python qa_compress.py --encoder checkpoints/gru/encoder.pt --prior checkpoints/gru/prior.pt \
+  --decoder checkpoints/gru/decoder_gray.pt --seed 0 --encoder-mode greedy --prior-mode actual \
+  --render mean -n 16 -k 0 1 2 4 10 -m 8 --out-dir outputs/gru/compress
+
+python benchmark.py --encoder checkpoints/gru/encoder.pt --prior checkpoints/gru/prior.pt \
+  --decoder checkpoints/gru/decoder_gray.pt --out-dir results/gru
+python analyze_encoder.py --encoder checkpoints/gru/encoder.pt --out results/gru/usage.json
+
+python record_experiment.py --name gru-selector-v1 --notes "Replaced selector MLP with GRU; other settings unchanged." \
+  --encoder checkpoints/gru/encoder.pt --decoder checkpoints/gru/decoder_gray.pt \
+  --prior checkpoints/gru/prior.pt --outputs outputs/gru --results results/gru
+```
+
+Use prefix lengths valid for the trained encoder. Generation now writes `<image>.json`; compression
+writes `metadata.json` with evaluation settings, checkpoint hashes, input test indices, encoded tokens,
+and completed codes. The original PNG paths are unchanged. Old PNGs have no recoverable evaluation
+settings unless you recorded them elsewhere.
+
+Compression metadata also includes mean pixel MSE at each prefix length, averaged over images,
+completions and pixels, plus per-image values and raw prefix bits. Lower is better for pixel fidelity;
+it is not a digit-recognition or generation-quality score. Keep rendering/sampling settings and test
+indices fixed when comparing it. This metric does not enumerate codes, so it works with larger spaces
+that the exact benchmark cannot handle.
+
+For fair comparisons, keep the dataset, training budget, training seed, decoder likelihood, evaluation
+seed, image count, prefix lengths, completion count, render mode, and token sampling modes fixed. The
+same compression seed selects the same test images; identical random outcomes across architectures or
+devices are not guaranteed. When vocabulary sizes differ, compare at matched `k * log2(V)` raw bits,
+not just matched token counts. Repeat promising experiments with several training seeds.
+
+Keep these results for each experiment:
+
+- **Generation and compression grids:** visual quality, diversity, digit identity and retained detail.
+- **Benchmark JSON:** NLL and negative ELBO (lower is better), plus distortion and rate. Compare the
+  same likelihood, test set/subset and encoder mode. Rate alone is not an overall quality score.
+- **Encoder usage JSON:** image/label information and used codes at each prefix length. More used
+  codes alone does not establish better reconstruction.
+- **Training histories:** validation decompression loss per position, decoder/prior validation loss,
+  training time, configurations and seeds. Use validation results for selecting changes and reserve
+  test-set scores for final comparisons. Exact benchmarks require a small enough code space.
+
 ## Layout
 
 ```
