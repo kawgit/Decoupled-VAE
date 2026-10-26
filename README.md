@@ -529,9 +529,9 @@ The device is picked automatically (cuda → mps → cpu); override it with `--d
 
 ```bash
 python train_encoder.py                                  # -> checkpoints/encoder.pt (+ encoder_build.pt)
-python train_decoder.py --k-max 8                        # -> checkpoints/decoder_gray.pt   (8-bit pixels)
-python train_decoder.py --k-max 8 --likelihood binary    # -> checkpoints/decoder_binary.pt (binarized)
-python train_prior.py --k-max 8                          # -> checkpoints/prior.pt
+python train_decoder.py --k-max 32                       # -> checkpoints/decoder_gray.pt   (8-bit pixels)
+python train_decoder.py --k-max 32 --likelihood binary   # -> checkpoints/decoder_binary.pt (binarized)
+python train_prior.py --k-max 32                         # -> checkpoints/prior.pt
 python qa_generate.py -n 64                              # -> outputs/generate.png
 python qa_compress.py -n 16 -k 1 2 4 10 -m 8             # -> outputs/compress/k01.png ...
 python qa_compress_analytically.py -n 16 -m 8            # -> outputs/compress_analytically/k01.png ...

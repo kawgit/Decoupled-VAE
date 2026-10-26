@@ -20,7 +20,7 @@ def main():
     add_train_args(p, out=None, batch_size=128, lr=1e-3, epochs=30, patience=3)
     p.add_argument("--encoder", default="checkpoints/encoder.pt")
     p.add_argument("--likelihood", choices=["gray", "binary"], default="gray")
-    p.add_argument("--k-max", type=int, default=8, help="code length: how many of the encoder's tokens the decoder reads")
+    p.add_argument("--k-max", type=int, default=32, help="code length: how many of the encoder's tokens the decoder reads")
     add_mode_args(p, "encoder")
     p.add_argument("--d-model", type=int, default=128)
     p.add_argument("--n-layers", type=int, default=4)
