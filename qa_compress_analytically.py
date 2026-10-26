@@ -36,7 +36,7 @@ def main():
     add_common_args(p)
     p.add_argument("--encoder", default="checkpoints/encoder.pt")
     p.add_argument("-n", type=int, default=16, help="number of test images")
-    p.add_argument("--k-max", type=int, default=8, help="code length")
+    p.add_argument("--k-max", type=int, default=32, help="code length")
     p.add_argument("-k", type=int, nargs="+", default=None,
                    help="prefix lengths to keep (default: every k up to k_max if it's at most 10, else powers of 2 "
                         "and k_max)")
