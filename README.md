@@ -197,7 +197,9 @@ alone, rules that out. Once the bank is used up, after $S$ tokens, every further
 **The decoder and prior read the slices too.** At every position they're told which slice is asked
 there (a separate index once the bank is used up). That index follows from the code's earlier tokens
 through the commits and the selector, so the encoder supplies it: when they train, when the prior
-samples, and when the benchmark enumerates codes.
+samples, and when the benchmark enumerates codes. A token means nothing apart from the slice that drew
+it, so each (slice, token) pair has its own embedding, $V(S+1)$ in all. The decoder reads one pair per
+position. The prior reads the previous pair plus the slice it is asked to predict for.
 
 **SliceNet grows by columns.** Each build round adds one column holding up to $B$ (`--slices-per-round`)
 new slices. A column is a small conv stack with one head per slice. Its layer $l$ reads its own layer
