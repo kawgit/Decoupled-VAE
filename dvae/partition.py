@@ -1,11 +1,11 @@
-"""Code posteriors, gains and bank-improvement partitions for the blind knight encoder (see README).
+"""Code posteriors, gains and bank-improvement partitions for the question-answer encoder (see README).
 
 A code's posterior weighs every training image by its held-out chance of producing the code, a product of
-slice outputs; weights below a cutoff are dropped. A posterior's spread is the mean squared pixel distance
+answer distributions; weights below a cutoff are dropped. A posterior's spread is the mean squared pixel distance
 between two different images drawn from it, which needs only its total weight W, |weighted pixel sum|^2
-MM, weighted squared norm Q and sum of squared weights W2. A slice's gain at a code is how much splitting
-the code's posterior by the slice's token lowers the spread; a partition's implied gain is the gain of a
-slice that reproduces its classes exactly.
+MM, weighted squared norm Q and sum of squared weights W2. A question's gain at a code is how much splitting
+the code's posterior by the question's answer lowers the spread; a partition's implied gain is the gain of a
+question that reproduces its classes exactly.
 
 Pass centered pixels for precision.
 """
@@ -26,21 +26,21 @@ class CodeSet:
     """The distinct prefixes of C sampled codes, depth by depth, with each prefix's exact posterior.
 
     Codes are numbered globally, depth by depth, so each depth's codes are contiguous. Per code: depth,
-    count (samples with that prefix), used (the slices asked along it), and its posterior's total weight W,
+    count (samples with that prefix), used (the questions asked along it), and its posterior's total weight W,
     spread D and support size. Posterior entries (code, image, weight) stay sorted by code. Each sample's
-    prefix tokens, the slices that drew them and its code id at every depth are kept too.
+    prefix answers, the questions they answer and its code id at every depth are kept too.
     """
 
     def __init__(self, table, x, cutoff, images, n_px=None):
-        """table [N, S, V]: every training image's held-out slice outputs; x [N, P]: centered training images,
+        """table [N, S, V]: every training image's held-out answer distributions; x [N, P]: centered training images,
         possibly with extra features after the pixels; images [C]: the sampled training images; n_px: what
         squared distances are divided by (default P). Starts with the empty code, whose posterior is uniform."""
         self.table, self.x, self.cutoff, self.images = table, x, cutoff, images
         self.n_px = x.shape[1] if n_px is None else n_px
         self.sq = x.pow(2).sum(1)
         N, C, device = len(x), len(images), x.device
-        self.tokens = torch.zeros(C, 0, dtype=torch.long, device=device)
-        self.slices = self.tokens.clone()
+        self.answers = torch.zeros(C, 0, dtype=torch.long, device=device)
+        self.questions = self.answers.clone()
         self.ids = torch.zeros(C, 1, dtype=torch.long, device=device)
         self.depth = torch.zeros(1, dtype=torch.long, device=device)
         self.count = torch.full((1,), float(C), device=device)
@@ -56,7 +56,7 @@ class CodeSet:
 
     @property
     def max_depth(self):
-        return self.tokens.shape[1]
+        return self.answers.shape[1]
 
     def codes_at(self, u):
         """Global ids of the depth-u codes."""
@@ -80,17 +80,17 @@ class CodeSet:
         counts = torch.bincount(self.e_code, minlength=self.n_codes)
         return torch.cumsum(counts, 0) - counts, counts
 
-    def add_depth(self, slices, tokens):
-        """Extend every sample's code by one token [C], drawn by the given slice [C]."""
-        u, dev = self.max_depth + 1, tokens.device
+    def add_depth(self, questions, answers):
+        """Extend every sample's code by one answer [C], drawn by the given question [C]."""
+        u, dev = self.max_depth + 1, answers.device
         parent = self.ids[:, -1]
-        uniq, inv = torch.unique(parent * self.table.shape[2] + tokens, return_inverse=True)
+        uniq, inv = torch.unique(parent * self.table.shape[2] + answers, return_inverse=True)
         n_new, start = len(uniq), self.n_codes
         rep = torch.zeros(n_new, dtype=torch.long, device=dev).scatter_(0, inv, torch.arange(len(inv), device=dev))
-        p_code, h, tok = parent[rep], slices[rep], tokens[rep]
+        p_code, h, tok = parent[rep], questions[rep], answers[rep]
         self.used.append(torch.cat([self.used[u - 1][p_code - self.codes_at(u - 1)[0]], h[:, None]], 1))
 
-        # each child's entries: its parent's entries times the slice's probability of the child's token
+        # each child's entries: its parent's entries times the question's probability of the child's answer
         offsets, counts = self._offsets()
         per_child = counts[p_code]
         child = torch.repeat_interleave(torch.arange(n_new, device=dev), per_child)
@@ -107,8 +107,8 @@ class CodeSet:
         self.W, self.D, self.support = torch.cat([self.W, W]), torch.cat([self.D, D]), torch.cat([self.support, n])
         self.depth = torch.cat([self.depth, torch.full((n_new,), u, device=dev)])
         self.count = torch.cat([self.count, torch.bincount(inv, minlength=n_new).float()])
-        self.tokens = torch.cat([self.tokens, tokens[:, None]], 1)
-        self.slices = torch.cat([self.slices, slices[:, None]], 1)
+        self.answers = torch.cat([self.answers, answers[:, None]], 1)
+        self.questions = torch.cat([self.questions, questions[:, None]], 1)
         self.ids = torch.cat([self.ids, (inv + start)[:, None]], 1)
 
     def posterior(self, z):
@@ -116,9 +116,9 @@ class CodeSet:
         sel = self.e_code == z
         return self.e_img[sel], self.e_w[sel]
 
-    def used_mask(self, codes, n_slices):
-        """[len(codes), n_slices]: True for the slices already asked along each code."""
-        mask = torch.zeros(len(codes), n_slices, dtype=torch.bool, device=codes.device)
+    def used_mask(self, codes, n_questions):
+        """[len(codes), n_questions]: True for the questions already asked along each code."""
+        mask = torch.zeros(len(codes), n_questions, dtype=torch.bool, device=codes.device)
         for u in self.depth[codes].unique().tolist():
             rows = (self.depth[codes] == u).nonzero().squeeze(1)
             used = self.used[u][codes[rows] - self.codes_at(u)[0]]
@@ -126,14 +126,14 @@ class CodeSet:
                 mask[rows[:, None], used] = True
         return mask
 
-    def slice_gains(self, codes, slices, progress=None):
-        """Realized gain of each of the given slices [h] at each code -> [len(codes), len(slices)].
+    def question_gains(self, codes, questions, progress=None):
+        """Realized gain of each of the given questions [h] at each code -> [len(codes), len(questions)].
 
-        Codes with fewer than two images of weight gain nothing. A token cell with fewer than two images
-        falls back to the code's own spread: the token adds nothing there.
+        Codes with fewer than two images of weight gain nothing. An answer cell with fewer than two images
+        falls back to the code's own spread: the answer adds nothing there.
         """
-        out = torch.zeros(len(codes), len(slices), device=self.x.device)
-        if len(slices) == 0:
+        out = torch.zeros(len(codes), len(questions), device=self.x.device)
+        if len(questions) == 0:
             return out
         offsets, counts = self._offsets()
         support, offsets, counts = self.support.tolist(), offsets.tolist(), counts.tolist()
@@ -143,8 +143,8 @@ class CodeSet:
             if support[z] < 2:
                 continue
             start, stop = offsets[z], offsets[z] + counts[z]
-            out[k] = posterior_gains(self.x, self.sq, self.table, self.e_img[start:stop], self.e_w[start:stop], slices,
-                                     self.n_px, self.cutoff, self.W[z], self.D[z])
+            out[k] = posterior_gains(self.x, self.sq, self.table, self.e_img[start:stop], self.e_w[start:stop],
+                                     questions, self.n_px, self.cutoff, self.W[z], self.D[z])
         return out
 
     @classmethod
@@ -154,7 +154,7 @@ class CodeSet:
         dev = x.device
         self.table, self.x, self.cutoff, self.n_px = torch.empty(0, 0, 0, device=dev), x, cutoff, n_px
         self.sq = x.pow(2).sum(1)
-        self.images = self.tokens = self.slices = torch.zeros(0, 0, dtype=torch.long, device=dev)
+        self.images = self.answers = self.questions = torch.zeros(0, 0, dtype=torch.long, device=dev)
         self.ids = torch.zeros(0, 1, dtype=torch.long, device=dev)
         self.depth = torch.zeros(1, dtype=torch.long, device=dev)
         self.count = torch.ones(1, device=dev)
@@ -164,25 +164,25 @@ class CodeSet:
         return self
 
 
-def posterior_gains(x, sq, table, img, w, slices, n_px, cutoff, W=None, D=None):
-    """Realized gain of each of the given slices [h] on one posterior (images img [n], weights w [n]), with the
-    slices' answers from table [N, S, V] -> [len(slices)]. W and D (the posterior's total weight and spread) are
-    computed when not given. A token cell with fewer than two images falls back to the posterior's own spread:
-    the token adds nothing there. A posterior with fewer than two images gains nothing."""
+def posterior_gains(x, sq, table, img, w, questions, n_px, cutoff, W=None, D=None):
+    """Realized gain of each of the given questions [h] on one posterior (images img [n], weights w [n]), with the
+    answers from table [N, S, V] -> [len(questions)]. W and D (the posterior's total weight and spread) are
+    computed when not given. An answer cell with fewer than two images falls back to the posterior's own spread:
+    the answer adds nothing there. A posterior with fewer than two images gains nothing."""
     P, V, dev = x.shape[1], table.shape[2], x.device
-    if len(img) < 2 or len(slices) == 0:
-        return torch.zeros(len(slices), device=dev)
+    if len(img) < 2 or len(questions) == 0:
+        return torch.zeros(len(questions), device=dev)
     if W is None or D is None:
         M = w @ x[img]
         W = w.sum()
         D = spread(W, M.pow(2).sum(), w @ sq[img], w.pow(2).sum(), n_px)
-    Wc = torch.zeros(len(slices), V, device=dev)
+    Wc = torch.zeros(len(questions), V, device=dev)
     W2, Q, n = Wc.clone(), Wc.clone(), Wc.clone()
-    M = torch.zeros(len(slices), V, P, device=dev)
-    rows = max(1, CHUNK_ELEMENTS // (len(slices) * V))
+    M = torch.zeros(len(questions), V, P, device=dev)
+    rows = max(1, CHUNK_ELEMENTS // (len(questions) * V))
     for i in range(0, len(img), rows):
         im, ww = img[i:i + rows], w[i:i + rows]
-        A = ww[:, None, None] * table[im][:, slices]
+        A = ww[:, None, None] * table[im][:, questions]
         A = torch.where(A >= cutoff, A, 0.0)
         Wc += A.sum(0)
         W2 += A.pow(2).sum(0)

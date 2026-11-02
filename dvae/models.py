@@ -1,16 +1,16 @@
-"""Prior p(z) and decoder p(x|z) for a discrete 1-D latent of k_max tokens over a vocab of V (encoder: dvae/knight.py).
+"""Prior p(z) and decoder p(x|z) for codes of answers over a vocab of V (encoder: dvae/questions.py).
 
-Both also read, at every position, the index of the slice the encoder's selector asks there (n_slices means
-"no slice", past the end of the bank). It follows from the code's earlier tokens, so the encoder supplies it.
-A token means nothing apart from the slice that drew it, so each (slice, token) pair has its own embedding:
-row slice * V + token of a table of V * (n_slices + 1) rows.
+A code is a sequence of answers, each to the question the encoder's selector asked at that position (n_questions
+means "no question", past the end of the bank: the answer is always 0). What a code says about an image is the set
+of its (question, answer) pairs, whatever their order, so both models read sets: every pair has its own row
+question * V + answer of a joint embedding table, no position embeddings are used, and pairs past the bank carry
+nothing and are left out.
 
 Codes are indexed as base-V numbers with z_1 as the most significant digit, so the children of
 prefix node j at depth t are nodes j*V .. j*V+V-1 at depth t+1.
 """
 
 import math
-from typing import cast
 
 import torch
 import torch.nn as nn
@@ -18,10 +18,11 @@ import torch.nn.functional as F
 
 
 MODES = ("actual", "greedy", "topp")
+TREE_CHUNK = 4096  # prefix nodes per prior call when enumerating the code tree
 
 
 def apply_mode(logits, mode="actual", top_p=0.9):
-    """Next-token logits -> log-probs of the distribution we actually sample from.
+    """Next-answer logits -> log-probs of the distribution we actually sample from.
 
     actual: the model's distribution. greedy: point mass on the argmax. topp: nucleus-truncated and
     renormalized. Applied identically when sampling and when enumerating the tree, so the enumerated
@@ -41,206 +42,160 @@ def apply_mode(logits, mode="actual", top_p=0.9):
     raise ValueError(f"unknown mode {mode!r}, expected one of {MODES}")
 
 
-class Block(nn.Module):
-    """Pre-norm transformer block: causal self-attention, optional cross-attention, MLP.
+def all_prefixes(depth, vocab_size, device):
+    """Every length-depth prefix, in node order -> [V**depth, depth]."""
+    idx = torch.arange(vocab_size**depth, device=device)
+    powers = vocab_size ** torch.arange(depth - 1, -1, -1, device=device)
+    return (idx[:, None] // powers) % vocab_size
 
-    Runs on ordinary sequences (forward) or on one depth of the code tree at a time with the
-    ancestors' keys/values cached (forward_tree).
-    """
 
-    def __init__(self, d_model, n_heads, cross):
+def pair_rows(answers, questions, vocab_size, n_questions):
+    """Row of each (question, answer) pair in a joint table, and whether it's a real pair (not past the bank)."""
+    valid = questions < n_questions
+    return torch.where(valid, questions * vocab_size + answers, 0), valid
+
+
+class ReadLayer(nn.Module):
+    """Queries cross-attend to a set's items, then an MLP (pre-norm, residual)."""
+
+    def __init__(self, d_model, n_heads):
         super().__init__()
         self.n_heads, self.d_head = n_heads, d_model // n_heads
-        self.ln1 = nn.LayerNorm(d_model)
-        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.ln_q = nn.LayerNorm(d_model)
+        self.q = nn.Linear(d_model, d_model)
+        self.kv = nn.Linear(d_model, 2 * d_model)
         self.proj = nn.Linear(d_model, d_model)
-        self.cross = cross
-        if cross:
-            self.ln2 = nn.LayerNorm(d_model)
-            self.q_x = nn.Linear(d_model, d_model)
-            self.kv_x = nn.Linear(d_model, 2 * d_model)
-            self.proj_x = nn.Linear(d_model, d_model)
-        self.ln3 = nn.LayerNorm(d_model)
+        self.ln_mlp = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model))
 
     def _heads(self, t):
-        return t.unflatten(-1, (self.n_heads, self.d_head))
+        return t.unflatten(-1, (self.n_heads, self.d_head)).transpose(1, 2)
 
-    def memory_kv(self, memory):
-        """Cross-attention keys/values for image features [N, M, d] -> two [N, H, M, dh]."""
-        k, v = self.kv_x(memory).chunk(2, -1)
-        return self._heads(k).transpose(1, 2), self._heads(v).transpose(1, 2)
-
-    def _cross_and_mlp(self, x, memory_kv):
-        if self.cross:
-            q = self._heads(self.q_x(self.ln2(x))).transpose(1, 2)
-            out = F.scaled_dot_product_attention(q, *memory_kv)
-            x = x + self.proj_x(out.transpose(1, 2).flatten(-2))
-        return x + self.mlp(self.ln3(x))
-
-    def _self_attn(self, x):
-        q, k, v = (self._heads(t).transpose(1, 2) for t in self.qkv(self.ln1(x)).chunk(3, -1))
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        return x + self.proj(out.transpose(1, 2).flatten(-2))
-
-    def forward(self, x, memory_kv=None):
-        return self._cross_and_mlp(self._self_attn(x), memory_kv)
-
-    def forward_tree(self, x, cache, memory_kv=None):
-        """x: [N, n, d], every node at depth t = len(cache). cache[s] = (k, v) of depth s, [N, V**s, H, dh].
-
-        Node j's ancestor at depth s is j // V**(t-s), so nodes sharing an ancestor are contiguous and
-        we can broadcast against the cache instead of gathering it.
-        """
-        N, n, _ = x.shape
-        H, dh = self.n_heads, self.d_head
-        # contiguous so the per-depth reshapes below are views, not copies autograd would keep
-        q, k, v = (self._heads(t).contiguous() for t in self.qkv(self.ln1(x)).chunk(3, -1))
-        scores = []
-        for ks, _ in cache:
-            width = ks.shape[1]
-            qs = q.reshape(N, width, n // width, H, dh)
-            scores.append((qs * ks.unsqueeze(2)).sum(-1).reshape(N, n, H))
-        scores.append((q * k).sum(-1))
-        att = (torch.stack(scores, -1) / math.sqrt(dh)).softmax(-1)  # [N, n, H, t+1]
-        out = att[..., -1:] * v
-        for s, (_, vs) in enumerate(cache):
-            width = vs.shape[1]
-            a = att[..., s].reshape(N, width, n // width, H, 1)
-            out = out + (a * vs.unsqueeze(2)).reshape(N, n, H, dh)
-        x = x + self.proj(out.flatten(-2))
-        return self._cross_and_mlp(x, memory_kv), k, v
+    def forward(self, x, items, mask):
+        q = self._heads(self.q(self.ln_q(x)))
+        k, v = (self._heads(t) for t in self.kv(items).chunk(2, -1))
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        x = x + self.proj(out.transpose(1, 2).flatten(-2))
+        return x + self.mlp(self.ln_mlp(x))
 
 
-class TokenTransformer(nn.Module):
-    """Autoregressive model over k_max tokens, optionally cross-attending to image features.
+class SetReader(nn.Module):
+    """Queries read a set: n_layers rounds of cross-attention from the queries to the set's items, each followed by
+    an MLP. The items never attend to each other, so the result doesn't depend on their order. A learned null item
+    is always readable, so an empty set, or a query allowed to read nothing, is fine."""
 
-    Position u reads the previous token together with the slice that drew it (BOS first), plus the slice asked
-    at u, and predicts token u.
-    """
-
-    def __init__(self, vocab_size, k_max, d_model, n_layers, n_heads, cross, n_slices):
+    def __init__(self, d_model, n_heads, n_layers):
         super().__init__()
-        self.V, self.k_max, self.bos = vocab_size, k_max, vocab_size * (n_slices + 1)
-        self.pair_emb = nn.Embedding(vocab_size * (n_slices + 1) + 1, d_model)  # (slice, token) pairs, then BOS
-        self.slice_emb = nn.Embedding(n_slices + 1, d_model)  # the slice asked at each position
-        self.pos_emb = nn.Parameter(torch.randn(k_max, d_model) * 0.02)
-        self.blocks = nn.ModuleList(Block(d_model, n_heads, cross) for _ in range(n_layers))
-        self.ln_f = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, vocab_size)
+        self.null = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.ln_items = nn.LayerNorm(d_model)
+        self.layers = nn.ModuleList(ReadLayer(d_model, n_heads) for _ in range(n_layers))
 
-    @property
-    def block_list(self) -> list[Block]:
-        return cast(list[Block], list(self.blocks))
-
-    def memory_kvs(self, memory):
-        return [b.memory_kv(memory) if memory is not None else None for b in self.block_list]
-
-    def logits(self, prefix, slices, memory_kvs):
-        """Next-token logits after BOS and each token of prefix [N, T], T < k_max, given the slice asked at each of
-        the T+1 positions [N, T+1] -> [N, T+1, V]."""
-        bos = prefix.new_full((prefix.shape[0], 1), self.bos)
-        pairs = torch.cat([bos, slices[:, :-1] * self.V + prefix], 1)
-        x = self.pair_emb(pairs) + self.slice_emb(slices) + self.pos_emb[: pairs.shape[1]]
-        for block, kv in zip(self.blocks, memory_kvs):
-            x = block(x, kv)
-        return self.head(self.ln_f(x))
-
-    def log_prob(self, codes, slices, memory=None, mode="actual", top_p=0.9):
-        """Per-token log-probs of full codes [N, k_max], with the slice asked at each position [N, k_max]
-        -> [N, k_max]."""
-        logp = apply_mode(self.logits(codes[:, :-1], slices, self.memory_kvs(memory)), mode, top_p)
-        return logp.gather(-1, codes.unsqueeze(-1)).squeeze(-1)
-
-    @torch.no_grad()
-    def sample(self, n, next_slices, memory=None, prefix=None, mode="actual", top_p=0.9, generator=None,
-               temperature=1.0):
-        """Complete prefix [n, T] (or start empty) to full codes [n, k_max]; next_slices(prefix) gives the slice
-        asked after each prefix [n]. Logits are divided by temperature."""
-        device = self.pos_emb.device
-        codes = prefix if prefix is not None else torch.zeros(n, 0, dtype=torch.long, device=device)
-        slices = torch.stack([next_slices(codes[:, :u]) for u in range(codes.shape[1] + 1)], 1)
-        kvs = self.memory_kvs(memory)
-        while codes.shape[1] < self.k_max:
-            logp = apply_mode(self.logits(codes, slices, kvs)[:, -1] / temperature, mode, top_p)
-            nxt = torch.multinomial(logp.exp(), 1, generator=generator)
-            codes = torch.cat([codes, nxt], 1)
-            slices = torch.cat([slices, next_slices(codes)[:, None]], 1)
-        return codes
-
-    def prefix_logprobs(self, n, tree_slices, memory=None, mode="actual", top_p=0.9):
-        """Enumerate the whole code tree, given the slice asked after every prefix (tree_slices[t] is [V**t]).
-
-        Returns a list of k_max+1 tensors; entry t is [n, V**t], the log-prob of every length-t prefix.
-        Costs one transformer position per tree node (V**k_max - 1 internal nodes / V - 1).
-        """
-        device = self.pos_emb.device
-        kvs = self.memory_kvs(memory)
-        caches = [[] for _ in self.blocks]
-        out = [torch.zeros(n, 1, device=device)]
-        for t in range(self.k_max):
-            width = self.V**t
-            if t == 0:
-                pair = torch.full((1,), self.bos, device=device)
-            else:  # node j's last token is j % V, drawn by the slice asked after its parent j // V
-                pair = tree_slices[t - 1].repeat_interleave(self.V) * self.V + torch.arange(width, device=device) % self.V
-            x = (self.pair_emb(pair) + self.slice_emb(tree_slices[t]) + self.pos_emb[t]).expand(n, width, -1)
-            for block, cache, kv in zip(self.block_list, caches, kvs):
-                x, k, v = block.forward_tree(x, cache, kv)
-                cache.append((k, v))
-            logp = apply_mode(self.head(self.ln_f(x)), mode, top_p)  # [n, width, V]
-            out.append((out[-1].unsqueeze(-1) + logp).flatten(1))
-        return out
+    def forward(self, queries, items, allowed):
+        """queries [N, U, d], items [N, P, d], allowed [N, U, P] (True: that query may read that item) -> [N, U, d]."""
+        N, U, _ = queries.shape
+        items = self.ln_items(torch.cat([self.null.expand(N, 1, -1), items], 1))
+        mask = torch.cat([allowed.new_ones(N, U, 1), allowed], 2)[:, None]  # [N, 1, U, P + 1]
+        x = queries
+        for layer in self.layers:
+            x = layer(x, items, mask)
+        return x
 
 
 class Prior(nn.Module):
-    """p(z): unconditional autoregressive token transformer, told which slice the encoder asks at each position.
+    """p(z): the answer at each position, given the question asked there and the set of earlier pairs.
 
-    The slices come from the encoder it was trained with: sample() and prefix_logprobs() take that encoder.
+    The question at each position follows from the earlier answers through the encoder it was trained with, so
+    sample() and prefix_logprobs() take that encoder. A query per position (the question asked there plus how many
+    pairs came before it) reads the earlier pairs; since pairs never read each other, every position is scored in
+    one pass and order never matters.
     """
 
-    def __init__(self, vocab_size=2, k_max=10, n_slices=1, d_model=128, n_layers=3, n_heads=4):
+    def __init__(self, vocab_size=2, k_max=10, n_questions=1, d_model=128, n_layers=3, n_heads=4):
         super().__init__()
-        self.config = dict(vocab_size=vocab_size, k_max=k_max, n_slices=n_slices, d_model=d_model, n_layers=n_layers,
-                           n_heads=n_heads)
-        self.tokens = TokenTransformer(vocab_size, k_max, d_model, n_layers, n_heads, cross=False, n_slices=n_slices)
+        self.config = dict(vocab_size=vocab_size, k_max=k_max, n_questions=n_questions, d_model=d_model,
+                           n_layers=n_layers, n_heads=n_heads)
+        self.V, self.k_max, self.S = vocab_size, k_max, n_questions
+        self.pairs = nn.Embedding(vocab_size * n_questions, d_model)
+        self.asked = nn.Embedding(n_questions + 1, d_model)  # the question being answered (n_questions: none left)
+        self.count = nn.Embedding(k_max + 1, d_model)  # how many pairs came before it
+        self.reader = SetReader(d_model, n_heads, n_layers)
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size)
 
-    def prefix_logprobs(self, encoder, mode="actual", top_p=0.9):
-        """Log-probs of every prefix at every depth, each [V**t] (no batch dim)."""
-        tree = encoder.tree_slices(self.tokens.k_max, self.tokens.pos_emb.device)
-        return [lp[0] for lp in self.tokens.prefix_logprobs(1, tree, None, mode, top_p)]
+    def logits(self, answers, questions, asked, start=0):
+        """Logits [N, U, V] of the answer to each question in asked [N, U]; query u reads the pairs (answers,
+        questions [N, T]) before position start + u."""
+        T, U, device = answers.shape[1], asked.shape[1], answers.device
+        rows, valid = pair_rows(answers, questions, self.V, self.S)
+        before = torch.arange(T, device=device) < (start + torch.arange(U, device=device))[:, None]  # [U, T]
+        allowed = before & valid[:, None, :]  # [N, U, T]
+        x = self.asked(asked) + self.count(allowed.sum(-1).clamp_max(self.k_max))
+        return self.head(self.ln_f(self.reader(x, self.pairs(rows), allowed)))
 
-    def log_prob(self, codes, slices, mode="actual", top_p=0.9):
-        """Per-token log-probs of codes [N, k_max] with the slice asked at each position [N, k_max]."""
-        return self.tokens.log_prob(codes, slices, None, mode, top_p)
+    def log_prob(self, codes, questions, mode="actual", top_p=0.9):
+        """Per-answer log-probs of codes [N, k] with the question asked at each position [N, k] -> [N, k]."""
+        logp = apply_mode(self.logits(codes, questions, questions), mode, top_p)
+        return logp.gather(-1, codes.unsqueeze(-1)).squeeze(-1)
 
     @torch.no_grad()
-    def sample(self, n, encoder, prefix=None, mode="actual", top_p=0.9, generator=None):
-        return self.tokens.sample(n, encoder.next_slices, None, prefix, mode, top_p, generator)
+    def sample(self, n, encoder, prefix=None, mode="actual", top_p=0.9, generator=None, temperature=1.0):
+        """Complete prefix [n, T] (or start empty) to full codes [n, k_max]. Logits are divided by temperature."""
+        device = self.head.weight.device
+        codes = prefix if prefix is not None else torch.zeros(n, 0, dtype=torch.long, device=device)
+        questions = encoder.question_path(codes)
+        while codes.shape[1] < self.k_max:
+            nxt = encoder.next_questions(codes)
+            logits = self.logits(codes, questions, nxt[:, None], start=codes.shape[1])[:, 0]
+            logp = apply_mode(logits / temperature, mode, top_p)
+            codes = torch.cat([codes, torch.multinomial(logp.exp(), 1, generator=generator)], 1)
+            questions = torch.cat([questions, nxt[:, None]], 1)
+        return codes
+
+    @torch.no_grad()
+    def prefix_logprobs(self, encoder, mode="actual", top_p=0.9):
+        """Log-probs of every prefix at every depth up to k_max, each [V**t]."""
+        device = self.head.weight.device
+        tree = encoder.tree_questions(self.k_max, device)  # tree[t]: the question asked after each length-t prefix
+        out = [torch.zeros(1, device=device)]
+        for t in range(self.k_max):
+            nodes = all_prefixes(t, self.V, device)
+            j = torch.arange(len(nodes), device=device)
+            path = torch.stack([tree[s][j // self.V ** (t - s)] for s in range(t)], 1) if t else nodes
+            logp = torch.cat([apply_mode(self.logits(nodes[i:i + TREE_CHUNK], path[i:i + TREE_CHUNK],
+                                                     tree[t][i:i + TREE_CHUNK, None], start=t)[:, 0], mode, top_p)
+                              for i in range(0, len(nodes), TREE_CHUNK)])
+            out.append((out[-1][:, None] + logp).flatten())
+        return out
 
 
 class Decoder(nn.Module):
-    """p(x|z), factorized over pixels.
+    """p(x|z), factorized over pixels, from the set of a code's (question, answer) pairs.
+
+    A set transformer (self-attention without positions) contextualizes the pairs; 49 learned queries read them
+    into a 7x7 map, which transposed convs bring to 28x28. Reads any number of pairs; k_max only records the code
+    length it was trained on.
 
     likelihood="gray": 256-way categorical per pixel (8-bit MNIST, scored in bits/dim).
     likelihood="binary": Bernoulli per pixel (binarized MNIST, scored in nats).
     """
 
-    def __init__(self, vocab_size=2, k_max=10, n_slices=1, likelihood="gray", d_model=128, n_layers=2, n_heads=4,
-                 channels=128):
+    def __init__(self, vocab_size=2, k_max=10, n_questions=1, likelihood="gray", d_model=128, n_layers=2, n_heads=4,
+                 channels=128, n_read_layers=2):
         super().__init__()
         assert likelihood in ("gray", "binary")
-        self.config = dict(vocab_size=vocab_size, k_max=k_max, n_slices=n_slices, likelihood=likelihood,
-                           d_model=d_model, n_layers=n_layers, n_heads=n_heads, channels=channels)
+        self.config = dict(vocab_size=vocab_size, k_max=k_max, n_questions=n_questions, likelihood=likelihood,
+                           d_model=d_model, n_layers=n_layers, n_heads=n_heads, channels=channels,
+                           n_read_layers=n_read_layers)
+        self.V, self.S = vocab_size, n_questions
         self.likelihood = likelihood
-        self.channels = channels
-        self.V = vocab_size
-        self.pair_emb = nn.Embedding(vocab_size * (n_slices + 1), d_model)  # (slice, token) pairs
-        self.pos_emb = nn.Parameter(torch.randn(k_max, d_model) * 0.02)
+        self.pairs = nn.Embedding(vocab_size * n_questions, d_model)
+        self.null = nn.Parameter(torch.zeros(1, 1, d_model))  # always present, so no set is empty
         layer = nn.TransformerEncoderLayer(d_model, n_heads, 4 * d_model, dropout=0.0, activation="gelu",
                                            batch_first=True, norm_first=True)
         self.tf = nn.TransformerEncoder(layer, n_layers, enable_nested_tensor=False)
-        self.fc = nn.Linear(k_max * d_model, channels * 49)
+        self.queries = nn.Parameter(torch.randn(49, d_model) * 0.02)
+        self.reader = SetReader(d_model, n_heads, n_read_layers)
+        self.to_map = nn.Conv2d(d_model, channels, 1)
         out_ch = 256 if likelihood == "gray" else 1
         self.up = nn.Sequential(
             nn.GELU(), nn.ConvTranspose2d(channels, channels // 2, 4, stride=2, padding=1),  # 14x14
@@ -248,11 +203,15 @@ class Decoder(nn.Module):
             nn.GELU(), nn.Conv2d(channels // 4, out_ch, 3, padding=1),
         )
 
-    def forward(self, codes, slices):
-        """codes [N, k_max] and the slice that drew each token [N, k_max] -> logits [N, 784, 256] (gray) or
-        [N, 784] (binary)."""
-        h = self.tf(self.pair_emb(slices * self.V + codes) + self.pos_emb).flatten(1)
-        out = self.up(self.fc(h).view(-1, self.channels, 7, 7))
+    def forward(self, codes, questions):
+        """codes [N, k] and the question each answers [N, k] -> logits [N, 784, 256] (gray) or [N, 784] (binary)."""
+        N = len(codes)
+        rows, valid = pair_rows(codes, questions, self.V, self.S)
+        items = torch.cat([self.null.expand(N, 1, -1), self.pairs(rows)], 1)
+        present = torch.cat([valid.new_ones(N, 1), valid], 1)
+        h = self.tf(items, src_key_padding_mask=~present)
+        z = self.reader(self.queries.expand(N, -1, -1), h, present[:, None, :].expand(-1, 49, -1))
+        out = self.up(self.to_map(z.transpose(1, 2).reshape(N, -1, 7, 7)))
         if self.likelihood == "gray":
             return out.flatten(2).transpose(1, 2)
         return out.flatten(1)
@@ -280,4 +239,4 @@ class Decoder(nn.Module):
         return img.view(-1, 1, 28, 28)
 
 
-MODELS = {"prior": Prior, "decoder": Decoder}  # the encoder lives in dvae/knight.py
+MODELS = {"prior": Prior, "decoder": Decoder}  # the encoder lives in dvae/questions.py

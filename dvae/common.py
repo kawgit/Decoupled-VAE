@@ -14,9 +14,9 @@ import torch
 
 from .models import MODELS as _MODELS
 from .models import MODES
-from .knight import BlindKnightEncoder
+from .questions import QuestionAnswerEncoder
 
-MODELS = {**_MODELS, "encoder": BlindKnightEncoder}
+MODELS = {**_MODELS, "encoder": QuestionAnswerEncoder}
 
 
 # Cap what the MPS allocator may take (relative to macOS's recommended GPU working set, ~13 GB on an
@@ -44,7 +44,7 @@ def add_common_args(parser):
 
 def add_mode_args(parser, who, default="actual"):
     parser.add_argument(f"--{who}-mode", choices=MODES, default=default,
-                        help=f"how {who} tokens are drawn: actual distribution, greedy argmax, or top-p nucleus")
+                        help=f"how {who} answers are drawn: actual distribution, greedy argmax, or top-p nucleus")
     parser.add_argument(f"--{who}-top-p", type=float, default=0.9)
 
 
@@ -101,15 +101,15 @@ def load_checkpoint(path, kind, device):
 
 
 def check_same_codes(a, b, what):
-    """Two models that read codes (prior, decoder) must agree on the vocab, the code length and the slice count."""
-    for key in ("vocab_size", "k_max", "n_slices"):
+    """Two models that read codes (prior, decoder) must agree on the vocab, the code length and the question count."""
+    for key in ("vocab_size", "k_max", "n_questions"):
         if a.get(key) != b.get(key):
             raise ValueError(f"{what}: {key} mismatch ({a.get(key)} vs {b.get(key)})")
 
 
 def check_encoder(encoder, cfg, what):
-    """A prior or decoder must read the codes of the encoder whose slices it was trained with."""
-    for key, value in (("vocab_size", encoder.V), ("n_slices", encoder.n_slices)):
+    """A prior or decoder must read the codes of the encoder whose questions it was trained with."""
+    for key, value in (("vocab_size", encoder.V), ("n_questions", encoder.n_questions)):
         if cfg.get(key) != value:
             raise ValueError(f"{what}: {key} mismatch with the encoder ({cfg.get(key)} vs {value})")
 
