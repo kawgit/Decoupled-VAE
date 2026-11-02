@@ -1,4 +1,4 @@
-"""Test bits per dimension of a delta tree (train_deltatree.py), after every code length up to the checkpoint's.
+"""Test bits per dimension of a delta tree (train.py), after every code length up to the checkpoint's.
 
 A code of k tokens costs its tokens' bits under the decoders' own shares (the rare side's p = m / (1 + m)).
 Its pixels are coded given the code's predicted mean by a categorical over the 256 grey levels that depends

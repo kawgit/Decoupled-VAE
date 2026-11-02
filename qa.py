@@ -1,4 +1,4 @@
-"""Compression and generation QA for a delta tree (train_deltatree.py).
+"""Compression and generation QA for a delta tree (train.py).
 
 Compression: test images, each followed by its node's predicted mean after every token (the decoder's
 reconstruction), and in a second grid by the mean of the training images in that same node (what an ideal

@@ -40,7 +40,7 @@ def evaluate(decoder, fr, X, levels, batch):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--ckpt", default="checkpoints/deltatree.pt", help="the tree (train_deltatree.py)")
+    p.add_argument("--ckpt", default="checkpoints/deltatree.pt", help="the tree (train.py)")
     p.add_argument("--tokens", type=int, default=None, help="code length (default: all the tree's depths)")
     p.add_argument("--out", default=None, help="leaf decoder checkpoint (default: --ckpt with _leaf)")
     p.add_argument("--width", type=int, default=256)
