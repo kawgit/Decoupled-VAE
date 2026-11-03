@@ -64,7 +64,7 @@ def bisector(r, m):
 def top_direction(R):
     """The top principal direction of remainders R [N, D] (about each node's predicted mean, so pooled within
     nodes), a unit vector [D]."""
-    gram = sum((R[i:i + 8192].T @ R[i:i + 8192]).double().cpu() for i in range(0, len(R), 8192))
+    gram = sum((R[i:i + 8192].T @ R[i:i + 8192]).cpu().double() for i in range(0, len(R), 8192))
     assert isinstance(gram, Tensor)
     return torch.linalg.eigh(gram)[1][:, -1].float().to(R.device)
 
@@ -215,7 +215,6 @@ class Frontier:
     deltas: Tensor  # [Nn, k, D] half precision on the CPU: each node's delta history
     sides: Tensor   # [Nn, k] +1 rare, -1 common
     ms: Tensor      # [Nn, k] the m of each split
-    fold: Tensor | None = None  # [Nn] on the CPU: each node's fold, when its images go down their fold's models
 
     @property
     def depth(self):
@@ -226,16 +225,11 @@ class Frontier:
         return (self.deltas[nodes].to(device).float(), self.sides[nodes].to(device), self.ms[nodes].to(device))
 
 
-def root_frontier(X, mean, folds=None, num_folds=0):
-    """Every image at the root. With folds (each image's fold [N]), one root per fold: the roots share their
-    (empty) history, but each goes down its own fold's models."""
-    if folds is None:
-        return Frontier(R=X - mean, node=torch.zeros(len(X), dtype=torch.long, device=X.device),
-                        bits=torch.zeros(1, dtype=torch.int64), deltas=torch.zeros(1, 0, D, dtype=torch.half),
-                        sides=torch.zeros(1, 0), ms=torch.zeros(1, 0))
-    return Frontier(R=X - mean, node=folds.to(X.device), bits=torch.zeros(num_folds, dtype=torch.int64),
-                    deltas=torch.zeros(num_folds, 0, D, dtype=torch.half), sides=torch.zeros(num_folds, 0),
-                    ms=torch.zeros(num_folds, 0), fold=torch.arange(num_folds))
+def root_frontier(X, mean):
+    """Every image at the root."""
+    return Frontier(R=X - mean, node=torch.zeros(len(X), dtype=torch.long, device=X.device),
+                    bits=torch.zeros(1, dtype=torch.int64), deltas=torch.zeros(1, 0, D, dtype=torch.half),
+                    sides=torch.zeros(1, 0), ms=torch.zeros(1, 0))
 
 
 def node_order(fr):
@@ -269,11 +263,10 @@ def chunk_sse(decoder, fr, imgs, steps, select=False):
 
 
 @torch.no_grad()
-def choose(decoder, fr, steps, batch, nodes=None):
-    """The split of each node (default: every node) after the Lloyd steps, as (n [n, D], b [n], r [n, D],
-    m [n])."""
+def choose(decoder, fr, steps, batch):
+    """The split of each node after the Lloyd steps, as (n [Nn, D], b [Nn], r [Nn, D], m [Nn])."""
     device = fr.R.device
-    nodes = torch.arange(len(fr.bits)) if nodes is None else nodes.cpu()
+    nodes = torch.arange(len(fr.bits))
     out = []
     for i in range(0, len(nodes), batch):
         mems = decoder.memory(*fr.history(nodes[i:i + batch], device))
@@ -283,21 +276,10 @@ def choose(decoder, fr, steps, batch, nodes=None):
 
 
 @torch.no_grad()
-def split(decoder, fr, steps, batch, fold_decoders=None):
+def split(decoder, fr, steps, batch):
     """The next depth's frontier, every node split by its hyperplane and empty children dropped, and each
-    image's token cost in bits under the decoder's shares (the rare side's p = m / (1 + m)) [N]. With
-    fold_decoders and a frontier whose nodes carry folds, each node is split by its fold's decoder instead."""
-    if fold_decoders is None or fr.fold is None:
-        n, b, r, m = choose(decoder, fr, steps, batch)
-    else:
-        Nn, device = len(fr.bits), fr.R.device
-        n, r = fr.R.new_zeros(Nn, D), fr.R.new_zeros(Nn, D)
-        b, m = fr.R.new_zeros(Nn), fr.R.new_zeros(Nn)
-        for f, fold_decoder in enumerate(fold_decoders):
-            nodes = (fr.fold == f).nonzero()[:, 0]
-            if len(nodes):
-                at = nodes.to(device)
-                n[at], b[at], r[at], m[at] = choose(fold_decoder, fr, steps, batch, nodes)
+    image's token cost in bits under the decoder's shares (the rare side's p = m / (1 + m)) [N]."""
+    n, b, r, m = choose(decoder, fr, steps, batch)
     side = torch.cat([(fr.R[i:i + batch] * n[fr.node[i:i + batch]]).sum(-1) >= b[fr.node[i:i + batch]]
                       for i in range(0, len(fr.R), batch)])
     p_rare = (m / (1 + m))[fr.node]
@@ -311,11 +293,10 @@ def split(decoder, fr, steps, batch, fold_decoders=None):
                      bits=child_key(fr.bits[p], rare, fr.depth),
                      deltas=torch.cat([fr.deltas[p], child_delta.half().cpu()[:, None]], 1),
                      sides=torch.cat([fr.sides[p], (2 * rare.float() - 1)[:, None]], 1),
-                     ms=torch.cat([fr.ms[p], m[parent].cpu()[:, None]], 1),
-                     fold=None if fr.fold is None else fr.fold[p])
+                     ms=torch.cat([fr.ms[p], m[parent].cpu()[:, None]], 1))
     return child, token_bits
 
 
-def descend(decoder, fr, steps, batch, fold_decoders=None):
+def descend(decoder, fr, steps, batch):
     """The next depth's frontier (split's, without the token costs)."""
-    return split(decoder, fr, steps, batch, fold_decoders)[0]
+    return split(decoder, fr, steps, batch)[0]
