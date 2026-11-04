@@ -13,8 +13,11 @@ two-channel 28x28 image read by a small convolutional net. That adds no informat
 so far) but puts it in a form where strokes are local, as a person comparing the two would see them.
 """
 
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from dvae.deltatree import EPS, Block
@@ -63,7 +66,7 @@ class SidePrior(nn.Module):
         h = self.split_in(torch.cat([r / length, length.log(), m[..., None]], -1)) + self.side_in(before)
         if self.means_in is not None:
             common = -m[..., None] * r
-            delta = torch.where(rare[..., None], r, common)
+            delta = torch.where(rare[..., None], r, common)  # dvae/codes.py's deltas
             mu = self.mean + torch.cumsum(delta, 1) - delta  # each node's predicted mean, from the deltas before it
             h = h + self.means_in(torch.stack([mu + r, mu + common], 2))
         h = self.drop(h + self.position[:k])
@@ -108,3 +111,16 @@ def load_prior(ckpt, device):
         return snapshot(ckpt["state_dict"]).eval()
     priors = [snapshot(ckpt["states"][epoch]) for epoch in ckpt["band_epochs"]]
     return BandedPrior(priors, ckpt["bands"]).eval()
+
+
+@torch.no_grad()
+def token_bits(prior: SidePrior | BandedPrior, rare: Tensor, m: Tensor, r: Tensor, device, batch=256) -> Tensor:
+    """The bits [N, K] each token of N codes (rare [N, K], m [N, K], r [N, K, D], on any device) costs under
+    the prior, on the CPU."""
+    prior.eval()
+    out = []
+    for i in range(0, len(rare), batch):
+        rb = rare[i:i + batch].to(device)
+        logits = prior(r[i:i + batch].to(device).float(), m[i:i + batch].to(device).float(), rb)
+        out.append(F.binary_cross_entropy_with_logits(logits, rb.float(), reduction="none").cpu() / math.log(2))
+    return torch.cat(out)

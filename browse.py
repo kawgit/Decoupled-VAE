@@ -1,4 +1,4 @@
-"""Human QA of a delta tree (train.py's or train_walk.py's): a local web page for browsing its code tree, one node
+"""Human QA of the autoencoder (train_autoencoder.py): a local web page for browsing its code tree, one node
 at a time.
 
 The tree is deterministic, so every training image lies in exactly one node per depth. The script routes them

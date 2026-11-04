@@ -2,7 +2,7 @@
 # Hold one GPU on BU's SCC and run experiments from a queue folder on it as they arrive. From the repo there:
 #   qsub [-l gpu_type=L40S] [-l h_rt=12:00:00] [-v POOL=l40s,IDLE=7200,MIN_LEFT=14400] scc/hold.sh
 # An experiment is a file in ../queue/pending holding shell commands, run from the repo with $PY the venv's
-# python and $DVAE_JOB its file's name (e.g. "$PY train_walk.py --depths 32"), so its files go to
+# python and $DVAE_JOB its file's name (e.g. "$PY train_autoencoder.py --depths 32"), so its files go to
 # artifacts/<name>/ (dvae/artifacts.py), beside a copy of the commands, their stdout, stderr and exit code (so
 # every job has a log from its first second, even one that only waits). Holders take
 # files in name order; each moves to ../queue/running while it runs, then to ../queue/done. A file

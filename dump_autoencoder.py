@@ -1,10 +1,12 @@
-"""Dump a delta tree's codes for train_prior.py: for every train, val and test image, its sides (rare or not) at
-every depth and the tree's split at each node on its path (the rare side's mean delta r and the ratio m), routed
-by the tree's own Lloyd steps. Splits depend only on the code, never on which images reach a node, so images go
-down in chunks. Each split's file also holds the digit labels and which checkpoint made it. Progress (each chunk,
-timestamped) goes to run.log beside the files.
+"""Stage 2: dump the autoencoder's codes, for the prior (train_prior.py) and the categorical decoder
+(train_categorical_decoder.py). For every train, val and test image: its sides (rare or not) at every depth and
+the autoencoder's split at each node on its path (the rare side's mean delta r and the ratio m), routed by its
+own Lloyd steps. Splits depend only on the code, never on which images reach a node, so images go down in
+chunks. Each split's file also holds the digit labels, the training mean (a node's predicted mean is it plus
+the deltas so far) and which checkpoint made it. Progress (each chunk, timestamped) goes to run.log beside the
+files.
 
-Run from the repo: python dump_codes.py --ckpt artifacts/<run>/model.pt   (files go to artifacts/<job>/)
+Run from the repo: python dump_autoencoder.py --ckpt artifacts/<run>/model.pt   (files go to artifacts/<job>/)
 """
 
 import argparse
@@ -55,15 +57,15 @@ def main():
     out = a.out or artifact("")
     os.makedirs(out, exist_ok=True)
     log = RunLog(os.path.join(out, "run.log"), device)
-    log(f"=== dump_codes.py {vars(a)}: {len(decoders)} tokens")
+    log(f"=== dump_autoencoder.py {vars(a)}: {len(decoders)} tokens")
     for split in a.splits:
         began = time.time()
         X = pixels(load_mnist(split, a.data_root)[:a.limit])
         log(f"{split}: {len(X)} images")
         rare, m, r = codes(decoders, steps, mean, X, batch, tol, a.chunk, log)
         path = os.path.join(out, f"{split}.pt")
-        torch.save(dict(rare=rare, m=m, r=r, labels=load_labels(split, a.data_root)[:a.limit], ckpt=a.ckpt,
-                        epoch=ckpt.get("epoch"), depths=len(decoders)), path)
+        torch.save(dict(rare=rare, m=m, r=r, labels=load_labels(split, a.data_root)[:a.limit], mean=mean.cpu(),
+                        ckpt=a.ckpt, epoch=ckpt.get("epoch"), depths=len(decoders)), path)
         log(f"{path}: {len(X)} codes of {len(decoders)} tokens, {rare.float().mean():.3f} of tokens rare "
             f"({time.time() - began:.0f}s)")
 

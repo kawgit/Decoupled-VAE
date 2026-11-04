@@ -1,4 +1,6 @@
-"""Train a delta tree in one stage, with one decoder for every depth (dvae/deltatree.py's SharedDecoder).
+"""Stage 1: train the autoencoder, a delta tree with one network for every depth (dvae/deltatree.py's
+SharedDecoder). It is both encoder and decoder: an image's code is the sides of the hyperplanes the network's
+Lloyd steps find down its path, and a code decodes to the network's predicted mean at its node.
 
 Every step sends a batch of training images down the tree as the decoder now splits it. At each depth, every
 node the batch reaches runs Lloyd's algorithm on the decoder from its start; the decoder is trained on the
@@ -19,11 +21,6 @@ The decoder grows one depth every --grow-every epochs (1 by default; fractions g
 all its depths. The batch's split at the deepest one gives the next depth's remainders, which track that depth's
 start until it joins.
 
-With --adaptive, the decoder grows by a rule instead: every epoch either gives the deepest depth one more Lloyd
-step or adds a depth (at 1 step), whichever has given the larger gain (in val mse after the deepest token) in the
-epochs it began (an EMA, --gain-ema), a depth's divided by --depth-penalty (4: a depth must have given 4 times a
-step's gain to be chosen).
-
 With --chunk C, batches after the first epoch follow the tree: the training images, sorted by the codes the
 last epoch gave them (token 0 first, ties broken at random), are cut into runs of C, the runs shuffled, and
 consecutive runs joined into batches, so a batch's images share more tokens and reach fewer nodes (a node's
@@ -32,14 +29,16 @@ cost does not depend on its images). C = --batch makes each batch one run; small
 Early stopping watches the held-out (val) images' mse after all --depths tokens, routed the same way, once the
 decoder has grown to them; every depth's val mse is logged. A checkpoint holds everything training needs (the
 optimizer's state, the tracked starts, the step and the history): saved every epoch while the decoder grows, then
-at each new best. --resume continues from one, growing on to --depths if that is deeper.
+at each new best. --resume continues from one, growing on to --depths if that is deeper. The progress plot
+(dvae/plots.py's plot_depths) is redrawn every epoch.
+
+Next: dump_autoencoder.py writes every image's code for the prior and the categorical decoder.
 """
 
 import argparse
 import math
 import os
 import time
-from typing import Any
 
 os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.5")  # ~6.5 GB: fail instead of swapping
 os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.4")
@@ -51,7 +50,6 @@ from dvae.data import get_device, load_mnist  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
 from dvae.deltatree import (D, SharedDecoder, Split, by_nodes, cat_splits, children, chunk_sse, lloyd,  # noqa: E402
                             node_order, pixels, root_frontier, split, top_direction)
-from dvae.graphs import GraphedDepths  # noqa: E402
 from dvae.plots import plot_depths  # noqa: E402
 
 
@@ -102,14 +100,13 @@ def depth_step(decoder, fr, args, steps):
                                    None if s.u is None else s.u[whole], s.steps[whole])
 
 
-def train_step(decoder, X, mean, grams, args, caps, graphs: GraphedDepths | None = None):
+def train_step(decoder, X, mean, grams, args, caps):
     """Send the batch X down every depth of the decoder as it splits them (depth d with caps[d] Lloyd steps),
     accumulating each depth's gradient;
     without seeds, fold the remainders each depth sees into its running Gram matrix (grams [n, D, D]), and the
     next depth's too while grams has one more (it tracks its start before it joins). Returns, per depth [K]: the
     objective and the PCA reconstruction error summed over the batch, and the Lloyd steps taken and nodes split;
-    and each image's key (child_key) at the deepest depth it reached [b], on the CPU. With graphs, a full
-    batch's depths run as CUDA graphs."""
+    and each image's key (child_key) at the deepest depth it reached [b], on the CPU."""
     K = decoder.depths
     ahead = grams is not None and len(grams) > K
     fr = root_frontier(X, mean, resident=True)
@@ -119,11 +116,7 @@ def train_step(decoder, X, mean, grams, args, caps, graphs: GraphedDepths | None
         R = fr.R
         if grams is not None:
             fold(grams, depth, R, args.ema)
-        if graphs is not None and len(X) == graphs.batch:
-            total, s = graphs.run(fr, caps[depth])
-            pca_total = zero
-        else:
-            total, pca_total, s = depth_step(decoder, fr, args, caps[depth])
+        total, pca_total, s = depth_step(decoder, fr, args, caps[depth])
         sses[depth], pcas[depth] = total, pca_total
         steps[depth], nodes[depth] = s.steps.sum(), R.new_tensor(float(len(s.steps)))
         if depth + 1 < K or ahead:
@@ -147,18 +140,18 @@ def refresh(decoder, grams, tracked):
 
 
 @torch.no_grad()
-def lloyd_path(decoder, fr, steps, extra, batch):
-    """Every node's Split after steps Lloyd steps, and every image's squared error after the split each of the
-    first steps + extra steps gives [steps + extra, N]."""
+def lloyd_path(decoder, fr, steps, batch):
+    """Every node's Split after steps Lloyd steps, and every image's squared error after the split each step
+    gives [steps, N]."""
     device, Nn = fr.R.device, len(fr.bits)
     n, b, r, m = fr.R.new_zeros(Nn, D), fr.R.new_zeros(Nn), fr.R.new_zeros(Nn, D), fr.R.new_zeros(Nn)
-    errs = fr.R.new_zeros(steps + extra, len(fr.R))
+    errs = fr.R.new_zeros(steps, len(fr.R))
     for i in range(0, Nn, batch):
         nodes = torch.arange(i, min(i + batch, Nn), device=device)
         mine = (fr.node >= i) & (fr.node < i + len(nodes))
         R, node = fr.R[mine], fr.node[mine] - i
         mems = decoder.memory(*fr.history(nodes, device))
-        for t, (_, tn, tb, tr, tm, _) in enumerate(lloyd(decoder, mems, fr.starts(decoder, nodes), steps + extra)):
+        for t, (_, tn, tb, tr, tm, _) in enumerate(lloyd(decoder, mems, fr.starts(decoder, nodes), steps)):
             rare = (R * tn[node]).sum(-1) >= tb[node]
             errs[t, mine] = (R - torch.where(rare[:, None], tr[node], -tm[node, None] * tr[node])).square().sum(-1)
             if t == steps - 1:
@@ -167,34 +160,26 @@ def lloyd_path(decoder, fr, steps, extra, batch):
 
 
 @torch.no_grad()
-def evaluate(decoder, X, mean, args, caps, test):
+def evaluate(decoder, X, mean, args, caps):
     """Per token of the decoder's depths [K]: the mse per pixel after it, X routed down the decoder's tree
     (depth d with caps[d] Lloyd steps); the mean Lloyd steps per node; the share of nodes that took all their
-    steps; at each depth to test (test[d]) the z-score of one more step's gain (its mean over the images, in
-    standard errors), else None; and each step's gain, the mse per pixel it takes off the step before's split
-    (the first's off no split), through the look-ahead step at a tested depth (none with --tol)."""
+    steps; and each step's gain, the mse per pixel it takes off the step before's split (the first's off no
+    split; none with --tol)."""
     decoder.eval()
-    fr, mses, steps, capped, zs, gains = root_frontier(X, mean, resident=True), [], [], [], [], []
+    fr, mses, steps, capped, gains = root_frontier(X, mean, resident=True), [], [], [], []
     for depth in range(decoder.depths):
         if args.tol > 0:
             fr, _, s = split(decoder, fr, caps[depth], args.node_batch, args.tol)
-            zs.append(None)
             gains.append([])
         else:
-            s, errs = lloyd_path(decoder, fr, caps[depth], int(test[depth]), args.node_batch)
+            s, errs = lloyd_path(decoder, fr, caps[depth], args.node_batch)
             before = torch.cat([fr.R.square().sum(-1)[None], errs[:-1]])
             gains.append(((before - errs).mean(1) / D).tolist())
-            if test[depth]:
-                gain = errs[-2] - errs[-1]
-                se = gain.std() / len(gain) ** 0.5
-                zs.append(gain.mean().item() / se.item() if se > 0 else (math.inf if gain.mean() > 0 else 0.0))
-            else:
-                zs.append(None)
             fr, _ = children(fr, s)
         mses.append(fr.R.square().mean().item())
         steps.append(s.steps.mean().item())
         capped.append((s.steps >= caps[depth]).float().mean().item())
-    return mses, steps, capped, zs, gains
+    return mses, steps, capped, gains
 
 
 def grow(decoder, opt, depths, starts):
@@ -206,33 +191,6 @@ def grow(decoder, opt, depths, starts):
     for key, value in opt.state.get(p, {}).items():
         if torch.is_tensor(value) and value.shape[:1] == (old,):
             opt.state[p][key] = torch.cat([value, value.new_zeros(len(p) - old, *value.shape[1:])])
-
-
-def decide(control, val, can_step, can_grow, args):
-    """--adaptive's choice after an epoch that ended at val mse val (after the deepest token): every epoch either
-    gives the deepest depth one more Lloyd step ("step"; if can_step) or adds a depth at 1 step ("depth"; if
-    can_grow). An epoch's gain is how much it took off the val the epoch before ended at (or, first, the val
-    before any token); each option is estimated by an EMA of the gains of the epochs it began (the first epoch
-    seeding both). A depth is penalized: it wins only if its estimate is more than --depth-penalty times a
-    step's. When neither is positive or possible, the next epoch goes on as it is ("go"). Updates control and
-    returns the choice."""
-    gains, keep = control["gains"], args.gain_ema
-    gain = control["baseline"] - val
-    started = control["started"]  # what this epoch began: "depth", "step" or None
-    if started is not None:
-        for kind in ("depth", "step") if gains["depth"] is None else (started,):
-            gains[kind] = gain if gains[kind] is None else keep * gains[kind] + (1 - keep) * gain
-    scores = {}
-    if can_step and gains["step"] is not None:
-        scores["step"] = gains["step"]
-    if can_grow and gains["depth"] is not None:
-        scores["depth"] = gains["depth"] / args.depth_penalty
-    choice = max(scores, key=lambda k: scores[k]) if scores else "go"
-    if choice != "go" and scores[choice] <= 0:
-        choice = "go"
-    control["baseline"], control["started"] = val, (None if choice == "go" else choice)
-    control["grow"] = choice == "depth"
-    return choice
 
 
 def psnr(mse):
@@ -249,19 +207,7 @@ def main():
     p.add_argument("--resume", default=None, metavar="CKPT",
                    help="continue from a checkpoint (its architecture and data mean; training settings from now)")
     p.add_argument("--lloyd-steps", type=int, default=4,
-                   help="Lloyd steps per node (with --tol, the most a node takes); without --lloyd-curriculum")
-    p.add_argument("--lloyd-curriculum", action="store_true",
-                   help="each depth starts at 1 Lloyd step and, every epoch, gains one if one more step's val gain "
-                        "is significant (above 2 standard errors)")
-    p.add_argument("--lloyd-max", type=int, default=32,
-                   help="with --lloyd-curriculum or --adaptive, a ceiling no depth's Lloyd steps pass")
-    p.add_argument("--adaptive", action="store_true",
-                   help="every epoch, give the deepest depth one more Lloyd step or add a depth (at 1 step): whichever "
-                        "has given the larger val gain in the epochs it began, a depth's divided by --depth-penalty")
-    p.add_argument("--depth-penalty", type=float, default=4.0,
-                   help="with --adaptive, how many times a step's gain a depth's must be to be chosen")
-    p.add_argument("--gain-ema", type=float, default=0.5,
-                   help="with --adaptive, the weight an estimate's history keeps each epoch")
+                   help="Lloyd steps per node (with --tol, the most a node takes)")
     p.add_argument("--tol", type=float, default=0.0, help="stop a node's Lloyd steps once its hyperplane moves less")
     p.add_argument("--seeded", action="store_true", help="start each node from its parent's predicted direction")
     p.add_argument("--start", choices=("depth", "root"), default="depth",
@@ -273,8 +219,6 @@ def main():
     p.add_argument("--batch", type=int, default=1024, help="training images per step")
     p.add_argument("--chunk", type=int, default=0, help="batch runs of this many images in last epoch's code order")
     p.add_argument("--tf32", action="store_true", help="TF32 matmuls on GPUs that have them (~20%% faster on an L40S)")
-    p.add_argument("--graphs", action="store_true",
-                   help="run full batches' depths as CUDA graphs (CUDA only; no --seeded or --tol)")
     p.add_argument("--max-nodes", type=int, default=256,
                    help="nodes per forward pass; a depth spanning more is run in pieces with accumulated gradients")
     p.add_argument("--node-batch", type=int, default=512, help="nodes split at once when evaluating")
@@ -314,10 +258,6 @@ def main():
     root_top = top_direction(R)
     root_gram = R.T @ R / N
     tracking = not args.seeded and args.start == "depth"
-    assert not (args.lloyd_curriculum or args.adaptive) or (not args.seeded and args.tol == 0), \
-        "--lloyd-curriculum and --adaptive: no --seeded or --tol"
-    assert not (args.lloyd_curriculum and args.adaptive), "--adaptive grows the deepest depth's steps itself"
-    first_cap = 1 if args.lloyd_curriculum or args.adaptive else args.lloyd_steps
 
     torch.manual_seed(args.seed)
     if ckpt is None:
@@ -343,11 +283,7 @@ def main():
     opt = torch.optim.AdamW(decoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     history, step, first, best = [], 0, 0, (math.inf, -1)
     grown = 0.0  # when (in epochs) the decoder last grew
-    caps = [first_cap] * decoder.depths  # each depth's Lloyd steps, part of the tree
-    # --adaptive: each option's estimated val gain per epoch (an EMA; None until measured), the val the last epoch
-    # ended at, and what the next epoch begins ("depth", "step" or None: a depth begins the run)
-    control: dict[str, Any] = dict(gains=dict(step=None, depth=None), started="depth", grow=False,
-                                   baseline=(V - mean).square().mean().item())
+    caps = [args.lloyd_steps] * decoder.depths  # each depth's Lloyd steps, part of the tree
     if ckpt is not None:
         if "optimizer" in ckpt:
             opt.load_state_dict(ckpt["optimizer"])
@@ -358,15 +294,11 @@ def main():
         history, step, first = ckpt["metrics"], ckpt.get("step", 0), ckpt["epoch"] + 1
         grown = max(ckpt.get("grown", -math.inf), first - args.grow_every)  # grow as it resumes, not to catch up
         caps = list(ckpt.get("caps") or [ckpt["args"]["lloyd_steps"]] * decoder.depths)
-        control = ckpt.get("control") or control
         if decoder.depths == K and ckpt.get("best"):
             best = tuple(ckpt["best"])  # the same full depth: early stopping carries on
         log(f"resumed {args.resume} after epoch {ckpt['epoch']} (step {step}), saving to {args.out}")
     step0 = step
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (step0 + s + 1) / args.warmup_steps))
-    graphs = None
-    if args.graphs:
-        assert device.type == "cuda" and not args.seeded and args.tol == 0, "--graphs: CUDA, no --seeded or --tol"
     began = time.time() - (history[-1].get("seconds", 0.0) if history else 0.0)
     codes = None  # each training image's code in the last epoch
 
@@ -375,7 +307,7 @@ def main():
         torch.save(dict(args=vars(args), mean=mean.cpu(), epoch=epoch, step=step, metrics=history, best=best,
                         shared=dict(config=decoder.config,
                                     state_dict={k: v.cpu() for k, v in decoder.state_dict().items()}),
-                        optimizer=opt.state_dict(), tracked=tracked.cpu(), grown=grown, caps=caps, control=control,
+                        optimizer=opt.state_dict(), tracked=tracked.cpu(), grown=grown, caps=caps,
                         grams=None if grams is None else grams.cpu()), args.out)
 
     def fmt(values, digits=5):
@@ -383,17 +315,16 @@ def main():
 
     def add_depth():
         """One more depth, from its start tracked so far (refreshed now), and track the next one's."""
-        nonlocal tracked, grams, graphs
+        nonlocal tracked, grams
         depth = decoder.depths
         if grams is not None:
             refresh(decoder, grams, tracked)
         grow(decoder, opt, depth + 1, tracked[depth:depth + 1])
-        caps.append(first_cap)
+        caps.append(args.lloyd_steps)
         if depth + 1 < K:
             tracked = torch.cat([tracked, root_top[None]])
             if grams is not None:
                 grams = torch.cat([grams, root_gram[None]])
-        graphs = None  # recorded again for the grown parameters
 
     for epoch in range(first, first + args.epochs):
         t0, last = time.time(), time.time()
@@ -403,17 +334,11 @@ def main():
         batches, seen = epoch_batches(N, codes, args, gen), 0
         codes = torch.zeros(N, dtype=torch.int64)
         for i, idx in enumerate(batches):
-            if args.adaptive:
-                if control["grow"]:
-                    add_depth()
-                    control["grow"] = False
-            elif decoder.depths < K and epoch + i / len(batches) - grown >= args.grow_every - 1e-9:
+            if decoder.depths < K and epoch + i / len(batches) - grown >= args.grow_every - 1e-9:
                 add_depth()
                 grown += args.grow_every
-            if args.graphs and graphs is None:  # (re)recorded for the decoder's parameters as they are now
-                graphs = GraphedDepths(decoder, args.batch, args.batch * D)
-            opt.zero_grad(set_to_none=graphs is None)  # graphs add into the gradients' fixed buffers
-            stats, keys = train_step(decoder, X[idx.to(device)], mean, grams, args, caps, graphs)
+            opt.zero_grad(set_to_none=True)
+            stats, keys = train_step(decoder, X[idx.to(device)], mean, grams, args, caps)
             if stats.shape[1] > totals.shape[1]:
                 totals = torch.cat([totals, totals.new_zeros(4, stats.shape[1] - totals.shape[1])], 1)
             totals[:, :stats.shape[1]] += stats
@@ -429,17 +354,7 @@ def main():
                 last = time.time()
                 log.detail(f"    step {step} ({seen}/{N} images this epoch)")
         t1 = time.time()
-        trained_caps = list(caps)
-        test = [args.lloyd_curriculum and c < args.lloyd_max for c in caps]
-        val, val_steps, capped, zs, step_gains = evaluate(decoder, V, mean, args, caps, test)
-        for depth, z in enumerate(zs):  # one more step wherever it would measurably help
-            if args.lloyd_curriculum and z is not None and z > 2:
-                caps[depth] += 1
-        choice = ""
-        if args.adaptive:
-            choice = decide(control, val[-1], caps[-1] < args.lloyd_max, decoder.depths < K, args)
-            if choice == "step":
-                caps[-1] += 1
+        val, val_steps, capped, step_gains = evaluate(decoder, V, mean, args, caps)
         totals = totals[:, :decoder.depths]  # (a depth added mid-epoch counts only the images it saw)
         objective = (totals[0] / (N * D)).tolist()
         pca = (totals[1] / (N * D)).tolist()
@@ -449,22 +364,14 @@ def main():
         if improved:
             best = (val[-1], epoch)
         history.append(dict(epoch=epoch, val_mse=val, objective=objective, pca=pca, train_steps=train_steps,
-                            val_steps=val_steps, val_capped=capped, trained=decoder.depths - 1, caps=trained_caps,
-                            look_ahead=zs, step_gains=step_gains, choice=choice,
-                            gains=dict(control["gains"]) if args.adaptive else None,
-                            seconds=time.time() - began))
+                            val_steps=val_steps, val_capped=capped, trained=decoder.depths - 1, caps=list(caps),
+                            step_gains=step_gains, seconds=time.time() - began))
         plot_depths(history, args.plot or os.path.splitext(args.log)[0] + ".png")
         log(f"  epoch {epoch:2d}: val mse after {decoder.depths} tokens {val[-1]:.6f} (psnr {psnr(val[-1]):.2f} dB); "
             "per depth " + fmt(val) + "; objective per depth " + fmt(objective)
             + (("; pca per depth " + fmt(pca)) if args.seeded else "")
             + "; lloyd steps per depth train " + fmt(train_steps, 2) + ", val " + fmt(val_steps, 2)
             + ", val capped " + fmt(capped, 2) + "; nodes per batch " + fmt((totals[3] / len(batches)).tolist(), 0)
-            + ("; lloyd caps " + " ".join(f"{c}{'+' if new > c else ''}" for c, new in zip(trained_caps, caps))
-               + " (+ one more next epoch), look-ahead z " + " ".join("-" if z is None else f"{z:.1f}" for z in zs)
-               if args.lloyd_curriculum else "")
-            + (f"; chose {choice} (estimated gains, as EMAs: "
-               + ", ".join(f"{k} {'-' if g is None else f'{g:.2e}'}" for k, g in history[-1]["gains"].items())
-               + "; lloyd caps " + " ".join(map(str, caps)) + ")" if args.adaptive else "")
             + f" ({t1 - t0:.0f}s train, {time.time() - t1:.0f}s val){'  *' if improved else ''}")
         if not full or improved:
             save(epoch)  # the latest while growing, then the best

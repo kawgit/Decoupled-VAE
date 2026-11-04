@@ -183,25 +183,6 @@ class SliceDecoder(HistoryReader):
         return self.r_head(f)[:, 0] * scale, torch.sigmoid(self.m_head(f)[:, 0]), u
 
 
-class DeltaDecoder(SliceDecoder):
-    """One depth's decoder, with that depth's scale and Lloyd start (set by the trainer)."""
-
-    scale: Tensor  # the depth's scale
-    start: Tensor  # [D] the depth's first hyperplane's normal
-
-    def __init__(self, depth, scale=1.0, width=256, layers=4, heads=4):
-        super().__init__(depth, width, layers, heads)
-        self.config = dict(depth=depth, scale=scale, width=width, layers=layers, heads=heads)
-        self.register_buffer("scale", torch.tensor(float(scale)))
-        self.register_buffer("start", torch.zeros(D))
-
-    def scale_at(self, k):
-        return self.scale
-
-    def start_at(self, k):
-        return self.start
-
-
 class SharedDecoder(SliceDecoder):
     """One decoder for every depth below depths, with each depth's Lloyd start (set by the trainer; a seeded
     one only uses the root's, its other nodes starting from their parent's predicted direction). Its biases
@@ -504,24 +485,17 @@ def descend(decoder, fr, steps, batch, tol=0.0):
 
 
 def tree_steps(ckpt, depths):
-    """Each depth's Lloyd steps [depths]: a step-curriculum tree's own caps (train_walk.py), else the one
-    --lloyd-steps it was built with."""
+    """Each depth's Lloyd steps [depths]: the checkpoint's own per-depth caps when it has them, else the one
+    --lloyd-steps it was trained with."""
     caps = ckpt.get("caps")
     return list(caps)[:depths] if caps is not None else [ckpt["args"]["lloyd_steps"]] * depths
 
 
 def load_tree(ckpt, device):
-    """A trained tree's decoders, one per depth (the same SharedDecoder at every depth for a one-model tree),
-    from its checkpoint (train.py's or train_walk.py's)."""
-    if "shared" in ckpt:
-        config = dict(ckpt["shared"]["config"], scaled="scales" in ckpt["shared"]["state_dict"],
-                      seeded=any(k.startswith("dir_head.") for k in ckpt["shared"]["state_dict"]))
-        decoder = SharedDecoder(**config).to(device)
-        decoder.load_state_dict(ckpt["shared"]["state_dict"])
-        return [decoder.eval()] * ckpt["shared"]["config"]["depths"]
-    decoders = []
-    for cfg, state in zip(ckpt["configs"], ckpt["decoders"]):
-        decoder = DeltaDecoder(**cfg).to(device)
-        decoder.load_state_dict(state)
-        decoders.append(decoder.eval())
-    return decoders
+    """A trained autoencoder (train_autoencoder.py's checkpoint) as a list of its depths' decoders: the same
+    SharedDecoder at every depth, in eval mode."""
+    config = dict(ckpt["shared"]["config"], scaled="scales" in ckpt["shared"]["state_dict"],
+                  seeded=any(k.startswith("dir_head.") for k in ckpt["shared"]["state_dict"]))
+    decoder = SharedDecoder(**config).to(device)
+    decoder.load_state_dict(ckpt["shared"]["state_dict"])
+    return [decoder.eval()] * ckpt["shared"]["config"]["depths"]
