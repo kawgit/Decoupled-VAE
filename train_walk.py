@@ -14,9 +14,10 @@ depth's top direction, a running average of the batches' remainders' Gram matrix
 eigenvector every --refresh steps. With --tol > 0, a node's Lloyd steps stop once its
 hyperplane moves by less than tol, and at --lloyd-steps at most; the steps taken are logged per depth.
 
-The decoder grows one depth per epoch, from 1 up to --depths (dvae/deltatree.py's SharedDecoder.grow: new history
-positions and a new start), and every step trains all its depths. The batch's split at the deepest one gives the
-next depth's remainders, which track that depth's start for an epoch before it joins.
+The decoder grows one depth every --grow-every epochs (1 by default; fractions grow mid-epoch), from 1 up to
+--depths (dvae/deltatree.py's SharedDecoder.grow: new history positions and a new start), and every step trains
+all its depths. The batch's split at the deepest one gives the next depth's remainders, which track that depth's
+start until it joins.
 
 With --chunk C, batches after the first epoch follow the tree: the training images, sorted by the codes the
 last epoch gave them (token 0 first, ties broken at random), are cut into runs of C, the runs shuffled, and
@@ -171,6 +172,8 @@ def psnr(mse):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--depths", type=int, default=10, help="tokens per code, where the decoder stops growing")
+    p.add_argument("--grow-every", type=float, default=1.0,
+                   help="epochs between depths added (fractions allowed: 0.5 adds two per epoch)")
     p.add_argument("--resume", default=None, metavar="CKPT",
                    help="continue from a checkpoint (its architecture and data mean; training settings from now)")
     p.add_argument("--lloyd-steps", type=int, default=4, help="Lloyd steps (with --tol, the most a node takes)")
@@ -250,6 +253,7 @@ def main():
 
     opt = torch.optim.AdamW(decoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     history, step, first, best = [], 0, 0, (math.inf, -1)
+    grown = 0.0  # when (in epochs) the decoder last grew
     if ckpt is not None:
         if "optimizer" in ckpt:
             opt.load_state_dict(ckpt["optimizer"])
@@ -258,6 +262,7 @@ def main():
         else:
             log("the checkpoint has no optimizer state: AdamW starts afresh")
         history, step, first = ckpt["metrics"], ckpt.get("step", 0), ckpt["epoch"] + 1
+        grown = max(ckpt.get("grown", -math.inf), first - args.grow_every)  # grow as it resumes, not to catch up
         if decoder.depths == K and ckpt.get("best"):
             best = tuple(ckpt["best"])  # the same full depth: early stopping carries on
         log(f"resumed {args.resume} after epoch {ckpt['epoch']} (step {step}), saving to {args.out}")
@@ -274,33 +279,41 @@ def main():
         torch.save(dict(args=vars(args), mean=mean.cpu(), epoch=epoch, step=step, metrics=history, best=best,
                         shared=dict(config=decoder.config,
                                     state_dict={k: v.cpu() for k, v in decoder.state_dict().items()}),
-                        optimizer=opt.state_dict(), tracked=tracked.cpu(),
+                        optimizer=opt.state_dict(), tracked=tracked.cpu(), grown=grown,
                         grams=None if grams is None else grams.cpu()), args.out)
 
     def fmt(values, digits=5):
         return " ".join(f"{v:.{digits}f}" for v in values)
 
+    def add_depth():
+        """One more depth, from its start tracked so far (refreshed now), and track the next one's."""
+        nonlocal tracked, grams, graphs
+        depth = decoder.depths
+        if grams is not None:
+            refresh(decoder, grams, tracked)
+        grow(decoder, opt, depth + 1, tracked[depth:depth + 1])
+        if depth + 1 < K:
+            tracked = torch.cat([tracked, root_top[None]])
+            if grams is not None:
+                grams = torch.cat([grams, root_gram[None]])
+        graphs = None  # recorded again for the grown parameters
+
     for epoch in range(first, first + args.epochs):
-        if epoch > 0 and decoder.depths < K:  # one more depth, from its tracked start
-            depth = decoder.depths
-            grow(decoder, opt, depth + 1, tracked[depth:depth + 1])
-            if depth + 1 < K:  # and track the next one's
-                tracked = torch.cat([tracked, root_top[None]])
-                if grams is not None:
-                    grams = torch.cat([grams, root_gram[None]])
-            graphs = None
-        if args.graphs and graphs is None:  # (re)recorded for the decoder's parameters as they are now
-            graphs = GraphedDepths(decoder, args.batch, args.lloyd_steps, args.batch * D)
         t0, last = time.time(), time.time()
         decoder.train()
-        totals = torch.zeros(4, decoder.depths, device=device)
+        totals = torch.zeros(4, K, device=device)
         gen = torch.Generator().manual_seed(args.seed * 1_000_003 + epoch)
         batches, seen = epoch_batches(N, codes, args, gen), 0
         codes = torch.zeros(N, dtype=torch.int64)
-        for idx in batches:
+        for i, idx in enumerate(batches):
+            if decoder.depths < K and epoch + i / len(batches) - grown >= args.grow_every - 1e-9:
+                add_depth()
+                grown += args.grow_every
+            if args.graphs and graphs is None:  # (re)recorded for the decoder's parameters as they are now
+                graphs = GraphedDepths(decoder, args.batch, args.lloyd_steps, args.batch * D)
             opt.zero_grad(set_to_none=graphs is None)  # graphs add into the gradients' fixed buffers
             stats, keys = train_step(decoder, X[idx.to(device)], mean, grams, args, graphs)
-            totals += stats
+            totals[:, :len(stats[0])] += stats
             codes[idx] = keys
             seen += len(idx)
             torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
@@ -314,6 +327,7 @@ def main():
                 log(f"    step {step} ({seen}/{N} images this epoch)")
         t1 = time.time()
         val, val_steps, capped = evaluate(decoder, V, mean, args)
+        totals = totals[:, :decoder.depths]  # (a depth added mid-epoch counts only the images it saw)
         objective = (totals[0] / (N * D)).tolist()
         pca = (totals[1] / (N * D)).tolist()
         train_steps = (totals[2] / totals[3].clamp_min(1)).tolist()
