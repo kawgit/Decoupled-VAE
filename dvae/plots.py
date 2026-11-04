@@ -56,7 +56,7 @@ def plot_depths(history, path):
     by_epoch.annotate(f"best {final[best]:.4f}", (xs[best], final[best]), textcoords="offset points",
                       xytext=(0, 10), ha="right" if best > 0.8 * len(xs) else "center", fontsize=9, color=INK)
     by_epoch.xaxis.set_major_locator(MaxNLocator(integer=True))
-    _style(by_epoch, f"Val mse after {K} tokens by epoch", "epoch", "val mse")
+    _style(by_epoch, f"Val mse after each epoch's last token ({K} now) by epoch", "epoch", "val mse")
 
     fig.tight_layout()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

@@ -202,7 +202,8 @@ class SharedDecoder(SliceDecoder):
     """One decoder for every depth below depths, with each depth's Lloyd start (set by the trainer; a seeded
     one only uses the root's, its other nodes starting from their parent's predicted direction). Its biases
     and deltas are in pixel units, its depth's scale being its own to learn; scaled=True keeps a scale per
-    depth, as the first one-stage trees did."""
+    depth, as the first one-stage trees did. grow adds depths: the only parts sized by them are the history
+    positions, each drawn from its own seed (so a row is the same whenever it is added), and the starts."""
 
     starts: Tensor  # [depths, D]
     scales: Tensor  # [depths], when scaled
@@ -211,9 +212,32 @@ class SharedDecoder(SliceDecoder):
         super().__init__(depths, width, layers, heads, seeded)
         self.config = dict(depths=depths, width=width, layers=layers, heads=heads, scaled=scaled, seeded=seeded)
         self.scaled = scaled
+        with torch.no_grad():
+            self.position.copy_(self.position_rows(0, len(self.position)))
         self.register_buffer("starts", torch.zeros(depths, D))
         if scaled:
             self.register_buffer("scales", torch.ones(depths))
+
+    @property
+    def depths(self):
+        return self.starts.shape[0]
+
+    def position_rows(self, first, last):
+        """History positions first..last - 1 [last - first, W], row i drawn from seed i."""
+        rows = [torch.randn(self.width, generator=torch.Generator().manual_seed(i)) for i in range(first, last)]
+        return (torch.stack(rows) if rows else torch.zeros(0, self.width)) * 0.02
+
+    @torch.no_grad()
+    def grow(self, depths, starts):
+        """Extend to depths, the new depths starting from starts [depths - self.depths, D]. The position
+        parameter keeps its identity (an optimizer's state for it must grow to match) and loses its gradient."""
+        p = self.position
+        p.data = torch.cat([p.data, self.position_rows(len(p), max(1, depths)).to(p)])
+        p.grad = None
+        self.starts = torch.cat([self.starts, starts.to(self.starts)])
+        if self.scaled:
+            self.scales = torch.cat([self.scales, self.scales.new_ones(depths - len(self.scales))])
+        self.config["depths"] = depths
 
     def scale_at(self, k):
         return self.scales[k] if self.scaled else 1.0
@@ -355,9 +379,14 @@ def chunk_sse(decoder, fr, imgs, steps, select=False, tol=0.0, dir_weight=1.0):
     image's remainder after the split, less its projection on its side's predicted direction). Also returns
     the reconstruction error's own sum (detached; 0 when not seeded); with select, what the last step's split
     does to the images (their squared error before and after it and the bits of their tokens); the chunk's
-    nodes [b]; and their Split (detached)."""
-    R = fr.R[imgs]
-    nodes, inverse = torch.unique(fr.node[imgs], return_inverse=True)
+    nodes [b]; and their Split (detached). imgs=None takes all of fr, whose nodes are known without asking the
+    GPU (so without waiting for it)."""
+    if imgs is None:
+        R, inverse = fr.R, fr.node
+        nodes = torch.arange(len(fr.bits), device=R.device)
+    else:
+        R = fr.R[imgs]
+        nodes, inverse = torch.unique(fr.node[imgs], return_inverse=True)
     B, device = len(nodes), R.device
     mems = decoder.memory(*fr.history(nodes, device))
     all_n = R.new_zeros(B).index_add_(0, inverse, R.new_ones(len(R)))

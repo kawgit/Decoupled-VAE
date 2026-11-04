@@ -58,13 +58,20 @@ def main():
     X = pixels(load_mnist("train")).to(device)
     mean = X.mean(0)
     torch.manual_seed(0)
-    dec = SharedDecoder(a.depths, a.width, a.layers, a.heads).to(device)
     R = X - mean
-    with torch.no_grad():
-        dec.starts.copy_(top_direction(R).expand(a.depths, D))
-    if a.ckpt:
-        dec.load_state_dict(torch.load(a.ckpt, map_location=device, weights_only=False)["shared"]["state_dict"])
-    grams = (R.T @ R / len(R)).expand(a.depths, D, D).clone()
+    top = top_direction(R)
+    if a.ckpt:  # its own architecture, grown to --depths if shallower
+        shared = torch.load(a.ckpt, map_location=device, weights_only=False)["shared"]
+        dec = SharedDecoder(**shared["config"]).to(device)
+        dec.load_state_dict(shared["state_dict"])
+        if dec.depths < a.depths:
+            dec.grow(a.depths, top.expand(a.depths - dec.depths, D))
+    else:
+        dec = SharedDecoder(a.depths, a.width, a.layers, a.heads).to(device)
+        with torch.no_grad():
+            dec.starts.copy_(top.expand(a.depths, D))
+    tracked = dec.starts.detach().clone()
+    grams = (R.T @ R / len(R)).expand(dec.depths, D, D).clone()
     opt = torch.optim.AdamW(dec.parameters(), lr=1e-4)
     args = SimpleNamespace(depths=a.depths, max_nodes=a.max_nodes, lloyd_steps=a.lloyd_steps, tol=0.0,
                            dir_weight=1.0, batch=a.batch, ema=0.95)
@@ -77,7 +84,7 @@ def main():
             for g in (None, graphs):
                 for q in dec.parameters():
                     q.grad = torch.zeros_like(q) if q.grad is None else q.grad.zero_()
-                stats, keys = train_step(dec, X[idx], mean, None, args, a.depths - 1, g)
+                stats, keys = train_step(dec, X[idx], mean, None, args, g)
                 results.append((stats, keys, torch.cat([q.grad.flatten() for q in dec.parameters()
                                                         if q.grad is not None])))
             (s0, k0, g0), (s1, k1, g1) = results
@@ -88,7 +95,7 @@ def main():
         idx = torch.randint(len(X), (a.batch,), generator=gen).to(device)
         opt.zero_grad(set_to_none=graphs is None)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=a.amp):
-            stats, _ = train_step(dec, X[idx], mean, grams, args, a.depths - 1, graphs)
+            stats, _ = train_step(dec, X[idx], mean, grams, args, graphs)
         torch.nn.utils.clip_grad_norm_(dec.parameters(), 1.0)
         opt.step()
         return stats
@@ -102,7 +109,7 @@ def main():
     sync()
     per = (time.time() - t0) / a.steps
     t1 = time.time()
-    refresh(dec, grams)
+    refresh(dec, grams, tracked)
     sync()
     peak = torch.cuda.max_memory_allocated() / 2**30 if device.type == "cuda" else 0.0
     gpu = torch.cuda.get_device_name() if device.type == "cuda" else device.type
