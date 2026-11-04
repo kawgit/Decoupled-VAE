@@ -37,11 +37,13 @@ from dvae.prior import load_prior, token_bits  # noqa: E402
 class Leaves:
     """One split's images at their codes' nodes after k tokens, as the decoder reads them: delta histories
     [N, k, D] (half precision), sides and ms [N, k], predicted means [N, D] and grey levels [N, D] (uint8), on
-    the CPU."""
+    the CPU. The deltas overwrite codes.r in place (a full dump's r is ~8 GB), so price the codes first."""
 
     def __init__(self, codes: Codes, images, k, chunk=4096):
-        self.deltas = torch.cat([deltas(codes.r[i:i + chunk, :k].float(), codes.m[i:i + chunk, :k].float(),
-                                        codes.rare[i:i + chunk, :k]).half() for i in range(0, len(codes), chunk)])
+        for i in range(0, len(codes), chunk):
+            codes.r[i:i + chunk] = deltas(codes.r[i:i + chunk].float(), codes.m[i:i + chunk].float(),
+                                          codes.rare[i:i + chunk]).half()
+        self.deltas = codes.r[:, :k]
         self.sides = codes.rare[:, :k].float() * 2 - 1
         self.ms = codes.m[:, :k].float()
         self.mu = torch.cat([codes.mean + self.deltas[i:i + chunk].float().sum(1)
@@ -102,14 +104,14 @@ def main():
     codes = {s: load_codes(os.path.join(args.codes, f"{s}.pt")) for s in ("train", "val", "test")}
     K = args.tokens or codes["train"].depths
     assert K <= codes["train"].depths, f"--tokens {K}: the codes have {codes['train'].depths}"
-    leaves = {s: Leaves(c, load_mnist(s, args.data_root)[:len(c)], K) for s, c in codes.items()}
     prior = load_prior(torch.load(args.prior, map_location=device, weights_only=False), device) if args.prior else None
-    code_bits = {}
+    code_bits, leaves = {}, {}
     for s, c in codes.items():  # each image's code's bits, under the prior or the autoencoder's own shares
         if prior is not None:
             code_bits[s] = token_bits(prior, c.rare, c.m, c.r, device)[:, :K].sum(1)
         else:
             code_bits[s] = bits_of(own_shares(c.m[:, :K].float()), c.rare[:, :K]).sum(1)
+        leaves[s] = Leaves(c, load_mnist(s, args.data_root)[:len(c)], K)
         mse = (leaves[s].mu - leaves[s].levels.float().add(0.5).div(256)).square().mean().item()
         log(f"{s}: {len(c)} codes of {K} tokens, {code_bits[s].mean().item():.2f} bits each "
             f"({'prior' if prior is not None else 'own shares'}), mean image mse {mse:.5f}")
