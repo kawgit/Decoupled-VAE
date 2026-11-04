@@ -1,10 +1,10 @@
 """Compression and generation QA for a delta tree (train.py).
 
-Compression: test images, each followed by its node's predicted mean after every token (the decoder's
-reconstruction), and in a second grid by the mean of the training images in that same node (what an ideal
-decoder of the same tree would show; blank where the node holds none). Generation: codes sampled token by
-token from the decoders' own shares (the rare side with probability p = m / (1 + m)), shown as their
-predicted means after every token.
+Compression: test images, each followed by its node's predicted mean after a spread of token counts ending with
+the last (the decoder's reconstruction), and with --train-means a second grid of the mean of the training images
+in that same node (what an ideal decoder of the same tree would show; blank where the node holds none).
+Generation: codes sampled token by token from the decoders' own shares (the rare side with probability
+p = m / (1 + m)), shown as their predicted means after a spread of token counts ending with the last.
 """
 
 import argparse
@@ -43,11 +43,21 @@ def sample(decoders, mean, n, steps, batch, tol, generator):
     return torch.stack(out, 1)
 
 
+def columns(K, n):
+    """n token counts from 1 to K, evenly spread and ending with K (all of them when K <= n)."""
+    if K <= n:
+        return list(range(1, K + 1))
+    return [round(1 + (K - 1) * i / (n - 1)) for i in range(n)]
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--ckpt", default="checkpoints/deltatree.pt")
     p.add_argument("-n", type=int, default=16, help="test images to compress")
     p.add_argument("--generate", type=int, default=16, help="codes to sample")
+    p.add_argument("--cols", type=int, default=16, help="columns per grid (compression's first is the image)")
+    p.add_argument("--train-means", action="store_true",
+                   help="also show each test image's node as its training images' mean (sends all of them down)")
     p.add_argument("--out", default=None, help="folder for the pictures (default: the run's artifacts folder)")
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=0)
@@ -62,39 +72,47 @@ def main():
     args.out = args.out or artifact("")
     os.makedirs(args.out, exist_ok=True)
 
-    # every test image's and every training image's code and predicted mean after each token
+    # every test image's (and with --train-means every training image's) code and predicted mean after each token
     X = pixels(load_mnist("test", args.data_root)[:args.n]).to(device)
-    T = pixels(load_mnist("train", args.data_root)).to(device)
-    fr = {"test": root_frontier(X, mean), "train": root_frontier(T, mean)}
+    T = pixels(load_mnist("train", args.data_root)).to(device) if args.train_means else X[:0]
+    fr = {"test": root_frontier(X, mean)}
+    if args.train_means:
+        fr["train"] = root_frontier(T, mean)
     preds, empirical = [X], [X]
     for decoder, depth_steps in zip(decoders, steps):
         fr = {split: descend(decoder, f, depth_steps, batch, tol) for split, f in fr.items()}
         preds.append(X - fr["test"].R)
-        code = fr["test"].bits[fr["test"].node.cpu()]
-        train_code = fr["train"].bits[fr["train"].node.cpu()]
-        row = []
-        for c in code.tolist():
-            inside = (train_code == c).nonzero()[:, 0].to(device)
-            row.append(T[inside].mean(0) if len(inside) else torch.zeros(D, device=device))
-        empirical.append(torch.stack(row))
-    counts = [int((fr["train"].bits[fr["train"].node.cpu()] == c).sum()) for c in
-              fr["test"].bits[fr["test"].node.cpu()].tolist()]
+        if args.train_means:
+            code = fr["test"].bits[fr["test"].node.cpu()]
+            train_code = fr["train"].bits[fr["train"].node.cpu()]
+            row = []
+            for c in code.tolist():
+                inside = (train_code == c).nonzero()[:, 0].to(device)
+                row.append(T[inside].mean(0) if len(inside) else torch.zeros(D, device=device))
+            empirical.append(torch.stack(row))
     mse = [(preds[k] - X).square().mean().item() for k in range(1, K + 1)]
     print(f"test mse after 1..{K} tokens: " + ", ".join(f"{v:.4f}" for v in mse))
-    print(f"training images in each test image's node after {K} tokens: {counts}")
 
+    shown = columns(K, args.cols - 1)
+    cols = [0] + shown
     path = os.path.join(args.out, "compress.png")
-    save_grid(torch.stack(preds, 1).clamp(0, 1).reshape(-1, 1, 28, 28), path, nrow=1 + K)
-    print(f"{path}: rows are test images, then the decoder's predicted mean after 1..{K} tokens")
-    path = os.path.join(args.out, "compress_train_means.png")
-    save_grid(torch.stack(empirical, 1).clamp(0, 1).reshape(-1, 1, 28, 28), path, nrow=1 + K)
-    print(f"{path}: rows are test images, then the mean of the training images in the same node after 1..{K} tokens")
+    save_grid(torch.stack(preds, 1)[:, cols].clamp(0, 1).reshape(-1, 1, 28, 28), path, nrow=len(cols))
+    print(f"{path}: rows are test images, then the decoder's predicted mean after {shown} tokens")
+    if args.train_means:
+        counts = [int((fr["train"].bits[fr["train"].node.cpu()] == c).sum()) for c in
+                  fr["test"].bits[fr["test"].node.cpu()].tolist()]
+        print(f"training images in each test image's node after {K} tokens: {counts}")
+        path = os.path.join(args.out, "compress_train_means.png")
+        save_grid(torch.stack(empirical, 1)[:, cols].clamp(0, 1).reshape(-1, 1, 28, 28), path, nrow=len(cols))
+        print(f"{path}: rows are test images, then the mean of the training images in the same node after "
+              f"{shown} tokens")
 
     gen = torch.Generator().manual_seed(args.seed)
     xs = sample(decoders, mean, args.generate, steps, batch, tol, gen)
+    shown = columns(K, args.cols)
     path = os.path.join(args.out, "generate.png")
-    save_grid(xs.clamp(0, 1).reshape(-1, 1, 28, 28), path, nrow=K)
-    print(f"{path}: rows are sampled codes, shown as their predicted mean after 1..{K} tokens")
+    save_grid(xs[:, [k - 1 for k in shown]].clamp(0, 1).reshape(-1, 1, 28, 28), path, nrow=len(shown))
+    print(f"{path}: rows are sampled codes, shown as their predicted mean after {shown} tokens")
 
 
 if __name__ == "__main__":
