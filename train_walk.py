@@ -37,9 +37,12 @@ os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.4")
 
 import torch  # noqa: E402
 
-from dvae.data import load_mnist  # noqa: E402
+from dvae.artifacts import artifact  # noqa: E402
+from dvae.data import get_device, load_mnist  # noqa: E402
+from dvae.logs import RunLog  # noqa: E402
 from dvae.deltatree import (D, SharedDecoder, Split, by_nodes, cat_splits, children, chunk_sse,  # noqa: E402
                             node_order, pixels, root_frontier, split, top_direction)
+from dvae.graphs import GraphedDepths  # noqa: E402
 from dvae.plots import plot_depths  # noqa: E402
 
 
@@ -68,33 +71,44 @@ def fold(grams, depth, R, ema):
     grams[depth].mul_(ema).add_(R.T @ R / len(R), alpha=1 - ema)
 
 
-def train_step(decoder, X, mean, grams, args, active):
+def depth_step(decoder, fr, args):
+    """One depth of train_step, in pieces of at most --max-nodes nodes: the objective and PCA error summed over
+    fr's images (backward done) and every node's Split."""
+    order, _ = node_order(fr)
+    total, pca_total = fr.R.new_zeros(()), fr.R.new_zeros(())
+    ids, parts = [], []
+    for piece in by_nodes(order, fr.node[order], args.max_nodes):
+        sse, pca, _, piece_nodes, s = chunk_sse(decoder, fr, piece, args.lloyd_steps, tol=args.tol,
+                                                dir_weight=args.dir_weight)
+        (sse / (args.batch * D)).backward()  # a fixed divisor, so every image weighs the same
+        total, pca_total = total + sse.detach(), pca_total + pca
+        ids.append(piece_nodes)
+        parts.append(s)
+    s = cat_splits(parts)
+    whole = torch.argsort(torch.cat(ids))  # pieces hold whole nodes, in node order
+    return total, pca_total, Split(s.n[whole], s.b[whole], s.r[whole], s.m[whole],
+                                   None if s.u is None else s.u[whole], s.steps[whole])
+
+
+def train_step(decoder, X, mean, grams, args, active, graphs: GraphedDepths | None = None):
     """Send the batch X down depths 0..active as decoder splits them, accumulating each depth's gradient; without
     seeds, fold the remainders each depth sees into its running Gram matrix (grams [K, D, D]), and depth
     active + 1's too. Returns, per depth [K] (0 past active): the objective and the PCA reconstruction error
     summed over the batch, and the Lloyd steps taken and nodes split; and each image's key (child_key) at the
-    deepest depth it reached [b], on the CPU."""
+    deepest depth it reached [b], on the CPU. With graphs, a full batch's depths run as CUDA graphs."""
     K = args.depths
-    fr = root_frontier(X, mean)
+    fr = root_frontier(X, mean, resident=True)
     zero = X.new_zeros(())
     sses, pcas, steps, nodes = [zero] * K, [zero] * K, [zero] * K, [zero] * K
     for depth in range(active + 1):
         R = fr.R
         if grams is not None:
             fold(grams, depth, R, args.ema)
-        order, _ = node_order(fr)
-        total, pca_total = R.new_zeros(()), R.new_zeros(())
-        ids, parts = [], []
-        for piece in by_nodes(order, fr.node[order], args.max_nodes):
-            sse, pca, _, piece_nodes, s = chunk_sse(decoder, fr, piece, args.lloyd_steps, tol=args.tol,
-                                                    dir_weight=args.dir_weight)
-            (sse / (args.batch * D)).backward()  # a fixed divisor, so every image weighs the same
-            total, pca_total = total + sse.detach(), pca_total + pca
-            ids.append(piece_nodes)
-            parts.append(s)
-        s = cat_splits(parts)
-        whole = torch.argsort(torch.cat(ids))  # pieces hold whole nodes, in node order
-        s = Split(s.n[whole], s.b[whole], s.r[whole], s.m[whole], None if s.u is None else s.u[whole], s.steps[whole])
+        if graphs is not None and len(X) == graphs.batch:
+            total, s = graphs.run(fr)
+            pca_total = zero
+        else:
+            total, pca_total, s = depth_step(decoder, fr, args)
         sses[depth], pcas[depth] = total, pca_total
         steps[depth], nodes[depth] = s.steps.sum(), R.new_tensor(float(len(s.steps)))
         if depth + 1 < K:
@@ -102,14 +116,15 @@ def train_step(decoder, X, mean, grams, args, active):
             if depth == active and grams is not None:
                 fold(grams, depth + 1, fr.R, args.ema)  # the next depth's start, watched before it trains
     return torch.stack([torch.stack(sses), torch.stack(pcas), torch.stack(steps), torch.stack(nodes)]), \
-        fr.bits[fr.node.cpu()]
+        fr.bits[fr.node.to(fr.bits.device)].cpu()
 
 
 @torch.no_grad()
 def refresh(decoder, grams):
     """Each depth's start from its running Gram matrix; a start keeps its sign from before."""
     for depth, gram in enumerate(grams):
-        top = torch.linalg.eigh(gram.cpu().double())[1][:, -1].float().to(gram.device)
+        gram = gram.double() if gram.device.type == "cuda" else gram.cpu().double()  # MPS has no float64
+        top = torch.linalg.eigh(gram)[1][:, -1].float().to(decoder.starts.device)
         decoder.starts[depth] = top if top @ decoder.starts[depth] >= 0 else -top
 
 
@@ -118,7 +133,7 @@ def evaluate(decoder, X, mean, args):
     """Per token [K]: the mse per pixel after it, X routed down the decoder's tree; the mean Lloyd steps per
     node; and the share of nodes that took all --lloyd-steps."""
     decoder.eval()
-    fr, mses, steps, capped = root_frontier(X, mean), [], [], []
+    fr, mses, steps, capped = root_frontier(X, mean, resident=True), [], [], []
     for _ in range(args.depths):
         fr, _, s = split(decoder, fr, args.lloyd_steps, args.node_batch, args.tol)
         mses.append(fr.R.square().mean().item())
@@ -145,6 +160,9 @@ def main():
     p.add_argument("--heads", type=int, default=4)
     p.add_argument("--batch", type=int, default=1024, help="training images per step")
     p.add_argument("--chunk", type=int, default=0, help="batch runs of this many images in last epoch's code order")
+    p.add_argument("--tf32", action="store_true", help="TF32 matmuls on GPUs that have them (~20%% faster on an L40S)")
+    p.add_argument("--graphs", action="store_true",
+                   help="run full batches' depths as CUDA graphs (CUDA only; no --seeded or --tol)")
     p.add_argument("--max-nodes", type=int, default=256,
                    help="nodes per forward pass; a depth spanning more is run in pieces with accumulated gradients")
     p.add_argument("--node-batch", type=int, default=512, help="nodes split at once when evaluating")
@@ -158,24 +176,19 @@ def main():
     p.add_argument("--patience", type=int, default=5)
     p.add_argument("--limit-train", type=int, default=None)
     p.add_argument("--limit-val", type=int, default=None)
-    p.add_argument("--out", default="checkpoints/deltatree_walk.pt")
-    p.add_argument("--log", default="outputs/deltatree_walk.log")
+    p.add_argument("--out", default=None, help="checkpoint (default: model.pt in the run's artifacts folder)")
+    p.add_argument("--log", default=None, help="summary log (default: run.log in the run's artifacts folder)")
     p.add_argument("--plot", default=None, help="progress plot, redrawn every epoch (default: --log's path as .png)")
     p.add_argument("--log-interval", type=float, default=30.0, help="seconds between step logs")
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--data-root", default="data")
     args = p.parse_args()
+    args.out, args.log = args.out or artifact("model.pt"), args.log or artifact("run.log")
 
-    device = torch.device(args.device or ("mps" if torch.backends.mps.is_available() else "cpu"))
-    os.makedirs(os.path.dirname(args.log) or ".", exist_ok=True)
-    logf = open(args.log, "a")
-
-    def log(msg):
-        msg = f"{time.strftime('%H:%M:%S')} {msg}"
-        print(msg, flush=True)
-        logf.write(msg + "\n")
-        logf.flush()
+    device = get_device(args.device)
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32
+    log = RunLog(args.log, device)
 
     log(f"=== {time.strftime('%Y-%m-%d')} {vars(args)}")
     X = pixels(load_mnist("train", args.data_root)[:args.limit_train]).to(device)
@@ -193,11 +206,15 @@ def main():
         grams = (R.T @ R / N).expand(K, D, D).clone()
     log(f"shared decoder: {sum(q.numel() for q in decoder.parameters()) / 1e6:.1f}M parameters, {K} depths")
 
+    graphs = None
+    if args.graphs:
+        assert device.type == "cuda" and not args.seeded and args.tol == 0, "--graphs: CUDA, no --seeded or --tol"
+        graphs = GraphedDepths(decoder, args.batch, args.lloyd_steps, args.batch * D)
     opt = torch.optim.AdamW(decoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / args.warmup_steps))
     gen = torch.Generator().manual_seed(args.seed)
     best: tuple[float, int, dict | None] = (math.inf, -1, None)
-    history, step = [], 0
+    history, step, began = [], 0, time.time()
     active = K - 1  # the deepest depth trained
     codes = None  # each training image's code in the last epoch
 
@@ -218,8 +235,8 @@ def main():
         batches, seen = epoch_batches(N, codes, args, gen), 0
         codes = torch.zeros(N, dtype=torch.int64)
         for idx in batches:
-            opt.zero_grad(set_to_none=True)
-            stats, keys = train_step(decoder, X[idx.to(device)], mean, grams, args, active)
+            opt.zero_grad(set_to_none=graphs is None)  # graphs add into the gradients' fixed buffers
+            stats, keys = train_step(decoder, X[idx.to(device)], mean, grams, args, active, graphs)
             totals += stats
             codes[idx] = keys
             seen += len(idx)
@@ -239,7 +256,8 @@ def main():
         train_steps = (totals[2] / totals[3].clamp_min(1)).tolist()
         trained = active
         history.append(dict(epoch=epoch, val_mse=val, objective=objective, pca=pca, train_steps=train_steps,
-                            val_steps=val_steps, val_capped=capped, trained=trained))
+                            val_steps=val_steps, val_capped=capped, trained=trained,
+                            seconds=time.time() - began))
         plot_depths(history, args.plot or os.path.splitext(args.log)[0] + ".png")
         improved = trained == K - 1 and val[-1] < best[0]
         log(f"  epoch {epoch:2d}: val mse after {K} tokens {val[-1]:.6f} (psnr {psnr(val[-1]):.2f} dB); per depth "

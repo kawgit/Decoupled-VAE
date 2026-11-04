@@ -19,7 +19,9 @@ os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.4")
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
-from dvae.data import load_mnist  # noqa: E402
+from dvae.artifacts import artifact  # noqa: E402
+from dvae.data import get_device, load_mnist  # noqa: E402
+from dvae.logs import RunLog  # noqa: E402
 from dvae.deltatree import D, LeafDecoder, load_tree, pixels, root_frontier, split  # noqa: E402
 
 
@@ -42,7 +44,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--ckpt", default="checkpoints/deltatree.pt", help="the tree (train.py)")
     p.add_argument("--tokens", type=int, default=None, help="code length (default: all the tree's depths)")
-    p.add_argument("--out", default=None, help="leaf decoder checkpoint (default: --ckpt with _leaf)")
+    p.add_argument("--out", default=None,
+                   help="leaf decoder checkpoint (default: leaf.pt in the run's artifacts folder)")
     p.add_argument("--width", type=int, default=256)
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--heads", type=int, default=4)
@@ -53,24 +56,15 @@ def main():
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--patience", type=int, default=3)
     p.add_argument("--limit-test", type=int, default=None)
-    p.add_argument("--results", default=None, help="results prefix (default: results/<ckpt name>_leaf)")
-    p.add_argument("--log", default="outputs/deltatree_leaf.log")
+    p.add_argument("--results", default=None, help="results prefix (default: results in the run's artifacts folder)")
+    p.add_argument("--log", default=None, help="summary log (default: run.log in the run's artifacts folder)")
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--data-root", default="data")
     args = p.parse_args()
-    device = torch.device(args.device or ("mps" if torch.backends.mps.is_available() else "cpu"))
-    name = os.path.splitext(os.path.basename(args.ckpt))[0]
-    out = args.out or args.ckpt.replace(".pt", "_leaf.pt")
-    results = args.results or f"results/{name}_leaf"
-    os.makedirs(os.path.dirname(args.log) or ".", exist_ok=True)
-    logf = open(args.log, "a")
-
-    def log(msg):
-        msg = f"{time.strftime('%H:%M:%S')} {msg}"
-        print(msg, flush=True)
-        logf.write(msg + "\n")
-        logf.flush()
+    device = get_device(args.device)
+    out, results = args.out or artifact("leaf.pt"), args.results or artifact("results")
+    log = RunLog(args.log or artifact("run.log"), device)
 
     log(f"=== {time.strftime('%Y-%m-%d')} {vars(args)}")
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)

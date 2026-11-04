@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlparse
 import torch
 from PIL import Image
 
-from dvae.data import load_mnist
+from dvae.data import get_device, load_mnist
 from dvae.deltatree import D, child_key, load_tree, node_order, pixels, root_frontier, split
 
 
@@ -173,7 +173,7 @@ def main():
     p.add_argument("--device", default=None)
     p.add_argument("--data-root", default="data")
     args = p.parse_args()
-    device = torch.device(args.device or ("mps" if torch.backends.mps.is_available() else "cpu"))
+    device = get_device(args.device)
 
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     decoders, a = load_tree(ckpt, device), ckpt["args"]

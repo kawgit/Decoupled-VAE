@@ -27,18 +27,14 @@ os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.4")
 
 import torch  # noqa: E402
 
-from dvae.data import load_mnist  # noqa: E402
+from dvae.artifacts import artifact  # noqa: E402
+from dvae.data import get_device, load_mnist  # noqa: E402
+from dvae.logs import RunLog  # noqa: E402
 from dvae.deltatree import (D, DeltaDecoder, Frontier, by_nodes, chunk_sse, descend, node_order,  # noqa: E402
                             pixels, root_frontier, top_direction)
 
 
 TREE_ARGS = ("lloyd_steps", "limit_train", "limit_val", "data_root")
-
-
-def get_device(name):
-    if name:
-        return torch.device(name)
-    return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 
 def train_chunks(fr, size, gen):
@@ -149,25 +145,19 @@ def main():
     p.add_argument("--patience", type=int, default=3)
     p.add_argument("--limit-train", type=int, default=None)
     p.add_argument("--limit-val", type=int, default=None)
-    p.add_argument("--out", default="checkpoints/deltatree.pt")
+    p.add_argument("--out", default=None, help="checkpoint (default: model.pt in the run's artifacts folder)")
     p.add_argument("--resume", nargs="?", const="", default=None, metavar="CKPT",
                    help="deepen CKPT (default: --out): replay its decoders, then train the depths after them")
-    p.add_argument("--log", default="outputs/deltatree.log")
+    p.add_argument("--log", default=None, help="summary log (default: run.log in the run's artifacts folder)")
     p.add_argument("--log-interval", type=float, default=10.0, help="seconds between step logs")
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--data-root", default="data")
     args = p.parse_args()
+    args.out, args.log = args.out or artifact("model.pt"), args.log or artifact("run.log")
 
     device = get_device(args.device)
-    os.makedirs(os.path.dirname(args.log) or ".", exist_ok=True)
-    logf = open(args.log, "a")
-
-    def log(msg):
-        msg = f"{time.strftime('%H:%M:%S')} {msg}"
-        print(msg, flush=True)
-        logf.write(msg + "\n")
-        logf.flush()
+    log = RunLog(args.log, device)
 
     ckpt = None
     if args.resume is not None:

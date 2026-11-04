@@ -8,6 +8,15 @@ NUM_VAL = 5000
 SPLIT_SEED = 0  # fixed so every stage sees the same train/val split
 
 
+def get_device(name=None):
+    """The named device, else the best available: CUDA, then Apple's MPS, then the CPU."""
+    if name:
+        return torch.device(name)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+
 def _load(split, root):
     dataset = MNIST(root, train=split != "test", download=True)
     images, labels = dataset.data, dataset.targets

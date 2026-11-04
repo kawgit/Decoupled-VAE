@@ -12,7 +12,8 @@ import os
 
 import torch
 
-from dvae.data import load_mnist
+from dvae.artifacts import artifact
+from dvae.data import get_device, load_mnist
 from dvae.deltatree import D, Frontier, child_key, choose, descend, load_tree, pixels, root_frontier
 from dvae.viz import save_grid
 
@@ -46,17 +47,18 @@ def main():
     p.add_argument("--ckpt", default="checkpoints/deltatree.pt")
     p.add_argument("-n", type=int, default=16, help="test images to compress")
     p.add_argument("--generate", type=int, default=16, help="codes to sample")
-    p.add_argument("--out", default="outputs/deltatree")
+    p.add_argument("--out", default=None, help="folder for the pictures (default: the run's artifacts folder)")
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--data-root", default="data")
     args = p.parse_args()
-    device = torch.device(args.device or ("mps" if torch.backends.mps.is_available() else "cpu"))
+    device = get_device(args.device)
 
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     decoders = load_tree(ckpt, device)
     a, mean = ckpt["args"], ckpt["mean"].to(device)
     steps, batch, K, tol = a["lloyd_steps"], a["node_batch"], len(decoders), a.get("tol", 0.0)
+    args.out = args.out or artifact("")
     os.makedirs(args.out, exist_ok=True)
 
     # every test image's and every training image's code and predicted mean after each token

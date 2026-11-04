@@ -15,7 +15,8 @@ import os
 
 import torch
 
-from dvae.data import load_mnist
+from dvae.artifacts import artifact
+from dvae.data import get_device, load_mnist
 from dvae.deltatree import D, load_tree, pixels, root_frontier, split
 
 
@@ -36,11 +37,11 @@ def main():
     p.add_argument("--buckets", type=int, default=64, help="bins of the predicted mean the level model conditions on")
     p.add_argument("--alpha", type=float, default=0.5, help="added to every level count")
     p.add_argument("--limit-test", type=int, default=None)
-    p.add_argument("--results", default="results/deltatree_benchmark")
+    p.add_argument("--results", default=None, help="results prefix (default: benchmark in the run's artifacts folder)")
     p.add_argument("--device", default=None)
     p.add_argument("--data-root", default="data")
     args = p.parse_args()
-    device = torch.device(args.device or ("mps" if torch.backends.mps.is_available() else "cpu"))
+    device = get_device(args.device)
 
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     a, mean = ckpt["args"], ckpt["mean"].to(device)
@@ -73,6 +74,7 @@ def main():
 
     best = min(rows, key=lambda r: r["bpd"])
     print(f"best: {best['bpd']:.4f} bits/dim at {best['tokens']} tokens over {len(X['test'])} test images")
+    args.results = args.results or artifact("benchmark")
     os.makedirs(os.path.dirname(args.results) or ".", exist_ok=True)
     with open(args.results + ".json", "w") as f:
         json.dump(dict(ckpt=args.ckpt, buckets=args.buckets, alpha=args.alpha, test_images=len(X["test"]),

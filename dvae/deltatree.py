@@ -91,14 +91,29 @@ class Block(nn.Module):
 
     def __init__(self, width, heads):
         super().__init__()
+        self.heads = heads
         self.ln_a, self.ln_f = nn.LayerNorm(width), nn.LayerNorm(width)
-        self.attn = nn.MultiheadAttention(width, heads, batch_first=True)
+        self.attn = nn.MultiheadAttention(width, heads, batch_first=True)  # its weights; attend does the math
         self.ff = nn.Sequential(nn.Linear(width, 4 * width), nn.GELU(), nn.Linear(4 * width, width))
+
+    def attend(self, x, kv):
+        """self.attn(x, kv, kv), without nn.MultiheadAttention's per-call checks (which cost more than the math
+        on small batches)."""
+        B, L, W = x.shape
+        w, b = self.attn.in_proj_weight, self.attn.in_proj_bias
+        q = F.linear(x, w[:W], b[:W])
+        k, v = F.linear(kv, w[W:], b[W:]).chunk(2, -1)
+
+        def heads(t):
+            return t.reshape(B, t.shape[1], self.heads, W // self.heads).transpose(1, 2)
+
+        out = F.scaled_dot_product_attention(heads(q), heads(k), heads(v))
+        return self.attn.out_proj(out.transpose(1, 2).reshape(B, L, W))
 
     def forward(self, h, mem=None):
         x = self.ln_a(h)
         kv = x if mem is None else torch.cat([mem, x], 1)
-        h = h + self.attn(x, kv, kv, need_weights=False)[0]
+        h = h + self.attend(x, kv)
         return h + self.ff(self.ln_f(h)), x
 
 
@@ -271,11 +286,12 @@ def split_sse(r, m, rare_n, rare_sum, all_n, all_sum):
 
 @dataclass
 class Frontier:
-    """The nodes at one depth that hold images of a split, and those images."""
+    """The nodes at one depth that hold images of a split, and those images. The nodes' fields live on the CPU,
+    or for a resident frontier (a batch's, small enough) on the images' device."""
     R: Tensor       # [N, D] each image's remainder
     node: Tensor    # [N] its node
-    bits: Tensor    # [Nn] int64 on the CPU: each node's key (child_key), which names its code
-    deltas: Tensor  # [Nn, k, D] half precision on the CPU: each node's delta history
+    bits: Tensor    # [Nn] int64: each node's key (child_key), which names its code
+    deltas: Tensor  # [Nn, k, D] half precision: each node's delta history
     sides: Tensor   # [Nn, k] +1 rare, -1 common
     ms: Tensor      # [Nn, k] the m of each split
     seed: Tensor | None = None  # [Nn, D]: each node's Lloyd start, from a seeded parent (else its depth's start)
@@ -285,7 +301,7 @@ class Frontier:
         return self.sides.shape[1]
 
     def history(self, nodes, device):
-        nodes = nodes.cpu()
+        nodes = nodes.to(self.deltas.device)
         return (self.deltas[nodes].to(device).float(), self.sides[nodes].to(device), self.ms[nodes].to(device))
 
     def starts(self, decoder, nodes):
@@ -308,11 +324,13 @@ class Split:
     steps: Tensor
 
 
-def root_frontier(X, mean):
-    """Every image at the root."""
+def root_frontier(X, mean, resident=False):
+    """Every image at the root; resident keeps the nodes' fields on the images' device."""
+    store = X.device if resident else torch.device("cpu")
     return Frontier(R=X - mean, node=torch.zeros(len(X), dtype=torch.long, device=X.device),
-                    bits=torch.zeros(1, dtype=torch.int64), deltas=torch.zeros(1, 0, D, dtype=torch.half),
-                    sides=torch.zeros(1, 0), ms=torch.zeros(1, 0))
+                    bits=torch.zeros(1, dtype=torch.int64, device=store),
+                    deltas=torch.zeros(1, 0, D, dtype=torch.half, device=store),
+                    sides=torch.zeros(1, 0, device=store), ms=torch.zeros(1, 0, device=store))
 
 
 def node_order(fr):
@@ -437,12 +455,13 @@ def children(fr, s: Split, batch=8192):
     parent, rare = children // 2, (children % 2).bool()
     child_delta = torch.where(rare[:, None], r[parent], -m[parent, None] * r[parent])
     seed = None if s.u is None else torch.where(rare[:, None], s.u[parent, 0], s.u[parent, 1])
-    p, rare = parent.cpu(), rare.cpu()
+    store = fr.bits.device
+    p, rare = parent.to(store), rare.to(store)
     child = Frontier(R=fr.R - delta, node=node,
                      bits=child_key(fr.bits[p], rare, fr.depth),
-                     deltas=torch.cat([fr.deltas[p], child_delta.half().cpu()[:, None]], 1),
+                     deltas=torch.cat([fr.deltas[p], child_delta.half().to(store)[:, None]], 1),
                      sides=torch.cat([fr.sides[p], (2 * rare.float() - 1)[:, None]], 1),
-                     ms=torch.cat([fr.ms[p], m[parent].cpu()[:, None]], 1), seed=seed)
+                     ms=torch.cat([fr.ms[p], m[parent].to(store)[:, None]], 1), seed=seed)
     return child, token_bits
 
 
