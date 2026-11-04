@@ -371,7 +371,7 @@ def main():
                 refresh(decoder, grams, tracked)
             if time.time() - last >= args.log_interval:
                 last = time.time()
-                log(f"    step {step} ({seen}/{N} images this epoch)")
+                log.detail(f"    step {step} ({seen}/{N} images this epoch)")
         t1 = time.time()
         trained_caps = list(caps)
         test = [args.lloyd_curriculum and c < args.lloyd_max for c in caps]

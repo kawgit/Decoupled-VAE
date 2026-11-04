@@ -89,7 +89,7 @@ def train_epoch(decoder, opt, sched, fr, gen, args, log):
         sched.step()
         if time.time() - last >= args.log_interval:
             last = time.time()
-            log(f"    step {step + 1}/{len(batches)} loss {loss.item():.6f}")
+            log.detail(f"    step {step + 1}/{len(batches)} loss {loss.item():.6f}")
     return total.item()
 
 

@@ -8,9 +8,10 @@ import torch
 
 
 class RunLog:
-    """Called with a message, prints it and appends it, timestamped, to path and to path's .full.log twin. On a
-    CUDA device, the twin also gets a line every interval seconds: the GPU's utilization averaged over the
-    interval (sampled each second; needs nvidia-ml-py) and its memory, the GPU's as a whole and this run's."""
+    """Called with a message, prints it and appends it, timestamped, to path and to path's .full.log twin (detail
+    messages go to the twin only). On a CUDA device, the twin also gets a line every interval seconds: the GPU's
+    utilization averaged over the interval (sampled each second; needs nvidia-ml-py) and its memory, the GPU's
+    as a whole and this run's."""
 
     def __init__(self, path, device, interval=30.0):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -30,6 +31,10 @@ class RunLog:
 
     def __call__(self, msg):
         print(self.write(msg), flush=True)
+
+    def detail(self, msg):
+        """A progress message: printed and kept in the .full.log only."""
+        print(self.write(msg, summary=False), flush=True)
 
     def watch(self, device, interval):
         gib = 2 ** 30
