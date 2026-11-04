@@ -3,7 +3,8 @@
 #   qsub [-l gpu_type=L40S] [-l h_rt=12:00:00] [-v POOL=l40s,IDLE=7200,MIN_LEFT=14400] scc/hold.sh
 # An experiment is a file in ../queue/pending holding shell commands, run from the repo with $PY the venv's
 # python and $DVAE_JOB its file's name (e.g. "$PY train_walk.py --depths 32"), so its files go to
-# artifacts/<name>/ (dvae/artifacts.py), beside a copy of the commands, their stderr and exit code. Holders take
+# artifacts/<name>/ (dvae/artifacts.py), beside a copy of the commands, their stdout, stderr and exit code (so
+# every job has a log from its first second, even one that only waits). Holders take
 # files in name order; each moves to ../queue/running while it runs, then to ../queue/done. A file
 # ../queue/cancel/<name> (scc/cancel.sh) stops that experiment within seconds, and its holder takes the next. A
 # holder takes nothing new with under MIN_LEFT seconds of its time left, gives its GPU back after IDLE seconds
@@ -50,7 +51,7 @@ while true; do
   mkdir -p "artifacts/$name"
   cp "$Q/running/$name" "artifacts/$name/command.sh"
   # its own process group (setsid), so a cancel stops everything it started
-  DVAE_JOB=$name setsid bash "$Q/running/$name" > /dev/null 2> "artifacts/$name/stderr.log" &
+  DVAE_JOB=$name setsid bash "$Q/running/$name" > "artifacts/$name/stdout.log" 2> "artifacts/$name/stderr.log" &
   pid=$!
   while kill -0 $pid 2>/dev/null; do
     if [ -e "$Q/cancel/$name" ]; then

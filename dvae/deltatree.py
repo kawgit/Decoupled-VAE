@@ -85,18 +85,20 @@ class ImageHead(nn.Module):
 
 
 class Block(nn.Module):
-    """Pre-norm attention and feed-forward. Tokens h attend to themselves, or with mem (an earlier layer's
-    normalized history tokens), to mem and themselves. Also returns the normalized h, which is what later
-    queries read as this layer's memory."""
+    """Pre-norm attention and feed-forward. Tokens h attend to themselves (with causal=True, each only to itself
+    and those before it), or with mem (an earlier layer's normalized history tokens), to mem and themselves. Also
+    returns the normalized h, which is what later queries read as this layer's memory. dropout (training only)
+    drops attention weights and both branches' outputs."""
 
-    def __init__(self, width, heads):
+    def __init__(self, width, heads, dropout=0.0):
         super().__init__()
-        self.heads = heads
+        self.heads, self.dropout = heads, dropout
         self.ln_a, self.ln_f = nn.LayerNorm(width), nn.LayerNorm(width)
         self.attn = nn.MultiheadAttention(width, heads, batch_first=True)  # its weights; attend does the math
-        self.ff = nn.Sequential(nn.Linear(width, 4 * width), nn.GELU(), nn.Linear(4 * width, width))
+        self.ff = nn.Sequential(nn.Linear(width, 4 * width), nn.GELU(), nn.Linear(4 * width, width),
+                                *([nn.Dropout(dropout)] if dropout > 0 else []))  # none: stage 1's speed
 
-    def attend(self, x, kv):
+    def attend(self, x, kv, causal=False):
         """self.attn(x, kv, kv), without nn.MultiheadAttention's per-call checks (which cost more than the math
         on small batches)."""
         B, L, W = x.shape
@@ -107,13 +109,15 @@ class Block(nn.Module):
         def heads(t):
             return t.reshape(B, t.shape[1], self.heads, W // self.heads).transpose(1, 2)
 
-        out = F.scaled_dot_product_attention(heads(q), heads(k), heads(v))
-        return self.attn.out_proj(out.transpose(1, 2).reshape(B, L, W))
+        drop = self.dropout if self.training else 0.0
+        out = F.scaled_dot_product_attention(heads(q), heads(k), heads(v), dropout_p=drop, is_causal=causal)
+        out = self.attn.out_proj(out.transpose(1, 2).reshape(B, L, W))
+        return F.dropout(out, drop) if drop > 0 else out
 
-    def forward(self, h, mem=None):
+    def forward(self, h, mem=None, causal=False):
         x = self.ln_a(h)
         kv = x if mem is None else torch.cat([mem, x], 1)
-        h = h + self.attend(x, kv)
+        h = h + self.attend(x, kv, causal and mem is None)
         return h + self.ff(self.ln_f(h)), x
 
 
