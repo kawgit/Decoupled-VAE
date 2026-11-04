@@ -40,6 +40,7 @@ import torch  # noqa: E402
 from dvae.data import load_mnist  # noqa: E402
 from dvae.deltatree import (D, SharedDecoder, Split, by_nodes, cat_splits, children, chunk_sse,  # noqa: E402
                             node_order, pixels, root_frontier, split, top_direction)
+from dvae.plots import plot_depths  # noqa: E402
 
 
 def tree_order(keys, depth):
@@ -159,6 +160,7 @@ def main():
     p.add_argument("--limit-val", type=int, default=None)
     p.add_argument("--out", default="checkpoints/deltatree_walk.pt")
     p.add_argument("--log", default="outputs/deltatree_walk.log")
+    p.add_argument("--plot", default=None, help="progress plot, redrawn every epoch (default: --log's path as .png)")
     p.add_argument("--log-interval", type=float, default=30.0, help="seconds between step logs")
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=0)
@@ -238,6 +240,7 @@ def main():
         trained = active
         history.append(dict(epoch=epoch, val_mse=val, objective=objective, pca=pca, train_steps=train_steps,
                             val_steps=val_steps, val_capped=capped, trained=trained))
+        plot_depths(history, args.plot or os.path.splitext(args.log)[0] + ".png")
         improved = trained == K - 1 and val[-1] < best[0]
         log(f"  epoch {epoch:2d}: val mse after {K} tokens {val[-1]:.6f} (psnr {psnr(val[-1]):.2f} dB); per depth "
             + fmt(val) + "; objective per depth " + fmt(objective)
