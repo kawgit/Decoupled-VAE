@@ -23,49 +23,15 @@ os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.5")  # ~6.5 GB: fai
 os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.4")
 
 import torch  # noqa: E402
-import torch.nn.functional as F  # noqa: E402
 
 from dvae.artifacts import artifact  # noqa: E402
-from dvae.codes import Codes, bits_of, deltas, load_codes, own_shares  # noqa: E402
+from dvae.categorical import Leaves, code_bits as price, pixel_bits  # noqa: E402
+from dvae.codes import load_codes  # noqa: E402
 from dvae.data import get_device, load_mnist  # noqa: E402
 from dvae.deltatree import D, LeafDecoder  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
 from dvae.plots import plot_categorical  # noqa: E402
-from dvae.prior import load_prior, token_bits  # noqa: E402
-
-
-class Leaves:
-    """One split's images at their codes' nodes after k tokens, as the decoder reads them: delta histories
-    [N, k, D] (half precision), sides and ms [N, k], predicted means [N, D] and grey levels [N, D] (uint8), on
-    the CPU. The deltas overwrite codes.r in place (a full dump's r is ~8 GB), so price the codes first."""
-
-    def __init__(self, codes: Codes, images, k, chunk=4096):
-        for i in range(0, len(codes), chunk):
-            codes.r[i:i + chunk] = deltas(codes.r[i:i + chunk].float(), codes.m[i:i + chunk].float(),
-                                          codes.rare[i:i + chunk]).half()
-        self.deltas = codes.r[:, :k]
-        self.sides = codes.rare[:, :k].float() * 2 - 1
-        self.ms = codes.m[:, :k].float()
-        self.mu = torch.cat([codes.mean + self.deltas[i:i + chunk].float().sum(1)
-                             for i in range(0, len(codes), chunk)])
-        self.levels = images.flatten(1)
-
-    def __len__(self):
-        return len(self.levels)
-
-    def bits(self, decoder, idx, device):
-        """-log2 p(x | code) for images idx [b]."""
-        logits = decoder(self.deltas[idx].to(device).float(), self.sides[idx].to(device), self.ms[idx].to(device),
-                         self.mu[idx].to(device))
-        return F.cross_entropy(logits, self.levels[idx].to(device).long(), reduction="none").sum(1) / math.log(2)
-
-
-@torch.no_grad()
-def evaluate(decoder, leaves, device, batch):
-    """-log2 p(x | code) for every image [N], on the CPU."""
-    decoder.eval()
-    idx = torch.arange(len(leaves))
-    return torch.cat([leaves.bits(decoder, idx[i:i + batch], device).cpu() for i in range(0, len(leaves), batch)])
+from dvae.prior import load_prior  # noqa: E402
 
 
 def main():
@@ -107,10 +73,7 @@ def main():
     prior = load_prior(torch.load(args.prior, map_location=device, weights_only=False), device) if args.prior else None
     code_bits, leaves = {}, {}
     for s, c in codes.items():  # each image's code's bits, under the prior or the autoencoder's own shares
-        if prior is not None:
-            code_bits[s] = token_bits(prior, c.rare, c.m, c.r, device)[:, :K].sum(1)
-        else:
-            code_bits[s] = bits_of(own_shares(c.m[:, :K].float()), c.rare[:, :K]).sum(1)
+        code_bits[s] = price(c, K, prior, device)
         leaves[s] = Leaves(c, load_mnist(s, args.data_root)[:len(c)], K)
         mse = (leaves[s].mu - leaves[s].levels.float().add(0.5).div(256)).square().mean().item()
         log(f"{s}: {len(c)} codes of {K} tokens, {code_bits[s].mean().item():.2f} bits each "
@@ -139,7 +102,7 @@ def main():
             opt.step()
             total += bits.sum().item()
         t1 = time.time()
-        val = evaluate(decoder, leaves["val"], device, args.batch).mean().item() / D
+        val = pixel_bits(decoder, leaves["val"], device, args.batch).mean().item() / D
         history.append(dict(epoch=epoch, val=val, train=total / (N * D), seconds=time.time() - t0))
         plot_categorical(history, args.plot)
         improved = val < best[0]
@@ -158,7 +121,7 @@ def main():
 
     rows = {}
     for s in ("val", "test"):
-        pixel = evaluate(decoder, leaves[s], device, args.batch)
+        pixel = pixel_bits(decoder, leaves[s], device, args.batch)
         total = code_bits[s] + pixel
         rows[s] = dict(images=len(total), tokens=K, bpd=total.mean().item() / D,
                        nats=total.mean().item() * math.log(2), code_bits=code_bits[s].mean().item(),

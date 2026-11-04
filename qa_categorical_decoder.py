@@ -16,8 +16,9 @@ import os
 import torch
 
 from dvae.artifacts import artifact
+from dvae.categorical import load_categorical
 from dvae.data import get_device, load_mnist
-from dvae.deltatree import LeafDecoder, pixels
+from dvae.deltatree import pixels
 from dvae.prior import load_prior
 from dvae.sampling import load_autoencoder, sample
 from dvae.viz import save_grid
@@ -37,9 +38,7 @@ def main():
     args = p.parse_args()
     device = get_device(args.device)
     dckpt = torch.load(args.decoder, map_location=device, weights_only=False)
-    decoder = LeafDecoder(**dckpt["config"]).to(device)
-    decoder.load_state_dict(dckpt["state_dict"])
-    decoder.eval()
+    decoder = load_categorical(dckpt, device)
     ckpt = args.ckpt or dckpt.get("autoencoder")
     assert ckpt, "this decoder's checkpoint doesn't name its autoencoder: give --ckpt"
     decoders, mean, steps, batch, tol = load_autoencoder(ckpt, device)

@@ -105,7 +105,12 @@ Bits per image for the same 97-token codes on the test set (lower is better; a f
 | prior with side-mean images (`--images`) | **90.84** | **0.894** |
 
 Samples from the image prior are visibly cleaner than from the autoencoder's own shares (about 7 garbled digits
-in 64, against about 12). The categorical decoder has not yet been trained on this autoencoder.
+in 64, against about 12).
+
+The categorical decoder on the same codes (4.5M parameters, run `371-categorical-fixed8`) brings the whole model
+to **1.2355 bits per dimension on the test set** (671 nats per image): 90.84 bits for the code under the image
+prior, then 1.1196 bits per pixel given it. Its most likely level per pixel turns the blurry mean images into
+crisp strokes.
 
 ## Running it
 
@@ -125,6 +130,7 @@ python train_categorical_decoder.py --codes artifacts/<dump job> --prior artifac
 python qa_autoencoder.py --ckpt artifacts/<autoencoder job>/model.pt
 python qa_prior.py --prior artifacts/<prior job>/prior.pt
 python qa_categorical_decoder.py --decoder artifacts/<decoder job>/decoder.pt --prior artifacts/<prior job>/prior.pt
+python benchmark.py --decoder artifacts/<decoder job>/decoder.pt --prior artifacts/<prior job>/prior.pt
 ```
 
 `train_autoencoder.py --resume <model.pt>` continues a run from its checkpoint, which holds the whole training
@@ -136,6 +142,10 @@ state. The QA scripts write:
   with the autoencoder's own shares), `generate.png` (samples token by token) and `real.png`.
 - `qa_categorical_decoder.py`: from the same sampled codes, `samples_means.png` (the autoencoder's mean images),
   `samples_pixels.png` (one draw from $p(x \mid \text{code})$), `samples_mode.png` and `real.png`.
+
+`benchmark.py` scores the whole model's test bits per dimension, each image's
+$-\log_2 p(\text{code}) - \log_2 p(x \mid \text{code})$, with the code priced by the prior and by the
+autoencoder's own shares side by side (`benchmark.md` and `.json`).
 
 `browse.py` serves a local web page for walking through an autoencoder's tree one node at a time.
 
@@ -166,6 +176,7 @@ The repo lives at `/projectnb/cs599bg/kawgit56/Decoupled-VAE`, with the venv bes
 | `dvae/deltatree.py` | the autoencoder's network, Lloyd's algorithm, frontiers and splits, the categorical decoder's network |
 | `dvae/prior.py` | the prior's network, banded priors, and code costs under a prior |
 | `dvae/codes.py` | loading dumps, deltas and bit costs |
+| `dvae/categorical.py` | the categorical decoder's data, code and pixel bits |
 | `dvae/sampling.py` | sampling codes down the tree, from the autoencoder's shares or a prior |
 | `dvae/plots.py` | each stage's progress plot |
 | `dvae/data.py`, `dvae/artifacts.py`, `dvae/logs.py`, `dvae/viz.py` | data, output folders, logs, image grids |
