@@ -20,7 +20,7 @@ qstat -u "$USER" | tail -n +3 | while read -r id prior name user state day time 
     elif [ -n "$last" ]; then
       doing="idle for $(ago "$stamp")"
     else
-      doing="idle since it started"
+      doing="idle for $(ago "$(head -1 "$log" | sed 's/ holder .*//')")"
     fi
   elif [ "$state" = "r" ]; then
     doing="one-off job"
