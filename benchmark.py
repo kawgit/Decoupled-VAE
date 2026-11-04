@@ -16,7 +16,7 @@ import os
 import torch
 
 from dvae.data import load_mnist
-from dvae.deltatree import D, DeltaDecoder, pixels, root_frontier, split
+from dvae.deltatree import D, load_tree, pixels, root_frontier, split
 
 
 def bucket(mu, buckets):
@@ -53,13 +53,12 @@ def main():
     code = {s: torch.zeros(len(x), device=device) for s, x in X.items()}
 
     rows = []
-    for k in range(len(ckpt["decoders"]) + 1):
+    decoders = load_tree(ckpt, device)
+    for k in range(len(decoders) + 1):
         if k:
-            decoder = DeltaDecoder(**ckpt["configs"][k - 1]).to(device)
-            decoder.load_state_dict(ckpt["decoders"][k - 1])
-            decoder.eval()
+            decoder = decoders[k - 1]
             for s in fr:
-                fr[s], token_bits = split(decoder, fr[s], steps, batch)
+                fr[s], token_bits, _ = split(decoder, fr[s], steps, batch, a.get("tol", 0.0))
                 code[s] += token_bits
         mu = {s: X[s] - fr[s].R for s in fr}
         table = fit_levels(mu["val"], levels["val"], args.buckets, args.alpha)

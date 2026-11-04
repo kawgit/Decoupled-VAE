@@ -20,7 +20,7 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
 from dvae.data import load_mnist  # noqa: E402
-from dvae.deltatree import D, DeltaDecoder, LeafDecoder, pixels, root_frontier, split  # noqa: E402
+from dvae.deltatree import D, LeafDecoder, load_tree, pixels, root_frontier, split  # noqa: E402
 
 
 def leaf_bits(decoder, fr, X, levels, idx):
@@ -75,7 +75,8 @@ def main():
     log(f"=== {time.strftime('%Y-%m-%d')} {vars(args)}")
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     a, mean = ckpt["args"], ckpt["mean"].to(device)
-    K = args.tokens if args.tokens is not None else len(ckpt["decoders"])
+    decoders = load_tree(ckpt, device)
+    K = args.tokens if args.tokens is not None else len(decoders)
     steps, batch = a["lloyd_steps"], a["node_batch"]
     images = {"train": load_mnist("train", args.data_root)[:a["limit_train"]],
               "val": load_mnist("val", args.data_root)[:a["limit_val"]],
@@ -85,11 +86,9 @@ def main():
     fr = {s: root_frontier(x, mean) for s, x in X.items()}
     code = {s: torch.zeros(len(x), device=device) for s, x in X.items()}
     for k in range(K):
-        tree = DeltaDecoder(**ckpt["configs"][k]).to(device)
-        tree.load_state_dict(ckpt["decoders"][k])
-        tree.eval()
+        tree = decoders[k]
         for s in fr:
-            fr[s], token_bits = split(tree, fr[s], steps, batch)
+            fr[s], token_bits, _ = split(tree, fr[s], steps, batch, a.get("tol", 0.0))
             code[s] += token_bits
     for s in fr:
         log(f"{s}: {len(X[s])} images in {len(fr[s].bits)} leaves after {K} tokens, "

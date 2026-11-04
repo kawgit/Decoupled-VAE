@@ -13,12 +13,12 @@ import os
 import torch
 
 from dvae.data import load_mnist
-from dvae.deltatree import D, DeltaDecoder, Frontier, child_key, choose, descend, pixels, root_frontier
+from dvae.deltatree import D, Frontier, child_key, choose, descend, load_tree, pixels, root_frontier
 from dvae.viz import save_grid
 
 
 @torch.no_grad()
-def sample(decoders, mean, n, steps, batch, generator):
+def sample(decoders, mean, n, steps, batch, tol, generator):
     """n codes drawn from the decoders, and their predicted means after every token [n, K, D]."""
     device = mean.device
     fr = root_frontier(mean.new_zeros(0, D), mean)
@@ -26,7 +26,8 @@ def sample(decoders, mean, n, steps, batch, generator):
                   sides=fr.sides.expand(n, 0), ms=fr.ms.expand(n, 0))
     out, x = [], mean.expand(n, D)
     for decoder in decoders:
-        _, _, r, m = choose(decoder, fr, steps, batch)
+        s = choose(decoder, fr, steps, batch, tol)
+        r, m = s.r, s.m
         rare = torch.rand(n, generator=generator).to(device) < m / (1 + m)
         delta = torch.where(rare[:, None], r, -m[:, None] * r)
         x = x + delta
@@ -35,7 +36,8 @@ def sample(decoders, mean, n, steps, batch, generator):
         fr = Frontier(R=fr.R, node=fr.node, bits=child_key(fr.bits, rc, fr.depth),
                       deltas=torch.cat([fr.deltas, delta.half().cpu()[:, None]], 1),
                       sides=torch.cat([fr.sides, (2 * rc.float() - 1)[:, None]], 1),
-                      ms=torch.cat([fr.ms, m.cpu()[:, None]], 1))
+                      ms=torch.cat([fr.ms, m.cpu()[:, None]], 1),
+                      seed=None if s.u is None else torch.where(rare[:, None], s.u[:, 0], s.u[:, 1]))
     return torch.stack(out, 1)
 
 
@@ -52,13 +54,9 @@ def main():
     device = torch.device(args.device or ("mps" if torch.backends.mps.is_available() else "cpu"))
 
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-    decoders = []
-    for cfg, state in zip(ckpt["configs"], ckpt["decoders"]):
-        decoders.append(DeltaDecoder(**cfg).to(device))
-        decoders[-1].load_state_dict(state)
-        decoders[-1].eval()
+    decoders = load_tree(ckpt, device)
     a, mean = ckpt["args"], ckpt["mean"].to(device)
-    steps, batch, K = a["lloyd_steps"], a["node_batch"], len(decoders)
+    steps, batch, K, tol = a["lloyd_steps"], a["node_batch"], len(decoders), a.get("tol", 0.0)
     os.makedirs(args.out, exist_ok=True)
 
     # every test image's and every training image's code and predicted mean after each token
@@ -67,7 +65,7 @@ def main():
     fr = {"test": root_frontier(X, mean), "train": root_frontier(T, mean)}
     preds, empirical = [X], [X]
     for decoder in decoders:
-        fr = {split: descend(decoder, f, steps, batch) for split, f in fr.items()}
+        fr = {split: descend(decoder, f, steps, batch, tol) for split, f in fr.items()}
         preds.append(X - fr["test"].R)
         code = fr["test"].bits[fr["test"].node.cpu()]
         train_code = fr["train"].bits[fr["train"].node.cpu()]
@@ -90,7 +88,7 @@ def main():
     print(f"{path}: rows are test images, then the mean of the training images in the same node after 1..{K} tokens")
 
     gen = torch.Generator().manual_seed(args.seed)
-    xs = sample(decoders, mean, args.generate, steps, batch, gen)
+    xs = sample(decoders, mean, args.generate, steps, batch, tol, gen)
     path = os.path.join(args.out, "generate.png")
     save_grid(xs.clamp(0, 1).reshape(-1, 1, 28, 28), path, nrow=K)
     print(f"{path}: rows are sampled codes, shown as their predicted mean after 1..{K} tokens")

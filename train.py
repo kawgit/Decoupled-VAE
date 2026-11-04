@@ -28,8 +28,8 @@ os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.4")
 import torch  # noqa: E402
 
 from dvae.data import load_mnist  # noqa: E402
-from dvae.deltatree import (D, DeltaDecoder, Frontier, chunk_sse, descend, node_order, pixels,  # noqa: E402
-                            root_frontier, top_direction)
+from dvae.deltatree import (D, DeltaDecoder, Frontier, by_nodes, chunk_sse, descend, node_order,  # noqa: E402
+                            pixels, root_frontier, top_direction)
 
 
 TREE_ARGS = ("lloyd_steps", "limit_train", "limit_val", "data_root")
@@ -50,15 +50,6 @@ def train_chunks(fr, size, gen):
     return [perm[i:i + size] for i in range(0, len(perm), size)]
 
 
-def by_nodes(imgs, node, cap):
-    """Cut images grouped by node (imgs, their nodes node) into pieces holding at most cap nodes each: the
-    decoder's memory use grows with the nodes it queries, not the images."""
-    new = torch.ones_like(node, dtype=torch.long)
-    new[1:] = (node[1:] != node[:-1]).long()
-    piece = (new.cumsum(0) - 1) // cap
-    return list(imgs.split(torch.unique_consecutive(piece, return_counts=True)[1].tolist()))
-
-
 @torch.no_grad()
 def evaluate(decoder, fr, steps, size, cap):
     """The objective per image and pixel (averaged over steps), and the last step's split: mse before and after
@@ -68,13 +59,13 @@ def evaluate(decoder, fr, steps, size, cap):
     total = dict(sse=0.0, before=0.0, after=0.0, bits=0.0)
     for i in range(0, len(order), size):
         for imgs in by_nodes(order[i:i + size], fr.node[order[i:i + size]], cap):
-            sse, stats = chunk_sse(decoder, fr, imgs, steps, select=True)
+            sse, _, stats, _, _ = chunk_sse(decoder, fr, imgs, steps, select=True)
             assert stats is not None
             total["sse"] += sse.item()
             for key, value in stats.items():
                 total[key] += value.item()
     N = len(order)
-    return dict(loss=total["sse"] / (N * steps * D), mse_before=total["before"] / (N * D),
+    return dict(loss=total["sse"] / (N * D), mse_before=total["before"] / (N * D),
                 mse_after=total["after"] / (N * D), bits=total["bits"] / N)
 
 
@@ -84,7 +75,7 @@ def psnr(mse):
 
 def train_epoch(decoder, opt, sched, fr, gen, args, log):
     """One epoch of decoder on frontier fr. Returns the objective's sum over its images."""
-    steps, norm = args.lloyd_steps, args.lloyd_steps * D
+    steps, norm = args.lloyd_steps, D  # each node's objective is already averaged over its Lloyd steps
     decoder.train()
     total, last = fr.R.new_zeros(()), time.time()
     batches = train_chunks(fr, args.batch, gen)
@@ -92,7 +83,7 @@ def train_epoch(decoder, opt, sched, fr, gen, args, log):
         opt.zero_grad(set_to_none=True)
         loss = fr.R.new_zeros(())
         for piece in by_nodes(imgs, fr.node[imgs], args.max_nodes):
-            sse, _ = chunk_sse(decoder, fr, piece, steps)
+            sse, _, _, _, _ = chunk_sse(decoder, fr, piece, steps)
             part = sse / (args.batch * norm)  # a fixed divisor, so every image weighs the same
             part.backward()
             loss += part.detach()
@@ -109,7 +100,7 @@ def train_epoch(decoder, opt, sched, fr, gen, args, log):
 def fit(decoder, fr, val_fr, args, depth, log):
     """Train decoder on frontier fr, keeping the epoch with the best mse after the split on val_fr and early
     stopping on it. Returns the kept epoch and its val metrics."""
-    steps, norm = args.lloyd_steps, args.lloyd_steps * D
+    steps, norm = args.lloyd_steps, D
     opt = torch.optim.AdamW(decoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / args.warmup_steps))
     gen = torch.Generator().manual_seed(args.seed * 1000 + depth)

@@ -129,30 +129,82 @@ class HistoryReader(nn.Module):
         return mems
 
 
-class DeltaDecoder(HistoryReader):
-    """One depth's decoder: its query is a hyperplane at the node. It also holds the depth's Lloyd start, the
-    same at every node (set by the trainer)."""
+class SliceDecoder(HistoryReader):
+    """A decoder whose query is a hyperplane at a node. Each depth k (a node's history length) has a Lloyd
+    start, the same at every node of the depth, and may have a scale (the remainders' rms per pixel there,
+    hyperplane biases and r then being in its units); subclasses say where they come from. A seeded decoder
+    also predicts each side's top principal direction, which seeds that side's own Lloyd start."""
 
-    scale: Tensor  # the remainders' rms per pixel at this depth: hyperplane biases and r are in its units
+    def __init__(self, depth, width, layers, heads, seeded=False):
+        super().__init__(depth, width, layers, heads)
+        self.query_in = nn.Linear(D + 1, width)
+        self.out_norm = nn.LayerNorm(width)
+        self.r_head = ImageHead(width, 1)
+        self.m_head = nn.Linear(width, 1)
+        self.dir_head = ImageHead(width, 2) if seeded else None
+
+    def scale_at(self, k) -> Tensor | float:
+        raise NotImplementedError
+
+    def start_at(self, k) -> Tensor:
+        raise NotImplementedError
+
+    def query(self, mems, n, b):
+        """For a hyperplane n [B, D], b [B] at each of B nodes with memory mems: r [B, D], m [B], and from a
+        seeded decoder the rare and common sides' unit directions u [B, 2, D] (else None)."""
+        scale = self.scale_at(mems[0].shape[1])
+        q = self.query_in(torch.cat([n, (b / scale)[:, None]], -1))[:, None]
+        for blk, mem in zip(self.blocks, mems):
+            q, _ = blk(q, mem)
+        f = self.out_norm(q)[:, 0]
+        u = None
+        if self.dir_head is not None:
+            u = self.dir_head(f)
+            u = u / u.norm(dim=-1, keepdim=True).clamp_min(EPS)
+        return self.r_head(f)[:, 0] * scale, torch.sigmoid(self.m_head(f)[:, 0]), u
+
+
+class DeltaDecoder(SliceDecoder):
+    """One depth's decoder, with that depth's scale and Lloyd start (set by the trainer)."""
+
+    scale: Tensor  # the depth's scale
     start: Tensor  # [D] the depth's first hyperplane's normal
 
     def __init__(self, depth, scale=1.0, width=256, layers=4, heads=4):
         super().__init__(depth, width, layers, heads)
         self.config = dict(depth=depth, scale=scale, width=width, layers=layers, heads=heads)
-        self.query_in = nn.Linear(D + 1, width)
-        self.out_norm = nn.LayerNorm(width)
-        self.r_head = ImageHead(width, 1)
-        self.m_head = nn.Linear(width, 1)
         self.register_buffer("scale", torch.tensor(float(scale)))
         self.register_buffer("start", torch.zeros(D))
 
-    def query(self, mems, n, b):
-        """For a hyperplane n [B, D], b [B] at each of B nodes with memory mems: r [B, D] and m [B]."""
-        q = self.query_in(torch.cat([n, (b / self.scale)[:, None]], -1))[:, None]
-        for blk, mem in zip(self.blocks, mems):
-            q, _ = blk(q, mem)
-        f = self.out_norm(q)[:, 0]
-        return self.r_head(f)[:, 0] * self.scale, torch.sigmoid(self.m_head(f)[:, 0])
+    def scale_at(self, k):
+        return self.scale
+
+    def start_at(self, k):
+        return self.start
+
+
+class SharedDecoder(SliceDecoder):
+    """One decoder for every depth below depths, with each depth's Lloyd start (set by the trainer; a seeded
+    one only uses the root's, its other nodes starting from their parent's predicted direction). Its biases
+    and deltas are in pixel units, its depth's scale being its own to learn; scaled=True keeps a scale per
+    depth, as the first one-stage trees did."""
+
+    starts: Tensor  # [depths, D]
+    scales: Tensor  # [depths], when scaled
+
+    def __init__(self, depths, width=256, layers=4, heads=4, scaled=False, seeded=False):
+        super().__init__(depths, width, layers, heads, seeded)
+        self.config = dict(depths=depths, width=width, layers=layers, heads=heads, scaled=scaled, seeded=seeded)
+        self.scaled = scaled
+        self.register_buffer("starts", torch.zeros(depths, D))
+        if scaled:
+            self.register_buffer("scales", torch.ones(depths))
+
+    def scale_at(self, k):
+        return self.scales[k] if self.scaled else 1.0
+
+    def start_at(self, k):
+        return self.starts[k]
 
 
 class LeafDecoder(HistoryReader):
@@ -181,17 +233,28 @@ class LeafDecoder(HistoryReader):
         return logits + self.mean_path(mu.view(-1, 1, 28, 28)).flatten(2)
 
 
-def lloyd(decoder: DeltaDecoder, mems: list[Tensor], steps: int):
-    """Yields (n, b, r, m) at each step for B nodes with memory mems: the hyperplane queried ([B, D], [B]) and
-    the decoder's answers ([B, D], [B]). The first is the depth's start through each node's predicted mean;
-    each next one is the bisector of the last answers, detached."""
-    B = len(mems[0])
-    n, b = decoder.start.expand(B, D), decoder.start.new_zeros(B)
+def lloyd(decoder: SliceDecoder, mems: list[Tensor], start: Tensor, steps: int, tol: float = 0.0):
+    """Yields (active, n, b, r, m, u) at each step: the nodes still moving (indices into the B nodes with
+    memory mems), the hyperplanes queried there and the decoder's answers. Every node starts from start [B, D]
+    through its predicted mean; each next hyperplane is the bisector of the last answers, detached. With
+    tol > 0 a node stops once that would move its hyperplane by less than tol (1 - cos of the normals plus the
+    bias's change relative to |r|, squared); every node stops after steps queries."""
+    active = torch.arange(len(start), device=start.device)
+    n, b = start, start.new_zeros(len(start))
     for step in range(steps):
-        r, m = decoder.query(mems, n, b)
-        yield n, b, r, m
-        if step + 1 < steps:
-            n, b = bisector(r.detach(), m.detach())
+        r, m, u = decoder.query(mems, n, b)
+        yield active, n, b, r, m, u
+        if step + 1 == steps:
+            break
+        n2, b2 = bisector(r.detach(), m.detach())
+        if tol > 0:
+            move = 1 - (n2 * n).sum(-1) + ((b2 - b) / r.detach().norm(dim=-1).clamp_min(EPS)).square()
+            moving = move >= tol
+            if not moving.any():
+                break
+            if not moving.all():
+                active, n2, b2, mems = active[moving], n2[moving], b2[moving], [mem[moving] for mem in mems]
+        n, b = n2, b2
 
 
 def split_sse(r, m, rare_n, rare_sum, all_n, all_sum):
@@ -215,6 +278,7 @@ class Frontier:
     deltas: Tensor  # [Nn, k, D] half precision on the CPU: each node's delta history
     sides: Tensor   # [Nn, k] +1 rare, -1 common
     ms: Tensor      # [Nn, k] the m of each split
+    seed: Tensor | None = None  # [Nn, D]: each node's Lloyd start, from a seeded parent (else its depth's start)
 
     @property
     def depth(self):
@@ -223,6 +287,25 @@ class Frontier:
     def history(self, nodes, device):
         nodes = nodes.cpu()
         return (self.deltas[nodes].to(device).float(), self.sides[nodes].to(device), self.ms[nodes].to(device))
+
+    def starts(self, decoder, nodes):
+        """Lloyd's first normals [len(nodes), D] at nodes."""
+        if self.seed is not None:
+            return self.seed[nodes.to(self.seed.device)]
+        return decoder.start_at(self.depth).expand(len(nodes), D)
+
+
+@dataclass
+class Split:
+    """Every node's split after Lloyd's steps: its last hyperplane (n [Nn, D], b [Nn]), the decoder's answers
+    there (r [Nn, D], m [Nn] and, from a seeded decoder, the sides' directions u [Nn, 2, D]), and the steps it
+    took [Nn]."""
+    n: Tensor
+    b: Tensor
+    r: Tensor
+    m: Tensor
+    u: Tensor | None
+    steps: Tensor
 
 
 def root_frontier(X, mean):
@@ -239,47 +322,112 @@ def node_order(fr):
     return order, F.pad(counts.cumsum(0), (1, 0))
 
 
-def chunk_sse(decoder, fr, imgs, steps, select=False):
-    """The objective's sum over images imgs of a frontier (all Lloyd steps), and with select, what the last
-    step's split does to them: their squared error before and after it and the bits of their tokens."""
+def by_nodes(imgs, node, cap):
+    """Cut images grouped by node (imgs, their nodes node) into pieces holding at most cap nodes each: the
+    decoder's memory use grows with the nodes it queries, not the images."""
+    new = torch.ones_like(node, dtype=torch.long)
+    new[1:] = (node[1:] != node[:-1]).long()
+    piece = (new.cumsum(0) - 1) // cap
+    return list(imgs.split(torch.unique_consecutive(piece, return_counts=True)[1].tolist()))
+
+
+def chunk_sse(decoder, fr, imgs, steps, select=False, tol=0.0, dir_weight=1.0):
+    """The objective's sum over images imgs of a frontier, each node's averaged over its Lloyd steps: the
+    split's error and, for a seeded decoder, dir_weight times its sides' rank-1 PCA reconstruction error (each
+    image's remainder after the split, less its projection on its side's predicted direction). Also returns
+    the reconstruction error's own sum (detached; 0 when not seeded); with select, what the last step's split
+    does to the images (their squared error before and after it and the bits of their tokens); the chunk's
+    nodes [b]; and their Split (detached)."""
     R = fr.R[imgs]
     nodes, inverse = torch.unique(fr.node[imgs], return_inverse=True)
-    B = len(nodes)
-    mems = decoder.memory(*fr.history(nodes, R.device))
-    onehot = F.one_hot(inverse, B).to(R.dtype)
-    all_n, all_sum = onehot.sum(0), onehot.T @ R
-    sse = R.new_zeros(())
-    for n, b, r, m in lloyd(decoder, mems, steps):
-        rare = (R * n[inverse]).sum(-1) >= b[inverse]
-        W = onehot * rare[:, None]
-        sse = sse + split_sse(r, m, W.sum(0), W.T @ R, all_n, all_sum).sum()
+    B, device = len(nodes), R.device
+    mems = decoder.memory(*fr.history(nodes, device))
+    all_n = R.new_zeros(B).index_add_(0, inverse, R.new_ones(len(R)))
+    all_sum = R.new_zeros(B, D).index_add_(0, inverse, R)
+    node_loss, node_pca, node_steps = R.new_zeros(B), R.new_zeros(B), R.new_zeros(B)
+    last_n, last_b, last_r, last_m = R.new_zeros(B, D), R.new_zeros(B), R.new_zeros(B, D), R.new_zeros(B)
+    last_u = None
+    slot = torch.full((B,), -1, dtype=torch.long, device=device)
+    for active, n, b, r, m, u in lloyd(decoder, mems, fr.starts(decoder, nodes), steps, tol):
+        slot.fill_(-1)
+        slot[active] = torch.arange(len(active), device=device)
+        at = slot[inverse]
+        mine = at >= 0
+        Ra, ia = R[mine], at[mine]
+        rare = (Ra * n[ia]).sum(-1) >= b[ia]
+        rare_n = R.new_zeros(len(active)).index_add_(0, ia, rare.to(R.dtype))
+        rare_sum = R.new_zeros(len(active), D).index_add_(0, ia, Ra * rare[:, None])
+        loss = split_sse(r, m, rare_n, rare_sum, all_n[active], all_sum[active])
+        if u is not None:
+            child = (Ra - torch.where(rare[:, None], r[ia], -m[ia, None] * r[ia])).detach()
+            side_u = torch.where(rare[:, None], u[ia, 0], u[ia, 1])
+            pca = child.square().sum(-1) - (child * side_u).sum(-1).square()
+            pca = R.new_zeros(len(active)).index_add_(0, ia, pca)
+            loss = loss + dir_weight * pca
+            node_pca = node_pca.index_add(0, active, pca.detach())
+            if last_u is None:
+                last_u = R.new_zeros(B, 2, D)
+            last_u[active] = u.detach()
+        node_loss = node_loss.index_add(0, active, loss)
+        node_steps[active] += 1
+        last_n[active], last_b[active], last_r[active], last_m[active] = n, b, r.detach(), m.detach()
+    sse = (node_loss / node_steps).sum()
+    pca_sum = (node_pca / node_steps).sum()
+    split = Split(last_n, last_b, last_r, last_m, last_u, node_steps)
     if not select:
-        return sse, None
-    pred = torch.where(rare[:, None], r[inverse], -m[inverse, None] * r[inverse])
-    p = torch.div(m, m + 1)[inverse]
+        return sse, pca_sum, None, nodes, split
+    rare = (R * last_n[inverse]).sum(-1) >= last_b[inverse]
+    pred = torch.where(rare[:, None], last_r[inverse], -last_m[inverse, None] * last_r[inverse])
+    p = torch.div(last_m, last_m + 1)[inverse]
     bits = -torch.where(rare, p, 1 - p).clamp_min(EPS).log2()
     stats = dict(before=R.square().sum(), after=(R - pred).square().sum(), bits=bits.sum())
-    return sse, stats
+    return sse, pca_sum, stats, nodes, split
+
+
+def cat_splits(parts: list[Split]) -> Split:
+    us = [p.u for p in parts]
+    u = None if any(x is None for x in us) else torch.cat([x for x in us if x is not None])
+    return Split(torch.cat([p.n for p in parts]), torch.cat([p.b for p in parts]), torch.cat([p.r for p in parts]),
+                 torch.cat([p.m for p in parts]), u, torch.cat([p.steps for p in parts]))
 
 
 @torch.no_grad()
-def choose(decoder, fr, steps, batch):
-    """The split of each node after the Lloyd steps, as (n [Nn, D], b [Nn], r [Nn, D], m [Nn])."""
+def choose(decoder, fr, steps, batch, tol=0.0):
+    """Every node's Split after the Lloyd steps."""
     device = fr.R.device
     nodes = torch.arange(len(fr.bits))
-    out = []
+    parts = []
     for i in range(0, len(nodes), batch):
-        mems = decoder.memory(*fr.history(nodes[i:i + batch], device))
-        *_, last = lloyd(decoder, mems, steps)
-        out.append(last)
-    return tuple(torch.cat(parts) for parts in zip(*out))
+        part = nodes[i:i + batch]
+        mems = decoder.memory(*fr.history(part, device))
+        start = fr.starts(decoder, part)
+        B = len(part)
+        n, b, r, m = start.new_zeros(B, D), start.new_zeros(B), start.new_zeros(B, D), start.new_zeros(B)
+        u, taken = None, start.new_zeros(B)
+        for active, sn, sb, sr, sm, su in lloyd(decoder, mems, start, steps, tol):
+            n[active], b[active], r[active], m[active] = sn, sb, sr, sm
+            if su is not None:
+                u = start.new_zeros(B, 2, D) if u is None else u
+                u[active] = su
+            taken[active] += 1
+        parts.append(Split(n, b, r, m, u, taken))
+    return cat_splits(parts)
 
 
 @torch.no_grad()
-def split(decoder, fr, steps, batch):
-    """The next depth's frontier, every node split by its hyperplane and empty children dropped, and each
-    image's token cost in bits under the decoder's shares (the rare side's p = m / (1 + m)) [N]."""
-    n, b, r, m = choose(decoder, fr, steps, batch)
+def split(decoder, fr, steps, batch, tol=0.0):
+    """The next depth's frontier, every node split by its hyperplane and empty children dropped, each image's
+    token cost in bits under the decoder's shares (the rare side's p = m / (1 + m)) [N], and the Split."""
+    s = choose(decoder, fr, steps, batch, tol)
+    child, token_bits = children(fr, s, batch)
+    return child, token_bits, s
+
+
+@torch.no_grad()
+def children(fr, s: Split, batch=8192):
+    """split's frontier and token costs for every node's Split s; a seeded Split seeds each child with its
+    side's predicted direction."""
+    n, b, r, m = s.n, s.b, s.r, s.m
     side = torch.cat([(fr.R[i:i + batch] * n[fr.node[i:i + batch]]).sum(-1) >= b[fr.node[i:i + batch]]
                       for i in range(0, len(fr.R), batch)])
     p_rare = (m / (1 + m))[fr.node]
@@ -288,15 +436,33 @@ def split(decoder, fr, steps, batch):
     children, node = torch.unique(fr.node * 2 + side, return_inverse=True)
     parent, rare = children // 2, (children % 2).bool()
     child_delta = torch.where(rare[:, None], r[parent], -m[parent, None] * r[parent])
+    seed = None if s.u is None else torch.where(rare[:, None], s.u[parent, 0], s.u[parent, 1])
     p, rare = parent.cpu(), rare.cpu()
     child = Frontier(R=fr.R - delta, node=node,
                      bits=child_key(fr.bits[p], rare, fr.depth),
                      deltas=torch.cat([fr.deltas[p], child_delta.half().cpu()[:, None]], 1),
                      sides=torch.cat([fr.sides[p], (2 * rare.float() - 1)[:, None]], 1),
-                     ms=torch.cat([fr.ms[p], m[parent].cpu()[:, None]], 1))
+                     ms=torch.cat([fr.ms[p], m[parent].cpu()[:, None]], 1), seed=seed)
     return child, token_bits
 
 
-def descend(decoder, fr, steps, batch):
-    """The next depth's frontier (split's, without the token costs)."""
-    return split(decoder, fr, steps, batch)[0]
+def descend(decoder, fr, steps, batch, tol=0.0):
+    """The next depth's frontier (split's, without the token costs or the Split)."""
+    return split(decoder, fr, steps, batch, tol)[0]
+
+
+def load_tree(ckpt, device):
+    """A trained tree's decoders, one per depth (the same SharedDecoder at every depth for a one-model tree),
+    from its checkpoint (train.py's or train_walk.py's)."""
+    if "shared" in ckpt:
+        config = dict(ckpt["shared"]["config"], scaled="scales" in ckpt["shared"]["state_dict"],
+                      seeded=any(k.startswith("dir_head.") for k in ckpt["shared"]["state_dict"]))
+        decoder = SharedDecoder(**config).to(device)
+        decoder.load_state_dict(ckpt["shared"]["state_dict"])
+        return [decoder.eval()] * ckpt["shared"]["config"]["depths"]
+    decoders = []
+    for cfg, state in zip(ckpt["configs"], ckpt["decoders"]):
+        decoder = DeltaDecoder(**cfg).to(device)
+        decoder.load_state_dict(state)
+        decoders.append(decoder.eval())
+    return decoders
