@@ -76,7 +76,8 @@ def main():
     args = SimpleNamespace(depths=a.depths, max_nodes=a.max_nodes, lloyd_steps=a.lloyd_steps, tol=0.0,
                            dir_weight=1.0, batch=a.batch, ema=0.95)
     gen = torch.Generator().manual_seed(0)
-    graphs = GraphedDepths(dec, a.batch, a.lloyd_steps, a.batch * D) if a.graphs else None
+    graphs = GraphedDepths(dec, a.batch, a.batch * D) if a.graphs else None
+    caps = [a.lloyd_steps] * dec.depths
     if graphs is not None and a.check:
         for trial in range(3):  # the first records the graphs; the later ones replay them
             idx = torch.randint(len(X), (a.batch,), generator=gen).to(device)
@@ -84,7 +85,7 @@ def main():
             for g in (None, graphs):
                 for q in dec.parameters():
                     q.grad = torch.zeros_like(q) if q.grad is None else q.grad.zero_()
-                stats, keys = train_step(dec, X[idx], mean, None, args, g)
+                stats, keys = train_step(dec, X[idx], mean, None, args, caps, g)
                 results.append((stats, keys, torch.cat([q.grad.flatten() for q in dec.parameters()
                                                         if q.grad is not None])))
             (s0, k0, g0), (s1, k1, g1) = results
@@ -95,7 +96,7 @@ def main():
         idx = torch.randint(len(X), (a.batch,), generator=gen).to(device)
         opt.zero_grad(set_to_none=graphs is None)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=a.amp):
-            stats, _ = train_step(dec, X[idx], mean, grams, args, graphs)
+            stats, _ = train_step(dec, X[idx], mean, grams, args, caps, graphs)
         torch.nn.utils.clip_grad_norm_(dec.parameters(), 1.0)
         opt.step()
         return stats

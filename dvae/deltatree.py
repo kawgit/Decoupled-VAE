@@ -499,6 +499,13 @@ def descend(decoder, fr, steps, batch, tol=0.0):
     return split(decoder, fr, steps, batch, tol)[0]
 
 
+def tree_steps(ckpt, depths):
+    """Each depth's Lloyd steps [depths]: a step-curriculum tree's own caps (train_walk.py), else the one
+    --lloyd-steps it was built with."""
+    caps = ckpt.get("caps")
+    return list(caps)[:depths] if caps is not None else [ckpt["args"]["lloyd_steps"]] * depths
+
+
 def load_tree(ckpt, device):
     """A trained tree's decoders, one per depth (the same SharedDecoder at every depth for a one-model tree),
     from its checkpoint (train.py's or train_walk.py's)."""

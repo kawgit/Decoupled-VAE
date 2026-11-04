@@ -17,7 +17,7 @@ import torch  # noqa: E402
 
 from dvae.artifacts import artifact  # noqa: E402
 from dvae.data import get_device, load_mnist  # noqa: E402
-from dvae.deltatree import D, lloyd, load_tree, pixels, root_frontier, split  # noqa: E402
+from dvae.deltatree import D, lloyd, load_tree, pixels, root_frontier, split, tree_steps  # noqa: E402
 
 
 @torch.no_grad()
@@ -68,7 +68,7 @@ def main():
     decoders, args = load_tree(ckpt, device), ckpt["args"]
     for d in decoders:
         d.eval()
-    trained, tol = args["lloyd_steps"], args.get("tol", 0.0)
+    trained, tol = tree_steps(ckpt, len(decoders)), args.get("tol", 0.0)
     X = pixels(load_mnist("val", a.data_root)).to(device)
     mean = ckpt["mean"].to(device)
     out = open(artifact("probe.txt"), "a")
@@ -79,7 +79,7 @@ def main():
         out.flush()
 
     shown = [t for t in (1, 2, 4, 8, 16, 32, 64) if t <= a.most]
-    report(f"{a.ckpt}: trained with {trained} Lloyd steps; val mse after each depth's split (on the tree as "
+    report(f"{a.ckpt}: trained with {trained} Lloyd steps per depth; val mse after each depth's split (on the tree as "
            f"trained) if every node there stopped after s steps, or at its best predicted step among the first s")
     report("depth  before   " + "  ".join(f"s={s:<5d}" for s in shown) + "  | best of " +
            "  ".join(f"{s:<6d}" for s in shown))
@@ -92,7 +92,7 @@ def main():
         report(f"{depth:5d}  {fr.R.square().sum().item() / N:.5f}  "
                + "  ".join(f"{sse[s - 1].item() / N:.5f}" for s in shown) + "  | "
                + "  ".join(f"{best[s - 1].item() / N:.5f}" for s in shown))
-        fr, _, _ = split(decoder, fr, trained, a.batch, tol)
+        fr, _, _ = split(decoder, fr, trained[depth], a.batch, tol)
     report("mean change per depth: " + "  ".join(f"s={s} {totals[0, s - 1].item() / N / len(decoders):+.6f}"
                                                  for s in shown)
            + " | best of: " + "  ".join(f"{s} {totals[1, s - 1].item() / N / len(decoders):+.6f}" for s in shown))

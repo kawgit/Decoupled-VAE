@@ -21,7 +21,7 @@ import torch
 from PIL import Image
 
 from dvae.data import get_device, load_mnist
-from dvae.deltatree import D, child_key, load_tree, node_order, pixels, root_frontier, split
+from dvae.deltatree import D, child_key, load_tree, node_order, pixels, root_frontier, split, tree_steps
 
 
 def png_uri(pixels):
@@ -47,12 +47,12 @@ class Depth:
 
 
 class Tree:
-    def __init__(self, decoders, X, mean, steps, batch, tol, top):
+    def __init__(self, decoders, X, mean, steps, batch, tol, top):  # steps: each depth's
         self.X, self.top = X.cpu(), top
         fr = root_frontier(X, mean)
         self.depths = []
-        for decoder in decoders:
-            child, _, s = split(decoder, fr, steps, batch, tol)
+        for decoder, depth_steps in zip(decoders, steps):
+            child, _, s = split(decoder, fr, depth_steps, batch, tol)
             self.depths.append(Depth(fr, X, (s.m / (1 + s.m)).cpu()))
             fr = child
         self.depths.append(Depth(fr, X, None))  # the leaves
@@ -178,7 +178,8 @@ def main():
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     decoders, a = load_tree(ckpt, device), ckpt["args"]
     X = pixels(load_mnist("train", args.data_root)[:args.limit]).to(device)
-    tree = Tree(decoders, X, ckpt["mean"].to(device), a["lloyd_steps"], a["node_batch"], a.get("tol", 0.0), args.top)
+    tree = Tree(decoders, X, ckpt["mean"].to(device), tree_steps(ckpt, len(decoders)), a["node_batch"],
+                a.get("tol", 0.0), args.top)
     print(f"{len(X)} training images down {tree.K} depths ({device})")
     serve(tree, args.port, not args.no_browser, {"ckpt": args.ckpt, "N": len(X), "K": tree.K, "top": args.top})
 

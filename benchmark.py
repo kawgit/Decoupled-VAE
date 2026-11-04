@@ -17,7 +17,7 @@ import torch
 
 from dvae.artifacts import artifact
 from dvae.data import get_device, load_mnist
-from dvae.deltatree import D, load_tree, pixels, root_frontier, split
+from dvae.deltatree import D, load_tree, pixels, root_frontier, split, tree_steps
 
 
 def bucket(mu, buckets):
@@ -45,7 +45,7 @@ def main():
 
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     a, mean = ckpt["args"], ckpt["mean"].to(device)
-    steps, batch = a["lloyd_steps"], a["node_batch"]
+    batch = a["node_batch"]
     images = {"val": load_mnist("val", args.data_root)[:a["limit_val"]],
               "test": load_mnist("test", args.data_root)[:args.limit_test]}
     X = {s: pixels(im).to(device) for s, im in images.items()}
@@ -55,11 +55,12 @@ def main():
 
     rows = []
     decoders = load_tree(ckpt, device)
+    steps = tree_steps(ckpt, len(decoders))
     for k in range(len(decoders) + 1):
         if k:
             decoder = decoders[k - 1]
             for s in fr:
-                fr[s], token_bits, _ = split(decoder, fr[s], steps, batch, a.get("tol", 0.0))
+                fr[s], token_bits, _ = split(decoder, fr[s], steps[k - 1], batch, a.get("tol", 0.0))
                 code[s] += token_bits
         mu = {s: X[s] - fr[s].R for s in fr}
         table = fit_levels(mu["val"], levels["val"], args.buckets, args.alpha)

@@ -14,12 +14,12 @@ from dvae.deltatree import D, Frontier, SharedDecoder, Split, bisector, split_ss
 
 
 class GraphedDepths:
-    """Graphed depth steps for full batches of batch images, Lloyd steps queries per node and no seeds or
-    tolerance, the loss divided by denom before its backward."""
+    """Graphed depth steps for full batches of batch images, no seeds or tolerance, the loss divided by denom
+    before its backward. Each depth's Lloyd steps are given per run (a graph per step count)."""
 
-    def __init__(self, decoder: SharedDecoder, batch, steps, denom):
+    def __init__(self, decoder: SharedDecoder, batch, denom):
         assert decoder.dir_head is None, "seeded decoders are not graphed"
-        self.decoder, self.batch, self.steps, self.denom = decoder, batch, steps, denom
+        self.decoder, self.batch, self.denom = decoder, batch, denom
         device = decoder.starts.device
         self.params = [p for p in decoder.parameters() if p.requires_grad]
         for p in self.params:
@@ -33,9 +33,9 @@ class GraphedDepths:
         self.sides = torch.zeros(self.most, K, device=device)
         self.ms = torch.zeros(self.most, K, device=device)
         self.pool = torch.cuda.graph_pool_handle()
-        self.graphs = {}  # (depth, padded nodes) -> (graph, its outputs)
+        self.graphs = {}  # (depth, padded nodes, steps) -> (graph, its outputs)
 
-    def body(self, k, P):
+    def body(self, k, P, steps):
         """One depth's objective for the images in self.R at nodes self.node (of P), its backward, and the last
         step's split, as chunk_sse computes them."""
         dec, R, node = self.decoder, self.R, self.node
@@ -45,37 +45,38 @@ class GraphedDepths:
         n, b = dec.start_at(k).expand(P, D), R.new_zeros(P)
         total = R.new_zeros(P)
         last = (n, b, n, b)
-        for step in range(self.steps):
+        for step in range(steps):
             r, m, _ = dec.query(mems, n, b)
             rare = (R * n[node]).sum(-1) >= b[node]
             rare_n = R.new_zeros(P).index_add_(0, node, rare.to(R.dtype))
             rare_sum = R.new_zeros(P, D).index_add_(0, node, R * rare[:, None])
             total = total + split_sse(r, m, rare_n, rare_sum, all_n, all_sum)
             last = (n, b, r.detach(), m.detach())
-            if step + 1 < self.steps:
+            if step + 1 < steps:
                 n, b = bisector(r.detach(), m.detach())
-        sse = total.sum() / self.steps
+        sse = total.sum() / steps
         (sse / self.denom).backward()
         return sse.detach(), last
 
-    def record(self, k, P):
+    def record(self, k, P, steps):
         saved = [p.grad.clone() for p in self.params if p.grad is not None]
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):  # warm up (cuDNN picks its algorithms) off the graph
             for _ in range(2):
-                self.body(k, P)
+                self.body(k, P, steps)
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self.pool):
-            out = self.body(k, P)
+            out = self.body(k, P, steps)
         for p, g in zip(self.params, saved):  # undo the warm-ups' gradients
             assert p.grad is not None
             p.grad.copy_(g)
-        self.graphs[(k, P)] = (graph, out)
+        self.graphs[(k, P, steps)] = (graph, out)
 
-    def run(self, fr: Frontier):
-        """chunk_sse's objective over all of fr's images (backward done) and every node's Split."""
+    def run(self, fr: Frontier, steps):
+        """chunk_sse's objective over all of fr's images (backward done) and every node's Split, after steps
+        Lloyd steps."""
         k, Nn = fr.depth, len(fr.bits)
         P = 1 << max(0, Nn - 1).bit_length()
         self.R.copy_(fr.R)
@@ -83,9 +84,9 @@ class GraphedDepths:
         self.deltas[:Nn, :k].copy_(fr.deltas)
         self.sides[:Nn, :k].copy_(fr.sides)
         self.ms[:Nn, :k].copy_(fr.ms)
-        if (k, P) not in self.graphs:
-            self.record(k, P)
-        graph, (sse, (n, b, r, m)) = self.graphs[(k, P)]
+        if (k, P, steps) not in self.graphs:
+            self.record(k, P, steps)
+        graph, (sse, (n, b, r, m)) = self.graphs[(k, P, steps)]
         graph.replay()
-        steps = torch.full((Nn,), float(self.steps), device=n.device)
-        return sse.clone(), Split(n[:Nn].clone(), b[:Nn].clone(), r[:Nn].clone(), m[:Nn].clone(), None, steps)
+        taken = torch.full((Nn,), float(steps), device=n.device)
+        return sse.clone(), Split(n[:Nn].clone(), b[:Nn].clone(), r[:Nn].clone(), m[:Nn].clone(), None, taken)

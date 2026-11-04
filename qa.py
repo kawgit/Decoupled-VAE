@@ -14,20 +14,21 @@ import torch
 
 from dvae.artifacts import artifact
 from dvae.data import get_device, load_mnist
-from dvae.deltatree import D, Frontier, child_key, choose, descend, load_tree, pixels, root_frontier
+from dvae.deltatree import D, Frontier, child_key, choose, descend, load_tree, pixels, root_frontier, tree_steps
 from dvae.viz import save_grid
 
 
 @torch.no_grad()
 def sample(decoders, mean, n, steps, batch, tol, generator):
-    """n codes drawn from the decoders, and their predicted means after every token [n, K, D]."""
+    """n codes drawn from the decoders (each depth with its steps), and their predicted means after every token
+    [n, K, D]."""
     device = mean.device
     fr = root_frontier(mean.new_zeros(0, D), mean)
     fr = Frontier(R=fr.R, node=fr.node, bits=fr.bits.expand(n).clone(), deltas=fr.deltas.expand(n, 0, D),
                   sides=fr.sides.expand(n, 0), ms=fr.ms.expand(n, 0))
     out, x = [], mean.expand(n, D)
-    for decoder in decoders:
-        s = choose(decoder, fr, steps, batch, tol)
+    for decoder, depth_steps in zip(decoders, steps):
+        s = choose(decoder, fr, depth_steps, batch, tol)
         r, m = s.r, s.m
         rare = torch.rand(n, generator=generator).to(device) < m / (1 + m)
         delta = torch.where(rare[:, None], r, -m[:, None] * r)
@@ -57,7 +58,7 @@ def main():
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     decoders = load_tree(ckpt, device)
     a, mean = ckpt["args"], ckpt["mean"].to(device)
-    steps, batch, K, tol = a["lloyd_steps"], a["node_batch"], len(decoders), a.get("tol", 0.0)
+    steps, batch, K, tol = tree_steps(ckpt, len(decoders)), a["node_batch"], len(decoders), a.get("tol", 0.0)
     args.out = args.out or artifact("")
     os.makedirs(args.out, exist_ok=True)
 
@@ -66,8 +67,8 @@ def main():
     T = pixels(load_mnist("train", args.data_root)).to(device)
     fr = {"test": root_frontier(X, mean), "train": root_frontier(T, mean)}
     preds, empirical = [X], [X]
-    for decoder in decoders:
-        fr = {split: descend(decoder, f, steps, batch, tol) for split, f in fr.items()}
+    for decoder, depth_steps in zip(decoders, steps):
+        fr = {split: descend(decoder, f, depth_steps, batch, tol) for split, f in fr.items()}
         preds.append(X - fr["test"].R)
         code = fr["test"].bits[fr["test"].node.cpu()]
         train_code = fr["train"].bits[fr["train"].node.cpu()]
