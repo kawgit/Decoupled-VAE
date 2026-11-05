@@ -1,10 +1,10 @@
-"""Human QA of the autoencoder (train_autoencoder.py): a local web page for browsing its code tree, one node
+"""Human QA of the encoder (train_encoder.py): a local web page for browsing its code tree, one node
 at a time.
 
 The tree is deterministic, so every training image lies in exactly one node per depth. The script routes them
 all down the tree once and serves each node on request. The left of the page shows the focused node and its
 two children, each with its predicted mean image (what the code decodes to) beside the actual mean of its
-training images, its share of the parent's images (actual, and as the decoder predicts it) and its mse; the
+training images, its share of the parent's images (actual, and as the encoder predicts it) and its mse; the
 right shows the node's training images, closest to its predicted mean first. Stop it with Ctrl-C.
 """
 
@@ -47,16 +47,16 @@ class Depth:
 
 
 class Tree:
-    def __init__(self, decoders, X, mean, steps, batch, tol, top):  # steps: each depth's
+    def __init__(self, encoders, X, mean, steps, batch, tol, top):  # steps: each depth's
         self.X, self.top = X.cpu(), top
         fr = root_frontier(X, mean)
         self.depths = []
-        for decoder, depth_steps in zip(decoders, steps):
-            child, _, s = split(decoder, fr, depth_steps, batch, tol)
+        for encoder, depth_steps in zip(encoders, steps):
+            child, _, s = split(encoder, fr, depth_steps, batch, tol)
             self.depths.append(Depth(fr, X, (s.m / (1 + s.m)).cpu()))
             fr = child
         self.depths.append(Depth(fr, X, None))  # the leaves
-        self.K = len(decoders)
+        self.K = len(encoders)
         self.pngs: dict[int, str] = {}
 
     def locate(self, code):
@@ -176,9 +176,9 @@ def main():
     device = get_device(args.device)
 
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-    decoders, a = load_tree(ckpt, device), ckpt["args"]
+    encoders, a = load_tree(ckpt, device), ckpt["args"]
     X = pixels(load_mnist("train", args.data_root)[:args.limit]).to(device)
-    tree = Tree(decoders, X, ckpt["mean"].to(device), tree_steps(ckpt, len(decoders)), a["node_batch"],
+    tree = Tree(encoders, X, ckpt["mean"].to(device), tree_steps(ckpt, len(encoders)), a["node_batch"],
                 a.get("tol", 0.0), args.top)
     print(f"{len(X)} training images down {tree.K} depths ({device})")
     serve(tree, args.port, not args.no_browser, {"ckpt": args.ckpt, "N": len(X), "K": tree.K, "top": args.top})

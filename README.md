@@ -9,14 +9,14 @@ plot every epoch, with a QA script for each trained model:
 
 | Stage | Script | What it learns | QA |
 |---|---|---|---|
-| 1 | `train_autoencoder.py` | the tree: where each node splits, and each node's mean image | `qa_autoencoder.py` |
-| 2 | `dump_autoencoder.py` | (no training) every image's code and the splits along it | |
+| 1 | `train_encoder.py` | the tree: where each node splits, and each node's mean image | `qa_encoder.py` |
+| 2 | `dump_encoder.py` | (no training) every image's code and the splits along it | |
 | 3 | `train_prior.py` | which codes are valid: p(each token's side given the ones before) | `qa_prior.py` |
-| 4 | `train_categorical_decoder.py` | p(image given its code), 256 grey levels per pixel | `qa_categorical_decoder.py` |
+| 4 | `train_decoder.py` | p(image given its code), 256 grey levels per pixel | `qa_decoder.py` |
 
 ## How it works
 
-### Stage 1: the autoencoder
+### Stage 1: the encoder
 
 **Nodes and remainders.** Pixels are grey levels' bin centers, (level + 0.5) / 256. The root's predicted mean is
 the training mean; each token adds a delta, so a node's predicted mean is the training mean plus its deltas so
@@ -35,8 +35,12 @@ p\,r + (1 - p)(-m\,r) = 0 \quad\text{when}\quad m = \frac{p}{1 - p}.
 remainders' top principal direction at that depth) and each Lloyd step moves it to the bisector of the two
 predicted side means: normal $r / \lvert r\rvert$, bias $\lvert r\rvert (1 - m) / 2$. After a fixed number of
 steps (`--lloyd-steps`), the image goes to the side it lies on, and the side's predicted delta extends its
-history. Every query depends only on the code, never on the image, so decoding replays the encoder's choices
-exactly: the same network is both encoder and decoder, hence *autoencoder*.
+history. Every query depends only on the code, never on the image, so a code alone replays the encoder's choices
+exactly and maps back to its node's predicted mean image.
+
+**Seeing the node.** With `--node-mean`, the network also reads each node's predicted mean image, through a
+small convolutional net, as one more memory token beside the history of deltas. It adds no information (the mean
+follows from the deltas) but shows the network what the node looks like, which is what made the prior work.
 
 **Training.** Batches walk down the tree depth by depth. At every node the network is trained on the actual
 side means of the batch's images there (each side weighted by its image count, so every image counts once per
@@ -46,22 +50,22 @@ the full code.
 
 ### Two share predictions, two purposes
 
-The autoencoder already predicts each split's shares (its $m$), and the prior predicts them again. They answer to
+The encoder already predicts each split's shares (its $m$), and the prior predicts them again. They answer to
 different objectives:
 
-- **The autoencoder's purpose is to produce a space with an easy-to-learn prior.** Its $m$ is trained only so that
+- **The encoder's purpose is to produce a space with an easy-to-learn prior.** Its $m$ is trained only so that
   its side means come out right.
 - **The prior's purpose is to learn which codes in that space are valid.** It is trained on cross-entropy alone,
-  so it fixes the autoencoder's mistakes in exactly the quantity that sampling and compression depend on.
+  so it fixes the encoder's mistakes in exactly the quantity that sampling and compression depend on.
 
 With unlimited data and model capacity both would converge to the same shares. With finite ones they compromise
 in different places, and the prior's compromise is the one that matters for generation.
 
 ### Stage 2: the dump
 
-`dump_autoencoder.py` sends every train, val and test image down the frozen autoencoder once and keeps, at every
+`dump_encoder.py` sends every train, val and test image down the frozen encoder once and keeps, at every
 depth, its side and the split there ($r$ and $m$, half precision), plus the labels and the training mean. Splits
-depend only on the code, so later stages never need the autoencoder's network: a node's predicted mean is the
+depend only on the code, so later stages never need the encoder's network: a node's predicted mean is the
 training mean plus the deltas $r$ or $-m\,r$ so far.
 
 ### Stage 3: the prior
@@ -77,16 +81,16 @@ every depth. Depths need different amounts of training, so early stopping runs s
 depths: each band keeps the weights of its own best val epoch, and the kept prior answers each depth with its
 band's weights.
 
-### Stage 4: the categorical decoder
+### Stage 4: the decoder
 
-`train_categorical_decoder.py` trains $p(x \mid \text{code})$: 256 logits per pixel from the code's history and its
-node's predicted mean image. It adds what the autoencoder's mean leaves out, each pixel's spread around it.
+`train_decoder.py` trains $p(x \mid \text{code})$: 256 logits per pixel from the code's history and its
+node's predicted mean image. It adds what the encoder's mean leaves out, each pixel's spread around it.
 Test images are then scored as $-\log_2 p(\text{code}) - \log_2 p(x \mid \text{code})$, the one-code upper bound
-on $-\log_2 p(x)$, with the code priced by the prior (`--prior`) or else by the autoencoder's own shares.
+on $-\log_2 p(x)$, with the code priced by the prior (`--prior`) or else by the encoder's own shares.
 
 ## Results so far
 
-Autoencoder `344-fixed8-nocap` at epoch 96: 97 tokens, 8 Lloyd steps per node, still growing one depth per epoch.
+Encoder `344-fixed8-nocap` at epoch 96: 97 tokens, 8 Lloyd steps per node, still growing one depth per epoch.
 
 | | train images | test images |
 |---|---|---|
@@ -99,15 +103,15 @@ Bits per image for the same 97-token codes on the test set (lower is better; a f
 
 | codes priced by | bits per image | bits per token at depths 65-97 |
 |---|---|---|
-| the autoencoder's own shares | 96.97 | 0.999 |
+| the encoder's own shares | 96.97 | 0.999 |
 | the best constant share per depth | 96.93 | 0.999 |
 | prior, 256 wide x 4 layers | 95.65 | 0.979 |
 | prior with side-mean images (`--images`) | **90.84** | **0.894** |
 
-Samples from the image prior are visibly cleaner than from the autoencoder's own shares (about 7 garbled digits
+Samples from the image prior are visibly cleaner than from the encoder's own shares (about 7 garbled digits
 in 64, against about 12).
 
-The categorical decoder on the same codes (4.5M parameters, run `371-categorical-fixed8`) brings the whole model
+The decoder on the same codes (4.5M parameters, run `371-categorical-fixed8`) brings the whole model
 to **1.2355 bits per dimension on the test set** (671 nats per image): 90.84 bits for the code under the image
 prior, then 1.1196 bits per pixel given it. Its most likely level per pixel turns the blurry mean images into
 crisp strokes.
@@ -122,32 +126,32 @@ The device is picked automatically (CUDA, then Apple's MPS, then the CPU); `--de
 files go to `artifacts/<job>/`, named by `$DVAE_JOB` or else by the script and the time.
 
 ```bash
-python train_autoencoder.py --depths 0 --lloyd-steps 8 --lr 1e-4 --max-nodes 1024 --tf32
-python dump_autoencoder.py --ckpt artifacts/<autoencoder job>/model.pt
+python train_encoder.py --depths 0 --lloyd-steps 8 --lr 1e-4 --max-nodes 1024 --tf32
+python dump_encoder.py --ckpt artifacts/<encoder job>/model.pt
 python train_prior.py --codes artifacts/<dump job> --images --tf32
-python train_categorical_decoder.py --codes artifacts/<dump job> --prior artifacts/<prior job>/prior.pt --tf32
+python train_decoder.py --codes artifacts/<dump job> --prior artifacts/<prior job>/prior.pt --tf32
 
-python qa_autoencoder.py --ckpt artifacts/<autoencoder job>/model.pt
+python qa_encoder.py --ckpt artifacts/<encoder job>/model.pt
 python qa_prior.py --prior artifacts/<prior job>/prior.pt
-python qa_categorical_decoder.py --decoder artifacts/<decoder job>/decoder.pt --prior artifacts/<prior job>/prior.pt
+python qa_decoder.py --decoder artifacts/<decoder job>/decoder.pt --prior artifacts/<prior job>/prior.pt
 python benchmark.py --decoder artifacts/<decoder job>/decoder.pt --prior artifacts/<prior job>/prior.pt
 ```
 
-`train_autoencoder.py --resume <model.pt>` continues a run from its checkpoint, which holds the whole training
+`train_encoder.py --resume <model.pt>` continues a run from its checkpoint, which holds the whole training
 state. The QA scripts write:
 
-- `qa_autoencoder.py`: `compress_train.png` and `compress_test.png` (images, then their reconstructions after a
+- `qa_encoder.py`: `compress_train.png` and `compress_test.png` (images, then their reconstructions after a
   spread of token counts), and `mse.png` (mse by code length, training against test images).
 - `qa_prior.py`: `samples_t<T>.png` (8 x 8 samples per temperature), `samples_own.png` (the same random draws
-  with the autoencoder's own shares), `generate.png` (samples token by token) and `real.png`.
-- `qa_categorical_decoder.py`: from the same sampled codes, `samples_means.png` (the autoencoder's mean images),
+  with the encoder's own shares), `generate.png` (samples token by token) and `real.png`.
+- `qa_decoder.py`: from the same sampled codes, `samples_means.png` (the encoder's mean images),
   `samples_pixels.png` (one draw from $p(x \mid \text{code})$), `samples_mode.png` and `real.png`.
 
 `benchmark.py` scores the whole model's test bits per dimension, each image's
 $-\log_2 p(\text{code}) - \log_2 p(x \mid \text{code})$, with the code priced by the prior and by the
-autoencoder's own shares side by side (`benchmark.md` and `.json`).
+encoder's own shares side by side (`benchmark.md` and `.json`).
 
-`browse.py` serves a local web page for walking through an autoencoder's tree one node at a time.
+`browse.py` serves a local web page for walking through an encoder's tree one node at a time.
 
 Type checking (pyright's basic mode) must end with 0 errors and 0 warnings:
 
@@ -173,11 +177,11 @@ The repo lives at `/projectnb/cs599bg/kawgit56/Decoupled-VAE`, with the venv bes
 
 | | |
 |---|---|
-| `dvae/deltatree.py` | the autoencoder's network, Lloyd's algorithm, frontiers and splits, the categorical decoder's network |
+| `dvae/deltatree.py` | the encoder's network, Lloyd's algorithm, frontiers and splits, the decoder's network |
 | `dvae/prior.py` | the prior's network, banded priors, and code costs under a prior |
 | `dvae/codes.py` | loading dumps, deltas and bit costs |
-| `dvae/categorical.py` | the categorical decoder's data, code and pixel bits |
-| `dvae/sampling.py` | sampling codes down the tree, from the autoencoder's shares or a prior |
+| `dvae/decoder.py` | the decoder's data, code and pixel bits |
+| `dvae/sampling.py` | sampling codes down the tree, from the encoder's shares or a prior |
 | `dvae/plots.py` | each stage's progress plot |
 | `dvae/data.py`, `dvae/artifacts.py`, `dvae/logs.py`, `dvae/viz.py` | data, output folders, logs, image grids |
 | `scc/` | holders, the queue and helpers for BU's SCC |

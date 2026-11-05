@@ -1,13 +1,13 @@
-"""Compression QA for the autoencoder (train_autoencoder.py), on training and test images alike, so the two show
+"""Compression QA for the encoder (train_encoder.py), on training and test images alike, so the two show
 how well it generalizes.
 
 compress_train.png and compress_test.png: images, each followed by its node's predicted mean (its reconstruction)
 after a spread of token counts ending with the last. mse.png: the mse per pixel after every token count, over
 --score training and --score test images. With --train-means, compress_train_means.png: each test image's node
-shown as the mean of the training images in it (what an ideal decoder of the same tree would show; blank where
-the node holds none), which sends every training image down the tree.
+shown as the mean of the training images in it (what exact predicted means of the same tree would show; blank
+where the node holds none), which sends every training image down the tree.
 
-Run from the repo: python qa_autoencoder.py --ckpt artifacts/<run>/model.pt   (pictures go to artifacts/<job>/)
+Run from the repo: python qa_encoder.py --ckpt artifacts/<run>/model.pt   (pictures go to artifacts/<job>/)
 """
 
 import argparse
@@ -22,13 +22,13 @@ import torch  # noqa: E402
 from dvae.artifacts import artifact  # noqa: E402
 from dvae.data import get_device, load_mnist  # noqa: E402
 from dvae.deltatree import D, descend, pixels, root_frontier  # noqa: E402
-from dvae.sampling import columns, load_autoencoder  # noqa: E402
+from dvae.sampling import columns, load_encoder  # noqa: E402
 from dvae.viz import save_grid  # noqa: E402
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--ckpt", required=True, help="train_autoencoder.py's checkpoint")
+    p.add_argument("--ckpt", required=True, help="train_encoder.py's checkpoint")
     p.add_argument("-n", type=int, default=16, help="training and test images shown compressed")
     p.add_argument("--score", type=int, default=1000, help="training and test images whose mse is measured")
     p.add_argument("--cols", type=int, default=16, help="columns per grid, the first being the image")
@@ -39,8 +39,8 @@ def main():
     p.add_argument("--data-root", default="data")
     args = p.parse_args()
     device = get_device(args.device)
-    decoders, mean, steps, batch, tol = load_autoencoder(args.ckpt, device)
-    K = len(decoders)
+    encoders, mean, steps, batch, tol = load_encoder(args.ckpt, device)
+    K = len(encoders)
     out = args.out or artifact("")
     os.makedirs(out, exist_ok=True)
 
@@ -52,8 +52,8 @@ def main():
         fr["all"] = root_frontier(T, mean)
     preds = {s: [x] for s, x in X.items()}  # each split's images, then their predicted means after every token
     empirical = [X["test"][:args.n]]
-    for decoder, depth_steps in zip(decoders, steps):
-        fr = {s: descend(decoder, f, depth_steps, batch, tol) for s, f in fr.items()}
+    for encoder, depth_steps in zip(encoders, steps):
+        fr = {s: descend(encoder, f, depth_steps, batch, tol) for s, f in fr.items()}
         for s, x in X.items():
             preds[s].append(x - fr[s].R)
         if T is not None:

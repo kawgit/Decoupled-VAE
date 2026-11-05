@@ -1,4 +1,4 @@
-"""Sampling codes from the autoencoder's tree, and helpers the qa scripts share."""
+"""Sampling codes from the encoder's tree, and helpers the qa scripts share."""
 
 import torch
 
@@ -7,11 +7,11 @@ from dvae.prior import BandedPrior, SidePrior
 
 
 @torch.no_grad()
-def sample(decoders, mean, n, steps, batch, tol, generator, prior: SidePrior | BandedPrior | None = None,
+def sample(encoders, mean, n, steps, batch, tol, generator, prior: SidePrior | BandedPrior | None = None,
            temperature=1.0):
-    """n codes drawn down the autoencoder's tree (each depth with its Lloyd steps), as their predicted means after
+    """n codes drawn down the encoder's tree (each depth with its Lloyd steps), as their predicted means after
     every token [n, K, D], and the frontier they end at (its histories: deltas, sides and ms). Each token is rare
-    with the autoencoder's own probability m / (1 + m), or with a prior, with the prior's (its logit divided by
+    with the encoder's own probability m / (1 + m), or with a prior, with the prior's (its logit divided by
     temperature)."""
     device = mean.device
     rs, ms, rares = [], [], []  # the codes so far, as the prior reads them
@@ -19,12 +19,12 @@ def sample(decoders, mean, n, steps, batch, tol, generator, prior: SidePrior | B
     fr = Frontier(R=fr.R, node=fr.node, bits=fr.bits.expand(n).clone(), deltas=fr.deltas.expand(n, 0, D),
                   sides=fr.sides.expand(n, 0), ms=fr.ms.expand(n, 0))
     out, x = [], mean.expand(n, D)
-    for decoder, depth_steps in zip(decoders, steps):
-        s = choose(decoder, fr, depth_steps, batch, tol)
+    for encoder, depth_steps in zip(encoders, steps):
+        s = choose(encoder, fr, depth_steps, batch, tol)
         r, m = s.r, s.m
         p = m / (1 + m)
         if prior is not None:
-            rs.append(r.half().float())  # as dump_autoencoder.py stores them
+            rs.append(r.half().float())  # as dump_encoder.py stores them
             ms.append(m.half().float())
             unknown = torch.zeros(n, dtype=torch.bool, device=device)  # this token's side, which it doesn't read
             logits = prior(torch.stack(rs, 1), torch.stack(ms, 1), torch.stack(rares + [unknown], 1))
@@ -50,10 +50,10 @@ def columns(K, n):
     return [round(1 + (K - 1) * i / (n - 1)) for i in range(n)]
 
 
-def load_autoencoder(path, device):
-    """A train_autoencoder.py checkpoint as (its depths' decoders, training mean, Lloyd steps per depth, node
+def load_encoder(path, device):
+    """A train_encoder.py checkpoint as (its depths' encoders, training mean, Lloyd steps per depth, node
     batch, tol)."""
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    decoders = load_tree(ckpt, device)
+    encoders = load_tree(ckpt, device)
     a = ckpt["args"]
-    return decoders, ckpt["mean"].to(device), tree_steps(ckpt, len(decoders)), a["node_batch"], a.get("tol", 0.0)
+    return encoders, ckpt["mean"].to(device), tree_steps(ckpt, len(encoders)), a["node_batch"], a.get("tol", 0.0)

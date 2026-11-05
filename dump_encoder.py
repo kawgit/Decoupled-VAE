@@ -1,12 +1,12 @@
-"""Stage 2: dump the autoencoder's codes, for the prior (train_prior.py) and the categorical decoder
-(train_categorical_decoder.py). For every train, val and test image: its sides (rare or not) at every depth and
-the autoencoder's split at each node on its path (the rare side's mean delta r and the ratio m), routed by its
+"""Stage 2: dump the encoder's codes, for the prior (train_prior.py) and the decoder
+(train_decoder.py). For every train, val and test image: its sides (rare or not) at every depth and
+the encoder's split at each node on its path (the rare side's mean delta r and the ratio m), routed by its
 own Lloyd steps. Splits depend only on the code, never on which images reach a node, so images go down in
 chunks. Each split's file also holds the digit labels, the training mean (a node's predicted mean is it plus
 the deltas so far) and which checkpoint made it. Progress (each chunk, timestamped) goes to run.log beside the
 files.
 
-Run from the repo: python dump_autoencoder.py --ckpt artifacts/<run>/model.pt   (files go to artifacts/<job>/)
+Run from the repo: python dump_encoder.py --ckpt artifacts/<run>/model.pt   (files go to artifacts/<job>/)
 """
 
 import argparse
@@ -22,14 +22,14 @@ from dvae.logs import RunLog
 
 
 @torch.no_grad()
-def codes(decoders, steps, mean, X, batch, tol, chunk, log):
+def codes(encoders, steps, mean, X, batch, tol, chunk, log):
     """X's sides rare [N, K] (bool), m [N, K] and r [N, K, D] (half precision) along each image's path."""
     rares, ms, rs = [], [], []
     began = time.time()
     for i, part in enumerate(X.split(chunk)):
         fr = root_frontier(part.to(mean.device), mean)
-        for decoder, depth_steps in zip(decoders, steps):
-            fr = descend(decoder, fr, depth_steps, batch, tol)
+        for encoder, depth_steps in zip(encoders, steps):
+            fr = descend(encoder, fr, depth_steps, batch, tol)
         node = fr.node.cpu()
         rare, m, delta = fr.sides.cpu()[node] > 0, fr.ms.cpu()[node].float(), fr.deltas.cpu()[node].float()
         rares.append(rare)
@@ -51,22 +51,22 @@ def main():
     a = p.parse_args()
     device = get_device(a.device)
     ckpt = torch.load(a.ckpt, map_location=device, weights_only=False)
-    decoders, args = load_tree(ckpt, device), ckpt["args"]
-    steps, batch, tol = tree_steps(ckpt, len(decoders)), args["node_batch"], args.get("tol", 0.0)
+    encoders, args = load_tree(ckpt, device), ckpt["args"]
+    steps, batch, tol = tree_steps(ckpt, len(encoders)), args["node_batch"], args.get("tol", 0.0)
     mean = ckpt["mean"].to(device)
     out = a.out or artifact("")
     os.makedirs(out, exist_ok=True)
     log = RunLog(os.path.join(out, "run.log"), device)
-    log(f"=== dump_autoencoder.py {vars(a)}: {len(decoders)} tokens")
+    log(f"=== dump_encoder.py {vars(a)}: {len(encoders)} tokens")
     for split in a.splits:
         began = time.time()
         X = pixels(load_mnist(split, a.data_root)[:a.limit])
         log(f"{split}: {len(X)} images")
-        rare, m, r = codes(decoders, steps, mean, X, batch, tol, a.chunk, log)
+        rare, m, r = codes(encoders, steps, mean, X, batch, tol, a.chunk, log)
         path = os.path.join(out, f"{split}.pt")
         torch.save(dict(rare=rare, m=m, r=r, labels=load_labels(split, a.data_root)[:a.limit], mean=mean.cpu(),
-                        ckpt=a.ckpt, epoch=ckpt.get("epoch"), depths=len(decoders)), path)
-        log(f"{path}: {len(X)} codes of {len(decoders)} tokens, {rare.float().mean():.3f} of tokens rare "
+                        ckpt=a.ckpt, epoch=ckpt.get("epoch"), depths=len(encoders)), path)
+        log(f"{path}: {len(X)} codes of {len(encoders)} tokens, {rare.float().mean():.3f} of tokens rare "
             f"({time.time() - began:.0f}s)")
 
 

@@ -1,14 +1,18 @@
-"""Stage 1: train the autoencoder, a delta tree with one network for every depth (dvae/deltatree.py's
-SharedDecoder). It is both encoder and decoder: an image's code is the sides of the hyperplanes the network's
-Lloyd steps find down its path, and a code decodes to the network's predicted mean at its node.
+"""Stage 1: train the encoder, a delta tree with one network for every depth (dvae/deltatree.py's
+Encoder). An image's code is the sides of the hyperplanes the network's Lloyd steps find down its path, and
+a code also maps back to the network's predicted mean image at its node (the decoder, train_decoder.py, then
+models the pixels around it).
 
-Every step sends a batch of training images down the tree as the decoder now splits it. At each depth, every
-node the batch reaches runs Lloyd's algorithm on the decoder from its start; the decoder is trained on the
+Every step sends a batch of training images down the tree as the encoder now splits it. At each depth, every
+node the batch reaches runs Lloyd's algorithm on the encoder from its start; the encoder is trained on the
 actual side means of the batch's images there (each node's split error averaged over its Lloyd steps, each
 side weighted by its image count, so every image counts once per depth); and the last step's split, detached,
 takes the images to the next depth.
 
-Lloyd's starts: with --seeded, the decoder also predicts each side's top principal direction (trained on the
+With --node-mean, the network also reads each node's predicted mean image (one more memory token, from a small
+convolutional net), not only the history of deltas that led there.
+
+Lloyd's starts: with --seeded, the encoder also predicts each side's top principal direction (trained on the
 side's rank-1 PCA reconstruction error, weighted by --dir-weight), and a node starts from the direction its
 parent predicted for it; only the root starts from the training data's top direction. With --start root, every
 node starts from that same root direction. Otherwise (--start depth) every node of a depth starts from the
@@ -16,8 +20,8 @@ depth's top direction, a running average of the batches' remainders' Gram matrix
 eigenvector every --refresh steps. With --tol > 0, a node's Lloyd steps stop once its
 hyperplane moves by less than tol, and at --lloyd-steps at most; the steps taken are logged per depth.
 
-The decoder grows one depth every --grow-every epochs (1 by default; fractions grow mid-epoch), from 1 up to
---depths (dvae/deltatree.py's SharedDecoder.grow: new history positions and a new start), and every step trains
+The encoder grows one depth every --grow-every epochs (1 by default; fractions grow mid-epoch), from 1 up to
+--depths (dvae/deltatree.py's Encoder.grow: new history positions and a new start), and every step trains
 all its depths. The batch's split at the deepest one gives the next depth's remainders, which track that depth's
 start until it joins.
 
@@ -27,12 +31,12 @@ consecutive runs joined into batches, so a batch's images share more tokens and 
 cost does not depend on its images). C = --batch makes each batch one run; smaller C mixes more of the tree.
 
 Early stopping watches the held-out (val) images' mse after all --depths tokens, routed the same way, once the
-decoder has grown to them; every depth's val mse is logged. A checkpoint holds everything training needs (the
-optimizer's state, the tracked starts, the step and the history): saved every epoch while the decoder grows, then
+encoder has grown to them; every depth's val mse is logged. A checkpoint holds everything training needs (the
+optimizer's state, the tracked starts, the step and the history): saved every epoch while the encoder grows, then
 at each new best. --resume continues from one, growing on to --depths if that is deeper. The progress plot
 (dvae/plots.py's plot_depths) is redrawn every epoch.
 
-Next: dump_autoencoder.py writes every image's code for the prior and the categorical decoder.
+Next: dump_encoder.py writes every image's code for the prior and the decoder.
 """
 
 import argparse
@@ -48,7 +52,7 @@ import torch  # noqa: E402
 from dvae.artifacts import artifact  # noqa: E402
 from dvae.data import get_device, load_mnist  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
-from dvae.deltatree import (D, SharedDecoder, Split, by_nodes, cat_splits, children, chunk_sse, lloyd,  # noqa: E402
+from dvae.deltatree import (D, Encoder, Split, by_nodes, cat_splits, children, chunk_sse, lloyd,  # noqa: E402
                             node_order, pixels, root_frontier, split, top_direction)
 from dvae.plots import plot_depths  # noqa: E402
 
@@ -78,18 +82,18 @@ def fold(grams, depth, R, ema):
     grams[depth].mul_(ema).add_(R.T @ R / len(R), alpha=1 - ema)
 
 
-def depth_step(decoder, fr, args, steps):
+def depth_step(encoder, fr, args, steps):
     """One depth of train_step, steps Lloyd steps at its nodes, in pieces of at most --max-nodes nodes: the
     objective and PCA error summed over fr's images (backward done) and every node's Split."""
     if len(fr.bits) <= args.max_nodes:  # one piece: no sorting or cutting, which would wait on the GPU
-        sse, pca, _, _, s = chunk_sse(decoder, fr, None, steps, tol=args.tol, dir_weight=args.dir_weight)
+        sse, pca, _, _, s = chunk_sse(encoder, fr, None, steps, tol=args.tol, dir_weight=args.dir_weight)
         (sse / (args.batch * D)).backward()
         return sse.detach(), pca, s
     order, _ = node_order(fr)
     total, pca_total = fr.R.new_zeros(()), fr.R.new_zeros(())
     ids, parts = [], []
     for piece in by_nodes(order, fr.node[order], args.max_nodes):
-        sse, pca, _, piece_nodes, s = chunk_sse(decoder, fr, piece, steps, tol=args.tol, dir_weight=args.dir_weight)
+        sse, pca, _, piece_nodes, s = chunk_sse(encoder, fr, piece, steps, tol=args.tol, dir_weight=args.dir_weight)
         (sse / (args.batch * D)).backward()  # a fixed divisor, so every image weighs the same
         total, pca_total = total + sse.detach(), pca_total + pca
         ids.append(piece_nodes)
@@ -100,14 +104,14 @@ def depth_step(decoder, fr, args, steps):
                                    None if s.u is None else s.u[whole], s.steps[whole])
 
 
-def train_step(decoder, X, mean, grams, args, caps):
-    """Send the batch X down every depth of the decoder as it splits them (depth d with caps[d] Lloyd steps),
+def train_step(encoder, X, mean, grams, args, caps):
+    """Send the batch X down every depth of the encoder as it splits them (depth d with caps[d] Lloyd steps),
     accumulating each depth's gradient;
     without seeds, fold the remainders each depth sees into its running Gram matrix (grams [n, D, D]), and the
     next depth's too while grams has one more (it tracks its start before it joins). Returns, per depth [K]: the
     objective and the PCA reconstruction error summed over the batch, and the Lloyd steps taken and nodes split;
     and each image's key (child_key) at the deepest depth it reached [b], on the CPU."""
-    K = decoder.depths
+    K = encoder.depths
     ahead = grams is not None and len(grams) > K
     fr = root_frontier(X, mean, resident=True)
     zero = X.new_zeros(())
@@ -116,7 +120,7 @@ def train_step(decoder, X, mean, grams, args, caps):
         R = fr.R
         if grams is not None:
             fold(grams, depth, R, args.ema)
-        total, pca_total, s = depth_step(decoder, fr, args, caps[depth])
+        total, pca_total, s = depth_step(encoder, fr, args, caps[depth])
         sses[depth], pcas[depth] = total, pca_total
         steps[depth], nodes[depth] = s.steps.sum(), R.new_tensor(float(len(s.steps)))
         if depth + 1 < K or ahead:
@@ -129,18 +133,18 @@ def train_step(decoder, X, mean, grams, args, caps):
 
 
 @torch.no_grad()
-def refresh(decoder, grams, tracked):
+def refresh(encoder, grams, tracked):
     """Each tracked depth's start [n, D] from its running Gram matrix (a start keeps its sign from before), and
-    the decoder's depths' starts from those."""
+    the encoder's depths' starts from those."""
     for depth, gram in enumerate(grams):
         gram = gram.double() if gram.device.type == "cuda" else gram.cpu().double()  # MPS has no float64
         top = torch.linalg.eigh(gram)[1][:, -1].float().to(tracked.device)
         tracked[depth] = top if top @ tracked[depth] >= 0 else -top
-    decoder.starts.copy_(tracked[:decoder.depths])
+    encoder.starts.copy_(tracked[:encoder.depths])
 
 
 @torch.no_grad()
-def lloyd_path(decoder, fr, steps, batch):
+def lloyd_path(encoder, fr, steps, batch):
     """Every node's Split after steps Lloyd steps, and every image's squared error after the split each step
     gives [steps, N]."""
     device, Nn = fr.R.device, len(fr.bits)
@@ -150,8 +154,8 @@ def lloyd_path(decoder, fr, steps, batch):
         nodes = torch.arange(i, min(i + batch, Nn), device=device)
         mine = (fr.node >= i) & (fr.node < i + len(nodes))
         R, node = fr.R[mine], fr.node[mine] - i
-        mems = decoder.memory(*fr.history(nodes, device))
-        for t, (_, tn, tb, tr, tm, _) in enumerate(lloyd(decoder, mems, fr.starts(decoder, nodes), steps)):
+        mems = encoder.memory(*fr.history(nodes, device))
+        for t, (_, tn, tb, tr, tm, _) in enumerate(lloyd(encoder, mems, fr.starts(encoder, nodes), steps)):
             rare = (R * tn[node]).sum(-1) >= tb[node]
             errs[t, mine] = (R - torch.where(rare[:, None], tr[node], -tm[node, None] * tr[node])).square().sum(-1)
             if t == steps - 1:
@@ -160,19 +164,19 @@ def lloyd_path(decoder, fr, steps, batch):
 
 
 @torch.no_grad()
-def evaluate(decoder, X, mean, args, caps):
-    """Per token of the decoder's depths [K]: the mse per pixel after it, X routed down the decoder's tree
+def evaluate(encoder, X, mean, args, caps):
+    """Per token of the encoder's depths [K]: the mse per pixel after it, X routed down the encoder's tree
     (depth d with caps[d] Lloyd steps); the mean Lloyd steps per node; the share of nodes that took all their
     steps; and each step's gain, the mse per pixel it takes off the step before's split (the first's off no
     split; none with --tol)."""
-    decoder.eval()
+    encoder.eval()
     fr, mses, steps, capped, gains = root_frontier(X, mean, resident=True), [], [], [], []
-    for depth in range(decoder.depths):
+    for depth in range(encoder.depths):
         if args.tol > 0:
-            fr, _, s = split(decoder, fr, caps[depth], args.node_batch, args.tol)
+            fr, _, s = split(encoder, fr, caps[depth], args.node_batch, args.tol)
             gains.append([])
         else:
-            s, errs = lloyd_path(decoder, fr, caps[depth], args.node_batch)
+            s, errs = lloyd_path(encoder, fr, caps[depth], args.node_batch)
             before = torch.cat([fr.R.square().sum(-1)[None], errs[:-1]])
             gains.append(((before - errs).mean(1) / D).tolist())
             fr, _ = children(fr, s)
@@ -182,12 +186,12 @@ def evaluate(decoder, X, mean, args, caps):
     return mses, steps, capped, gains
 
 
-def grow(decoder, opt, depths, starts):
-    """decoder.grow, and the optimizer's state for the position rows (zeros for the new rows, what zero
+def grow(encoder, opt, depths, starts):
+    """encoder.grow, and the optimizer's state for the position rows (zeros for the new rows, what zero
     gradients would have left them)."""
-    p = decoder.position
+    p = encoder.position
     old = len(p)
-    decoder.grow(depths, starts)
+    encoder.grow(depths, starts)
     for key, value in opt.state.get(p, {}).items():
         if torch.is_tensor(value) and value.shape[:1] == (old,):
             opt.state[p][key] = torch.cat([value, value.new_zeros(len(p) - old, *value.shape[1:])])
@@ -200,7 +204,7 @@ def psnr(mse):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--depths", type=int, default=10,
-                   help="tokens per code, where the decoder stops growing (0: no cap; then nothing stops the run but "
+                   help="tokens per code, where the encoder stops growing (0: no cap; then nothing stops the run but "
                         "--epochs, as early stopping waits for the full depth)")
     p.add_argument("--grow-every", type=float, default=1.0,
                    help="epochs between depths added (fractions allowed: 0.5 adds two per epoch)")
@@ -210,6 +214,8 @@ def main():
                    help="Lloyd steps per node (with --tol, the most a node takes)")
     p.add_argument("--tol", type=float, default=0.0, help="stop a node's Lloyd steps once its hyperplane moves less")
     p.add_argument("--seeded", action="store_true", help="start each node from its parent's predicted direction")
+    p.add_argument("--node-mean", action="store_true",
+                   help="also show the network each node's predicted mean image (dvae/deltatree.py's HistoryReader)")
     p.add_argument("--start", choices=("depth", "root"), default="depth",
                    help="without --seeded, each node's Lloyd start: its depth's tracked top direction, or the root's")
     p.add_argument("--dir-weight", type=float, default=1.0, help="weight of the seeds' PCA reconstruction error")
@@ -249,6 +255,7 @@ def main():
     if ckpt is not None:  # the architecture is the checkpoint's
         cfg = ckpt["shared"]["config"]
         args.width, args.layers, args.heads, args.seeded = cfg["width"], cfg["layers"], cfg["heads"], cfg["seeded"]
+        args.node_mean = cfg.get("node_mean", False)
     log(f"=== {time.strftime('%Y-%m-%d')} {vars(args)}")
     X = pixels(load_mnist("train", args.data_root)[:args.limit_train]).to(device)
     V = pixels(load_mnist("val", args.data_root)[:args.limit_val]).to(device)
@@ -261,15 +268,18 @@ def main():
 
     torch.manual_seed(args.seed)
     if ckpt is None:
-        decoder = SharedDecoder(1, args.width, args.layers, args.heads, seeded=args.seeded).to(device)
+        encoder = Encoder(1, args.width, args.layers, args.heads, seeded=args.seeded,
+                          node_mean=args.node_mean).to(device)
         with torch.no_grad():
-            decoder.starts[0] = root_top
+            encoder.starts[0] = root_top
+            if args.node_mean:
+                encoder.mean.copy_(mean)
     else:
-        decoder = SharedDecoder(**ckpt["shared"]["config"]).to(device)
-        decoder.load_state_dict(ckpt["shared"]["state_dict"])
-        assert decoder.depths <= K, f"--depths {K} is below the checkpoint's {decoder.depths}"
-    # each depth's tracked start, the decoder's and the next one's (the root's direction until tracked)
-    tracked = torch.cat([decoder.starts.detach().clone(), root_top[None]])[:min(decoder.depths + 1, K)]
+        encoder = Encoder(**ckpt["shared"]["config"]).to(device)
+        encoder.load_state_dict(ckpt["shared"]["state_dict"])
+        assert encoder.depths <= K, f"--depths {K} is below the checkpoint's {encoder.depths}"
+    # each depth's tracked start, the encoder's and the next one's (the root's direction until tracked)
+    tracked = torch.cat([encoder.starts.detach().clone(), root_top[None]])[:min(encoder.depths + 1, K)]
     grams = None
     if tracking:
         grams = root_gram.expand(len(tracked), D, D).clone()
@@ -277,13 +287,13 @@ def main():
             kept = ckpt["grams"].to(device)[:len(tracked)]
             grams[:len(kept)] = kept
             tracked[:len(kept)] = ckpt["tracked"].to(device)[:len(kept)]
-    log(f"shared decoder: {sum(q.numel() for q in decoder.parameters()) / 1e6:.1f}M parameters, "
-        f"{decoder.depths} depths, growing to {K}")
+    log(f"shared encoder: {sum(q.numel() for q in encoder.parameters()) / 1e6:.1f}M parameters, "
+        f"{encoder.depths} depths, growing to {K}")
 
-    opt = torch.optim.AdamW(decoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt = torch.optim.AdamW(encoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     history, step, first, best = [], 0, 0, (math.inf, -1)
-    grown = 0.0  # when (in epochs) the decoder last grew
-    caps = [args.lloyd_steps] * decoder.depths  # each depth's Lloyd steps, part of the tree
+    grown = 0.0  # when (in epochs) the encoder last grew
+    caps = [args.lloyd_steps] * encoder.depths  # each depth's Lloyd steps, part of the tree
     if ckpt is not None:
         if "optimizer" in ckpt:
             opt.load_state_dict(ckpt["optimizer"])
@@ -293,8 +303,8 @@ def main():
             log("the checkpoint has no optimizer state: AdamW starts afresh")
         history, step, first = ckpt["metrics"], ckpt.get("step", 0), ckpt["epoch"] + 1
         grown = max(ckpt.get("grown", -math.inf), first - args.grow_every)  # grow as it resumes, not to catch up
-        caps = list(ckpt.get("caps") or [ckpt["args"]["lloyd_steps"]] * decoder.depths)
-        if decoder.depths == K and ckpt.get("best"):
+        caps = list(ckpt.get("caps") or [ckpt["args"]["lloyd_steps"]] * encoder.depths)
+        if encoder.depths == K and ckpt.get("best"):
             best = tuple(ckpt["best"])  # the same full depth: early stopping carries on
         log(f"resumed {args.resume} after epoch {ckpt['epoch']} (step {step}), saving to {args.out}")
     step0 = step
@@ -305,8 +315,8 @@ def main():
     def save(epoch):
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         torch.save(dict(args=vars(args), mean=mean.cpu(), epoch=epoch, step=step, metrics=history, best=best,
-                        shared=dict(config=decoder.config,
-                                    state_dict={k: v.cpu() for k, v in decoder.state_dict().items()}),
+                        shared=dict(config=encoder.config,
+                                    state_dict={k: v.cpu() for k, v in encoder.state_dict().items()}),
                         optimizer=opt.state_dict(), tracked=tracked.cpu(), grown=grown, caps=caps,
                         grams=None if grams is None else grams.cpu()), args.out)
 
@@ -316,10 +326,10 @@ def main():
     def add_depth():
         """One more depth, from its start tracked so far (refreshed now), and track the next one's."""
         nonlocal tracked, grams
-        depth = decoder.depths
+        depth = encoder.depths
         if grams is not None:
-            refresh(decoder, grams, tracked)
-        grow(decoder, opt, depth + 1, tracked[depth:depth + 1])
+            refresh(encoder, grams, tracked)
+        grow(encoder, opt, depth + 1, tracked[depth:depth + 1])
         caps.append(args.lloyd_steps)
         if depth + 1 < K:
             tracked = torch.cat([tracked, root_top[None]])
@@ -328,46 +338,46 @@ def main():
 
     for epoch in range(first, first + args.epochs):
         t0, last = time.time(), time.time()
-        decoder.train()
-        totals = torch.zeros(4, decoder.depths, device=device)  # (widened as the decoder grows)
+        encoder.train()
+        totals = torch.zeros(4, encoder.depths, device=device)  # (widened as the encoder grows)
         gen = torch.Generator().manual_seed(args.seed * 1_000_003 + epoch)
         batches, seen = epoch_batches(N, codes, args, gen), 0
         codes = torch.zeros(N, dtype=torch.int64)
         for i, idx in enumerate(batches):
-            if decoder.depths < K and epoch + i / len(batches) - grown >= args.grow_every - 1e-9:
+            if encoder.depths < K and epoch + i / len(batches) - grown >= args.grow_every - 1e-9:
                 add_depth()
                 grown += args.grow_every
             opt.zero_grad(set_to_none=True)
-            stats, keys = train_step(decoder, X[idx.to(device)], mean, grams, args, caps)
+            stats, keys = train_step(encoder, X[idx.to(device)], mean, grams, args, caps)
             if stats.shape[1] > totals.shape[1]:
                 totals = torch.cat([totals, totals.new_zeros(4, stats.shape[1] - totals.shape[1])], 1)
             totals[:, :stats.shape[1]] += stats
             codes[idx] = keys
             seen += len(idx)
-            torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
             opt.step()
             sched.step()
             step += 1
             if grams is not None and step % args.refresh == 0:
-                refresh(decoder, grams, tracked)
+                refresh(encoder, grams, tracked)
             if time.time() - last >= args.log_interval:
                 last = time.time()
                 log.detail(f"    step {step} ({seen}/{N} images this epoch)")
         t1 = time.time()
-        val, val_steps, capped, step_gains = evaluate(decoder, V, mean, args, caps)
-        totals = totals[:, :decoder.depths]  # (a depth added mid-epoch counts only the images it saw)
+        val, val_steps, capped, step_gains = evaluate(encoder, V, mean, args, caps)
+        totals = totals[:, :encoder.depths]  # (a depth added mid-epoch counts only the images it saw)
         objective = (totals[0] / (N * D)).tolist()
         pca = (totals[1] / (N * D)).tolist()
         train_steps = (totals[2] / totals[3].clamp_min(1)).tolist()
-        full = decoder.depths == K
+        full = encoder.depths == K
         improved = full and val[-1] < best[0]
         if improved:
             best = (val[-1], epoch)
         history.append(dict(epoch=epoch, val_mse=val, objective=objective, pca=pca, train_steps=train_steps,
-                            val_steps=val_steps, val_capped=capped, trained=decoder.depths - 1, caps=list(caps),
+                            val_steps=val_steps, val_capped=capped, trained=encoder.depths - 1, caps=list(caps),
                             step_gains=step_gains, seconds=time.time() - began))
         plot_depths(history, args.plot or os.path.splitext(args.log)[0] + ".png")
-        log(f"  epoch {epoch:2d}: val mse after {decoder.depths} tokens {val[-1]:.6f} (psnr {psnr(val[-1]):.2f} dB); "
+        log(f"  epoch {epoch:2d}: val mse after {encoder.depths} tokens {val[-1]:.6f} (psnr {psnr(val[-1]):.2f} dB); "
             "per depth " + fmt(val) + "; objective per depth " + fmt(objective)
             + (("; pca per depth " + fmt(pca)) if args.seeded else "")
             + "; lloyd steps per depth train " + fmt(train_steps, 2) + ", val " + fmt(val_steps, 2)
@@ -378,7 +388,7 @@ def main():
         elif epoch - best[1] >= args.patience:
             break
     if best[1] < 0:
-        log(f"stopped at {decoder.depths} of {K} depths; the latest state is in {args.out}")
+        log(f"stopped at {encoder.depths} of {K} depths; the latest state is in {args.out}")
         return
     log(f"kept epoch {best[1]}: val mse after {K} tokens {best[0]:.6f} (psnr {psnr(best[0]):.2f} dB), saved {args.out}")
 

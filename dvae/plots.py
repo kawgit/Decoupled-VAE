@@ -37,7 +37,7 @@ def _colorbar(fig, ax, norm, label):
 
 
 def plot_depths(history, path):
-    """Save an autoencoder run's progress (train_autoencoder.py): the val mse after every code length, one line
+    """Save an encoder run's progress (train_encoder.py): the val mse after every code length, one line
     per epoch (darker is later); the val mse after the full code by epoch; and, from the latest epoch, the val
     mse gain of every Lloyd step at every depth, one line per depth (darker is deeper). history holds dicts with
     "epoch", "val_mse" (after 1..K tokens) and optionally "step_gains" (per depth, each step's gain)."""
@@ -118,8 +118,8 @@ def plot_prior(history, edges, kept, path):
     _save(fig, path)
 
 
-def plot_categorical(history, path):
-    """Save a categorical decoder run's progress (train_categorical_decoder.py): the val and train pixel bits per
+def plot_decoder(history, path):
+    """Save a decoder run's progress (train_decoder.py): the val and train pixel bits per
     dimension by epoch, the best val marked. history holds dicts with "epoch", "val" and "train"."""
     if not history:
         return

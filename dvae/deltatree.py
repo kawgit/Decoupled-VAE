@@ -1,12 +1,12 @@
 """Delta trees: a code is the sides of a sequence of hyperplanes, each found at its node by Lloyd's algorithm
-running on that depth's decoder, which predicts both sides' means.
+running on that depth's encoder, which predicts both sides' means.
 
 Pixels are grey levels' bin centers, (level + 0.5) / 256, centered on the training mean. A node's predicted
 mean is that mean plus its delta history, one delta per token, and a remainder is an image minus its node's
 predicted mean. A hyperplane (n, b), |n| = 1, splits a node into its rare side {n . x >= b} and its common
 side, in remainder coordinates; b >= 0 keeps the node's predicted mean on the common side.
 
-Given a node's history and a hyperplane, a depth's decoder predicts the rare side's mean delta r and
+Given a node's history and a hyperplane, a depth's encoder predicts the rare side's mean delta r and
 m = p / (1 - p) in [0, 1], p being the rare side's share. The common side's mean delta is -m r, so the two
 predicted means average to the node's (the tower property). Lloyd's algorithm starts every node of a depth
 from the same hyperplane, the depth's start (the training remainders' top principal direction there, through
@@ -121,26 +121,53 @@ class Block(nn.Module):
         return h + self.ff(self.ln_f(h)), x
 
 
+class MeanImage(nn.Module):
+    """Features [B, W] of images [B, D], read as 28 x 28 pictures by a small convolutional net."""
+
+    def __init__(self, width, channels=32):
+        super().__init__()
+        c = channels
+        self.net = nn.Sequential(nn.Conv2d(1, c, 3, stride=2, padding=1), nn.GELU(),  # 14 x 14
+                                 nn.Conv2d(c, 2 * c, 3, stride=2, padding=1), nn.GELU(),  # 7 x 7
+                                 nn.Conv2d(2 * c, 2 * c, 3, padding=1), nn.GELU(),
+                                 nn.Flatten(), nn.Linear(2 * c * 49, width))
+
+    def forward(self, images):
+        return self.net(images.reshape(-1, 1, 28, 28))
+
+
 class HistoryReader(nn.Module):
     """A node's memory: its history, one token per delta (the delta's direction, log length, side +-1 and m),
     with self-attention among them. A query reads it and itself at every layer (Block with mem), so a node's
-    memory is computed once for all its queries."""
+    memory is computed once for all its queries. With node_mean, the memory also holds a token for the node's
+    predicted mean image (the training mean, the buffer mean, plus the deltas), read by a small convolutional
+    net, so the network sees what the node looks like rather than only the steps that led there."""
 
-    def __init__(self, depth, width, layers, heads):
+    mean: Tensor  # [D] the training mean, with node_mean
+
+    def __init__(self, depth, width, layers, heads, node_mean=False):
         super().__init__()
         self.width = width
         self.delta_in = nn.Linear(D + 3, width)
         self.position = nn.Parameter(torch.randn(max(1, depth), width) * 0.02)
         self.blocks = nn.ModuleList(Block(width, heads) for _ in range(layers))
+        self.mean_in = MeanImage(width) if node_mean else None
+        self.extra = int(node_mean)  # memory tokens besides the history's
+        if node_mean:
+            self.mean_token = nn.Parameter(torch.randn(width) * 0.02)
+            self.register_buffer("mean", torch.zeros(D))
 
     def memory(self, deltas, sides, ms):
-        """Each layer's normalized history tokens [B, k, W] for histories deltas [B, k, D], sides and ms [B, k]."""
+        """Each layer's normalized memory tokens [B, extra + k, W] for histories deltas [B, k, D], sides and ms
+        [B, k]: the node's mean image's token (with node_mean), then the history's."""
         B, k = sides.shape
-        if k == 0:
-            return [deltas.new_zeros(B, 0, self.width) for _ in self.blocks]
         length = deltas.norm(dim=-1, keepdim=True).clamp_min(EPS)
         h = self.delta_in(torch.cat([deltas / length, length.log(), sides[..., None], ms[..., None]], -1))
         h = h + self.position[:k]
+        if self.mean_in is not None:
+            h = torch.cat([(self.mean_in(self.mean + deltas.sum(1)) + self.mean_token)[:, None], h], 1)
+        if h.shape[1] == 0:
+            return [deltas.new_zeros(B, 0, self.width) for _ in self.blocks]
         mems = []
         for blk in self.blocks:
             h, x = blk(h)
@@ -148,14 +175,14 @@ class HistoryReader(nn.Module):
         return mems
 
 
-class SliceDecoder(HistoryReader):
-    """A decoder whose query is a hyperplane at a node. Each depth k (a node's history length) has a Lloyd
+class SliceNet(HistoryReader):
+    """An encoder whose query is a hyperplane at a node. Each depth k (a node's history length) has a Lloyd
     start, the same at every node of the depth, and may have a scale (the remainders' rms per pixel there,
-    hyperplane biases and r then being in its units); subclasses say where they come from. A seeded decoder
+    hyperplane biases and r then being in its units); subclasses say where they come from. A seeded encoder
     also predicts each side's top principal direction, which seeds that side's own Lloyd start."""
 
-    def __init__(self, depth, width, layers, heads, seeded=False):
-        super().__init__(depth, width, layers, heads)
+    def __init__(self, depth, width, layers, heads, seeded=False, node_mean=False):
+        super().__init__(depth, width, layers, heads, node_mean)
         self.query_in = nn.Linear(D + 1, width)
         self.out_norm = nn.LayerNorm(width)
         self.r_head = ImageHead(width, 1)
@@ -170,8 +197,8 @@ class SliceDecoder(HistoryReader):
 
     def query(self, mems, n, b):
         """For a hyperplane n [B, D], b [B] at each of B nodes with memory mems: r [B, D], m [B], and from a
-        seeded decoder the rare and common sides' unit directions u [B, 2, D] (else None)."""
-        scale = self.scale_at(mems[0].shape[1])
+        seeded encoder the rare and common sides' unit directions u [B, 2, D] (else None)."""
+        scale = self.scale_at(mems[0].shape[1] - self.extra)  # the nodes' depth
         q = self.query_in(torch.cat([n, (b / scale)[:, None]], -1))[:, None]
         for blk, mem in zip(self.blocks, mems):
             q, _ = blk(q, mem)
@@ -183,8 +210,8 @@ class SliceDecoder(HistoryReader):
         return self.r_head(f)[:, 0] * scale, torch.sigmoid(self.m_head(f)[:, 0]), u
 
 
-class SharedDecoder(SliceDecoder):
-    """One decoder for every depth below depths, with each depth's Lloyd start (set by the trainer; a seeded
+class Encoder(SliceNet):
+    """One encoder for every depth below depths, with each depth's Lloyd start (set by the trainer; a seeded
     one only uses the root's, its other nodes starting from their parent's predicted direction). Its biases
     and deltas are in pixel units, its depth's scale being its own to learn; scaled=True keeps a scale per
     depth, as the first one-stage trees did. grow adds depths: the only parts sized by them are the history
@@ -193,9 +220,10 @@ class SharedDecoder(SliceDecoder):
     starts: Tensor  # [depths, D]
     scales: Tensor  # [depths], when scaled
 
-    def __init__(self, depths, width=256, layers=4, heads=4, scaled=False, seeded=False):
-        super().__init__(depths, width, layers, heads, seeded)
-        self.config = dict(depths=depths, width=width, layers=layers, heads=heads, scaled=scaled, seeded=seeded)
+    def __init__(self, depths, width=256, layers=4, heads=4, scaled=False, seeded=False, node_mean=False):
+        super().__init__(depths, width, layers, heads, seeded, node_mean)
+        self.config = dict(depths=depths, width=width, layers=layers, heads=heads, scaled=scaled, seeded=seeded,
+                           node_mean=node_mean)
         self.scaled = scaled
         with torch.no_grad():
             self.position.copy_(self.position_rows(0, len(self.position)))
@@ -231,7 +259,7 @@ class SharedDecoder(SliceDecoder):
         return self.starts[k]
 
 
-class LeafDecoder(HistoryReader):
+class Decoder(HistoryReader):
     """p(x | leaf): 256 logits per pixel for an image at a leaf, the sum of two paths. One reads the leaf's
     history with a learned query and turns it into an image of logits; the other runs a few convolutions over
     the leaf's predicted mean image, so each pixel's levels can follow its predicted value and neighbours."""
@@ -257,16 +285,16 @@ class LeafDecoder(HistoryReader):
         return logits + self.mean_path(mu.view(-1, 1, 28, 28)).flatten(2)
 
 
-def lloyd(decoder: SliceDecoder, mems: list[Tensor], start: Tensor, steps: int, tol: float = 0.0):
+def lloyd(encoder: SliceNet, mems: list[Tensor], start: Tensor, steps: int, tol: float = 0.0):
     """Yields (active, n, b, r, m, u) at each step: the nodes still moving (indices into the B nodes with
-    memory mems), the hyperplanes queried there and the decoder's answers. Every node starts from start [B, D]
+    memory mems), the hyperplanes queried there and the encoder's answers. Every node starts from start [B, D]
     through its predicted mean; each next hyperplane is the bisector of the last answers, detached. With
     tol > 0 a node stops once that would move its hyperplane by less than tol (1 - cos of the normals plus the
     bias's change relative to |r|, squared); every node stops after steps queries."""
     active = torch.arange(len(start), device=start.device)
     n, b = start, start.new_zeros(len(start))
     for step in range(steps):
-        r, m, u = decoder.query(mems, n, b)
+        r, m, u = encoder.query(mems, n, b)
         yield active, n, b, r, m, u
         if step + 1 == steps:
             break
@@ -313,17 +341,17 @@ class Frontier:
         nodes = nodes.to(self.deltas.device)
         return (self.deltas[nodes].to(device).float(), self.sides[nodes].to(device), self.ms[nodes].to(device))
 
-    def starts(self, decoder, nodes):
+    def starts(self, encoder, nodes):
         """Lloyd's first normals [len(nodes), D] at nodes."""
         if self.seed is not None:
             return self.seed[nodes.to(self.seed.device)]
-        return decoder.start_at(self.depth).expand(len(nodes), D)
+        return encoder.start_at(self.depth).expand(len(nodes), D)
 
 
 @dataclass
 class Split:
-    """Every node's split after Lloyd's steps: its last hyperplane (n [Nn, D], b [Nn]), the decoder's answers
-    there (r [Nn, D], m [Nn] and, from a seeded decoder, the sides' directions u [Nn, 2, D]), and the steps it
+    """Every node's split after Lloyd's steps: its last hyperplane (n [Nn, D], b [Nn]), the encoder's answers
+    there (r [Nn, D], m [Nn] and, from a seeded encoder, the sides' directions u [Nn, 2, D]), and the steps it
     took [Nn]."""
     n: Tensor
     b: Tensor
@@ -351,16 +379,16 @@ def node_order(fr):
 
 def by_nodes(imgs, node, cap):
     """Cut images grouped by node (imgs, their nodes node) into pieces holding at most cap nodes each: the
-    decoder's memory use grows with the nodes it queries, not the images."""
+    encoder's memory use grows with the nodes it queries, not the images."""
     new = torch.ones_like(node, dtype=torch.long)
     new[1:] = (node[1:] != node[:-1]).long()
     piece = (new.cumsum(0) - 1) // cap
     return list(imgs.split(torch.unique_consecutive(piece, return_counts=True)[1].tolist()))
 
 
-def chunk_sse(decoder, fr, imgs, steps, select=False, tol=0.0, dir_weight=1.0):
+def chunk_sse(encoder, fr, imgs, steps, select=False, tol=0.0, dir_weight=1.0):
     """The objective's sum over images imgs of a frontier, each node's averaged over its Lloyd steps: the
-    split's error and, for a seeded decoder, dir_weight times its sides' rank-1 PCA reconstruction error (each
+    split's error and, for a seeded encoder, dir_weight times its sides' rank-1 PCA reconstruction error (each
     image's remainder after the split, less its projection on its side's predicted direction). Also returns
     the reconstruction error's own sum (detached; 0 when not seeded); with select, what the last step's split
     does to the images (their squared error before and after it and the bits of their tokens); the chunk's
@@ -373,14 +401,14 @@ def chunk_sse(decoder, fr, imgs, steps, select=False, tol=0.0, dir_weight=1.0):
         R = fr.R[imgs]
         nodes, inverse = torch.unique(fr.node[imgs], return_inverse=True)
     B, device = len(nodes), R.device
-    mems = decoder.memory(*fr.history(nodes, device))
+    mems = encoder.memory(*fr.history(nodes, device))
     all_n = R.new_zeros(B).index_add_(0, inverse, R.new_ones(len(R)))
     all_sum = R.new_zeros(B, D).index_add_(0, inverse, R)
     node_loss, node_pca, node_steps = R.new_zeros(B), R.new_zeros(B), R.new_zeros(B)
     last_n, last_b, last_r, last_m = R.new_zeros(B, D), R.new_zeros(B), R.new_zeros(B, D), R.new_zeros(B)
     last_u = None
     slot = torch.full((B,), -1, dtype=torch.long, device=device)
-    for active, n, b, r, m, u in lloyd(decoder, mems, fr.starts(decoder, nodes), steps, tol):
+    for active, n, b, r, m, u in lloyd(encoder, mems, fr.starts(encoder, nodes), steps, tol):
         slot.fill_(-1)
         slot[active] = torch.arange(len(active), device=device)
         at = slot[inverse]
@@ -424,19 +452,19 @@ def cat_splits(parts: list[Split]) -> Split:
 
 
 @torch.no_grad()
-def choose(decoder, fr, steps, batch, tol=0.0):
+def choose(encoder, fr, steps, batch, tol=0.0):
     """Every node's Split after the Lloyd steps."""
     device = fr.R.device
     nodes = torch.arange(len(fr.bits))
     parts = []
     for i in range(0, len(nodes), batch):
         part = nodes[i:i + batch]
-        mems = decoder.memory(*fr.history(part, device))
-        start = fr.starts(decoder, part)
+        mems = encoder.memory(*fr.history(part, device))
+        start = fr.starts(encoder, part)
         B = len(part)
         n, b, r, m = start.new_zeros(B, D), start.new_zeros(B), start.new_zeros(B, D), start.new_zeros(B)
         u, taken = None, start.new_zeros(B)
-        for active, sn, sb, sr, sm, su in lloyd(decoder, mems, start, steps, tol):
+        for active, sn, sb, sr, sm, su in lloyd(encoder, mems, start, steps, tol):
             n[active], b[active], r[active], m[active] = sn, sb, sr, sm
             if su is not None:
                 u = start.new_zeros(B, 2, D) if u is None else u
@@ -447,10 +475,10 @@ def choose(decoder, fr, steps, batch, tol=0.0):
 
 
 @torch.no_grad()
-def split(decoder, fr, steps, batch, tol=0.0):
+def split(encoder, fr, steps, batch, tol=0.0):
     """The next depth's frontier, every node split by its hyperplane and empty children dropped, each image's
-    token cost in bits under the decoder's shares (the rare side's p = m / (1 + m)) [N], and the Split."""
-    s = choose(decoder, fr, steps, batch, tol)
+    token cost in bits under the encoder's shares (the rare side's p = m / (1 + m)) [N], and the Split."""
+    s = choose(encoder, fr, steps, batch, tol)
     child, token_bits = children(fr, s, batch)
     return child, token_bits, s
 
@@ -479,9 +507,9 @@ def children(fr, s: Split, batch=8192):
     return child, token_bits
 
 
-def descend(decoder, fr, steps, batch, tol=0.0):
+def descend(encoder, fr, steps, batch, tol=0.0):
     """The next depth's frontier (split's, without the token costs or the Split)."""
-    return split(decoder, fr, steps, batch, tol)[0]
+    return split(encoder, fr, steps, batch, tol)[0]
 
 
 def tree_steps(ckpt, depths):
@@ -492,10 +520,10 @@ def tree_steps(ckpt, depths):
 
 
 def load_tree(ckpt, device):
-    """A trained autoencoder (train_autoencoder.py's checkpoint) as a list of its depths' decoders: the same
-    SharedDecoder at every depth, in eval mode."""
+    """A trained encoder (train_encoder.py's checkpoint) as a list of its depths' encoders: the same
+    Encoder at every depth, in eval mode."""
     config = dict(ckpt["shared"]["config"], scaled="scales" in ckpt["shared"]["state_dict"],
                   seeded=any(k.startswith("dir_head.") for k in ckpt["shared"]["state_dict"]))
-    decoder = SharedDecoder(**config).to(device)
-    decoder.load_state_dict(ckpt["shared"]["state_dict"])
-    return [decoder.eval()] * ckpt["shared"]["config"]["depths"]
+    encoder = Encoder(**config).to(device)
+    encoder.load_state_dict(ckpt["shared"]["state_dict"])
+    return [encoder.eval()] * ckpt["shared"]["config"]["depths"]

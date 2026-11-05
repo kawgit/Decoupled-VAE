@@ -5,7 +5,7 @@ split has fixed answers: the rare side's mean delta r and the ratio m. The prior
 one token per depth: that depth's split (r's direction and log length, and m) plus the side taken at the depth
 before (none at the root). Causal attention lets token k see its own split and everything earlier, but not its
 own side, which its head predicts as a logit. So one pass over a code trains every depth, the same as asking a
-decoder with a side head at each node in turn.
+network with a side head at each node in turn.
 
 With images=True, each token also shows the two means it chooses between, as pictures: the node's predicted mean
 (the training mean plus the deltas before it) plus r (the rare side's) and minus m r (the common side's), as one

@@ -49,7 +49,7 @@ class RunLog:
             free, total = torch.cuda.mem_get_info(device)
             util = f"{sum(samples) / len(samples):.0f}% util (min {min(samples)}%, max {max(samples)}%), " \
                 if samples else ""
-            self.write(f"gpu: {util}{(total - free) / gib:.1f} of {total / gib:.1f} GB used; this run "
+            self.write(f"  gpu: {util}{(total - free) / gib:.1f} of {total / gib:.1f} GB used; this run "
                        f"{torch.cuda.memory_allocated(device) / gib:.1f} GB allocated (peak "
                        f"{torch.cuda.max_memory_allocated(device) / gib:.1f}), "
                        f"{torch.cuda.memory_reserved(device) / gib:.1f} GB reserved", summary=False)

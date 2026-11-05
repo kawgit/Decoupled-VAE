@@ -1,7 +1,7 @@
 """Test bits per dimension of the whole model: each test image scored as -log2 p(code) - log2 p(x | code), its
-code (the autoencoder's, from dump_autoencoder.py) priced by the prior and its pixels by the categorical decoder.
+code (the encoder's, from dump_encoder.py) priced by the prior and its pixels by the decoder.
 This is the one-code upper bound on -log2 p(x): the image's own code only, not summed over every code that could
-have drawn it. With --prior, the code is also priced by the autoencoder's own shares (m / (1 + m)) for
+have drawn it. With --prior, the code is also priced by the encoder's own shares (m / (1 + m)) for
 comparison; without, by those alone. The table goes to stdout and to benchmark.md and .json in the run's
 artifacts folder.
 
@@ -16,7 +16,7 @@ import os
 import torch
 
 from dvae.artifacts import artifact
-from dvae.categorical import Leaves, code_bits, load_categorical, pixel_bits
+from dvae.decoder import Leaves, code_bits, load_decoder, pixel_bits
 from dvae.codes import load_codes
 from dvae.data import get_device, load_mnist
 from dvae.deltatree import D
@@ -25,9 +25,9 @@ from dvae.prior import load_prior
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--decoder", required=True, help="train_categorical_decoder.py's checkpoint")
+    p.add_argument("--decoder", required=True, help="train_decoder.py's checkpoint")
     p.add_argument("--prior", default=None, help="train_prior.py's checkpoint")
-    p.add_argument("--codes", default=None, help="dump_autoencoder.py's folder (default: the decoder's)")
+    p.add_argument("--codes", default=None, help="dump_encoder.py's folder (default: the decoder's)")
     p.add_argument("--split", default="test", choices=("test", "val"))
     p.add_argument("--batch", type=int, default=128)
     p.add_argument("--out", default=None, help="results prefix (default: benchmark in the run's artifacts folder)")
@@ -36,10 +36,10 @@ def main():
     args = p.parse_args()
     device = get_device(args.device)
     dckpt = torch.load(args.decoder, map_location=device, weights_only=False)
-    decoder, K = load_categorical(dckpt, device), dckpt["tokens"]
+    decoder, K = load_decoder(dckpt, device), dckpt["tokens"]
     folder = args.codes or dckpt["codes"]
     codes = load_codes(os.path.join(folder, f"{args.split}.pt"))
-    priors = {"the autoencoder's own shares": None}
+    priors = {"the encoder's own shares": None}
     if args.prior:
         priors = {f"the prior ({args.prior})": load_prior(torch.load(args.prior, map_location=device,
                                                                      weights_only=False), device), **priors}

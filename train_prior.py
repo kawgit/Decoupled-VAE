@@ -1,12 +1,12 @@
-"""Stage 3: train the prior (dvae/prior.py's SidePrior), a causal transformer over the autoencoder's codes that
-predicts each token's side, on the codes dump_autoencoder.py wrote.
+"""Stage 3: train the prior (dvae/prior.py's SidePrior), a causal transformer over the encoder's codes that
+predicts each token's side, on the codes dump_encoder.py wrote.
 
-The autoencoder already predicts each side's share (its m), trained so its side means are right; the prior is
-trained on cross-entropy alone, so it learns which codes in the autoencoder's space are valid and corrects the
-autoencoder's shares where they are wrong. Each step takes a batch of training codes and minimizes the
+The encoder already predicts each side's share (its m), trained so its side means are right; the prior is
+trained on cross-entropy alone, so it learns which codes in the encoder's space are valid and corrects the
+encoder's shares where they are wrong. Each step takes a batch of training codes and minimizes the
 cross-entropy of every token's side, all depths at once. Every epoch logs, in bits, the train codes' cost (a
 fixed subset, scored as val is) and the val codes' cost per image and per range of depths, beside two baselines
-the prior has to beat: the autoencoder's own shares (the rare side with probability m / (1 + m)) and the best
+the prior has to beat: the encoder's own shares (the rare side with probability m / (1 + m)) and the best
 constant share per depth (fit on the train codes). Early stopping watches the val cost separately in each of
 --bands bands of depths (equal widths), since depths need different amounts of training: each band keeps the
 weights of the epoch with its lowest val cost, stops once --patience epochs pass without a better one (the model
@@ -16,7 +16,7 @@ scored on the test codes against the same baselines. The progress plot (dvae/plo
 every epoch.
 
 Run from the repo: python train_prior.py --codes artifacts/<dump job> --images
-Next: qa_prior.py samples from it; train_categorical_decoder.py can price its codes with it.
+Next: qa_prior.py samples from it; train_decoder.py can price its codes with it.
 """
 
 import argparse
@@ -49,7 +49,7 @@ def describe(per_token):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--codes", required=True, help="folder with dump_autoencoder.py's train.pt, val.pt and test.pt")
+    p.add_argument("--codes", required=True, help="folder with dump_encoder.py's train.pt, val.pt and test.pt")
     p.add_argument("--width", type=int, default=256)
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--heads", type=int, default=4)
@@ -94,7 +94,7 @@ def main():
         return token_bits(model, codes.rare, codes.m, codes.r, device, args.batch).mean(0)
 
     own, constant = baselines(val)
-    log(f"val baselines: the autoencoder's own shares {describe(own)}")
+    log(f"val baselines: the encoder's own shares {describe(own)}")
     log(f"val baselines: constant share per depth {describe(constant)}")
 
     prior = SidePrior(K, args.width, args.layers, args.heads, args.dropout, images=args.images).to(device)
@@ -153,13 +153,13 @@ def main():
             kept = [e for _, e in best]
             states = {e: w for e, w in states.items() if e in kept}
             torch.save(dict(config=prior.config, bands=edges, band_epochs=kept, states=states, args=vars(args),
-                            codes=args.codes, autoencoder=train.ckpt, epoch=epoch, history=history), args.out)
+                            codes=args.codes, encoder=train.ckpt, epoch=epoch, history=history), args.out)
         stopped = [done or epoch - e >= args.patience for done, (_, e) in zip(stopped, best)]
         plot_prior(history, edges, [e for _, e in best], args.plot)
         bands_now = ", ".join(f"{n}@{e}" + (" stopped" if done else "")
                               for n, (_, e), done in zip(names, best, stopped))
         log(f"epoch {epoch}: val {describe(va)}; train {describe(tr)}; training loss "
-            f"{running / N / LN2:.4f} bits/token; autoencoder's own shares {own.sum():.3f}; kept bands "
+            f"{running / N / LN2:.4f} bits/token; encoder's own shares {own.sum():.3f}; kept bands "
             f"{sum(c for c, _ in best):.3f} bits/image ({bands_now})"
             f"{'; better in ' + ', '.join(improved) if improved else ''} ({trained:.0f}s train, "
             f"{time.time() - began - trained:.0f}s eval)")
@@ -173,7 +173,7 @@ def main():
     log(f"kept epochs per band {', '.join(f'{n}@{e}' for n, (_, e) in zip(names, best))} (val "
         f"{sum(c for c, _ in best):.3f} bits/image), saved {args.out}")
     log(f"test: prior {describe(te)}")
-    log(f"test: autoencoder's own shares {describe(own)}")
+    log(f"test: encoder's own shares {describe(own)}")
     log(f"test: constant share per depth {describe(constant)}")
 
 

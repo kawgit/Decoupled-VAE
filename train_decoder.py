@@ -1,16 +1,16 @@
-"""Stage 4: train the categorical decoder (dvae/deltatree.py's LeafDecoder), p(x | code): 256 grey levels per
+"""Stage 4: train the decoder (dvae/deltatree.py's Decoder), p(x | code): 256 grey levels per
 pixel given a code's first --tokens tokens, by maximum likelihood on the training images, on the codes
-dump_autoencoder.py wrote.
+dump_encoder.py wrote.
 
 It reads a code's delta history and its node's predicted mean image (the training mean plus the deltas), so it
-adds what the autoencoder's mean leaves out: each pixel's spread around it. Every epoch logs and plots
-(dvae/plots.py's plot_categorical) the val and train images' pixel bits per dimension under it, and early
+adds what the encoder's mean leaves out: each pixel's spread around it. Every epoch logs and plots
+(dvae/plots.py's plot_decoder) the val and train images' pixel bits per dimension under it, and early
 stopping watches val. Then val and test are scored as -log2 p(code) - log2 p(x | code), the one-code upper bound
-on -log2 p(x): the code priced by --prior (train_prior.py's) when given, else by the autoencoder's own shares.
+on -log2 p(x): the code priced by --prior (train_prior.py's) when given, else by the encoder's own shares.
 
-Run from the repo: python train_categorical_decoder.py --codes artifacts/<dump job>
+Run from the repo: python train_decoder.py --codes artifacts/<dump job>
                    [--prior artifacts/<prior job>/prior.pt]
-Next: qa_categorical_decoder.py draws images from codes the prior samples.
+Next: qa_decoder.py draws images from codes the prior samples.
 """
 
 import argparse
@@ -25,21 +25,21 @@ os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.4")
 import torch  # noqa: E402
 
 from dvae.artifacts import artifact  # noqa: E402
-from dvae.categorical import Leaves, code_bits as price, pixel_bits  # noqa: E402
+from dvae.decoder import Leaves, code_bits as price, pixel_bits  # noqa: E402
 from dvae.codes import load_codes  # noqa: E402
 from dvae.data import get_device, load_mnist  # noqa: E402
-from dvae.deltatree import D, LeafDecoder  # noqa: E402
+from dvae.deltatree import D, Decoder  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
-from dvae.plots import plot_categorical  # noqa: E402
+from dvae.plots import plot_decoder  # noqa: E402
 from dvae.prior import load_prior  # noqa: E402
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--codes", required=True, help="folder with dump_autoencoder.py's train.pt, val.pt and test.pt")
+    p.add_argument("--codes", required=True, help="folder with dump_encoder.py's train.pt, val.pt and test.pt")
     p.add_argument("--tokens", type=int, default=None, help="code length (default: all the codes' tokens)")
     p.add_argument("--prior", default=None, help="train_prior.py's checkpoint, to price the codes (default: the "
-                                                 "autoencoder's own shares)")
+                                                 "encoder's own shares)")
     p.add_argument("--width", type=int, default=256)
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--heads", type=int, default=4)
@@ -64,7 +64,7 @@ def main():
     args.log = args.log or artifact("run.log")
     args.plot = args.plot or os.path.splitext(args.log)[0] + ".png"
     log = RunLog(args.log, device)
-    log(f"=== train_categorical_decoder.py {vars(args)}")
+    log(f"=== train_decoder.py {vars(args)}")
 
     began = time.time()
     codes = {s: load_codes(os.path.join(args.codes, f"{s}.pt")) for s in ("train", "val", "test")}
@@ -72,7 +72,7 @@ def main():
     assert K <= codes["train"].depths, f"--tokens {K}: the codes have {codes['train'].depths}"
     prior = load_prior(torch.load(args.prior, map_location=device, weights_only=False), device) if args.prior else None
     code_bits, leaves = {}, {}
-    for s, c in codes.items():  # each image's code's bits, under the prior or the autoencoder's own shares
+    for s, c in codes.items():  # each image's code's bits, under the prior or the encoder's own shares
         code_bits[s] = price(c, K, prior, device)
         leaves[s] = Leaves(c, load_mnist(s, args.data_root)[:len(c)], K)
         mse = (leaves[s].mu - leaves[s].levels.float().add(0.5).div(256)).square().mean().item()
@@ -81,8 +81,8 @@ def main():
     log(f"loaded in {time.time() - began:.0f}s")
 
     torch.manual_seed(args.seed)
-    decoder = LeafDecoder(K, args.width, args.layers, args.heads, args.channels).to(device)
-    log(f"categorical decoder: {sum(q.numel() for q in decoder.parameters()) / 1e6:.1f}M parameters")
+    decoder = Decoder(K, args.width, args.layers, args.heads, args.channels).to(device)
+    log(f"decoder: {sum(q.numel() for q in decoder.parameters()) / 1e6:.1f}M parameters")
     opt = torch.optim.AdamW(decoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     gen = torch.Generator().manual_seed(args.seed)
     best: tuple[float, int, dict | None] = (math.inf, -1, None)
@@ -104,7 +104,7 @@ def main():
         t1 = time.time()
         val = pixel_bits(decoder, leaves["val"], device, args.batch).mean().item() / D
         history.append(dict(epoch=epoch, val=val, train=total / (N * D), seconds=time.time() - t0))
-        plot_categorical(history, args.plot)
+        plot_decoder(history, args.plot)
         improved = val < best[0]
         log(f"  epoch {epoch:2d}: val {val:.4f} pixel bits/dim (with the code "
             f"{val + code_bits['val'].mean().item() / D:.4f}); train {total / (N * D):.4f} "
@@ -112,7 +112,7 @@ def main():
         if improved:
             best = (val, epoch, {key: v.detach().clone() for key, v in decoder.state_dict().items()})
             torch.save(dict(config=decoder.config, state_dict=best[2], codes=args.codes,
-                            autoencoder=codes["train"].ckpt, tokens=K, args=vars(args), history=history), out)
+                            encoder=codes["train"].ckpt, tokens=K, args=vars(args), history=history), out)
         elif epoch - best[1] >= args.patience:
             break
     assert best[2] is not None
@@ -130,7 +130,7 @@ def main():
         log(f"{s}: {r['bpd']:.4f} bits/dim ({r['nats']:.1f} nats/image): code {r['code_bits']:.2f} bits, "
             f"pixels {r['pixel_bpd']:.4f} bits/dim, over {r['images']} images")
     os.makedirs(os.path.dirname(results) or ".", exist_ok=True)
-    priced = args.prior or "the autoencoder's own shares"
+    priced = args.prior or "the encoder's own shares"
     with open(results + ".json", "w") as f:
         json.dump(dict(codes=args.codes, decoder=out, code_priced_by=priced,
                        bound="one code: -log2 p(z(x)) - log2 p(x | z(x))", **rows), f, indent=2)

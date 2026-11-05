@@ -1,4 +1,4 @@
-"""The categorical decoder's data and scores (train_categorical_decoder.py, benchmark.py): images at their codes'
+"""The decoder's data and scores (train_decoder.py, benchmark.py): images at their codes'
 nodes, a code's bits, and -log2 p(x | code)."""
 
 import math
@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from dvae.codes import Codes, bits_of, deltas, own_shares
-from dvae.deltatree import LeafDecoder
+from dvae.deltatree import Decoder
 from dvae.prior import BandedPrior, SidePrior, token_bits
 
 
@@ -46,15 +46,15 @@ def pixel_bits(decoder, leaves: Leaves, device, batch):
 
 
 def code_bits(codes: Codes, k, prior: SidePrior | BandedPrior | None, device):
-    """-log2 p(code) for every image's first k tokens [N], on the CPU: under the prior, else the autoencoder's own
+    """-log2 p(code) for every image's first k tokens [N], on the CPU: under the prior, else the encoder's own
     shares. Call it before building the split's Leaves, which overwrite codes.r."""
     if prior is not None:
         return token_bits(prior, codes.rare, codes.m, codes.r, device)[:, :k].sum(1)
     return bits_of(own_shares(codes.m[:, :k].float()), codes.rare[:, :k]).sum(1)
 
 
-def load_categorical(ckpt, device):
-    """A trained categorical decoder from its checkpoint (train_categorical_decoder.py's), in eval mode."""
-    decoder = LeafDecoder(**ckpt["config"]).to(device)
+def load_decoder(ckpt, device):
+    """A trained decoder from its checkpoint (train_decoder.py's), in eval mode."""
+    decoder = Decoder(**ckpt["config"]).to(device)
     decoder.load_state_dict(ckpt["state_dict"])
     return decoder.eval()
