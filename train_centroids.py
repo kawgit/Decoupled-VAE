@@ -11,7 +11,8 @@ that never wins gets no gradient.
 
 As in train_encoder.py, the encoder grows one depth every --grow-every epochs, from 1 up to --depths (0: no cap),
 and every step trains all its depths; early stopping watches the val images' mse after all --depths tokens once the
-encoder has grown to them. A checkpoint holds everything training needs; it is saved every epoch while the encoder
+encoder has grown to them, and stops a run that goes a --patience-frac share of its epochs (at least --patience)
+without a better one (dvae/stopping.py). A checkpoint holds everything training needs; it is saved every epoch while the encoder
 grows, then at each new best, and --resume continues from one. The progress plot (dvae/plots.py's plot_depths) is
 redrawn every epoch.
 
@@ -34,6 +35,7 @@ from dvae.data import get_device, load_mnist  # noqa: E402
 from dvae.deltatree import D, Frontier, by_nodes, node_order, pixels, root_frontier  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
 from dvae.plots import plot_depths  # noqa: E402
+from dvae.stopping import add_patience_args, stagnant  # noqa: E402
 
 
 def depth_step(encoder, fr: Frontier, args):
@@ -143,7 +145,7 @@ def main():
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-steps", type=int, default=100)
     p.add_argument("--epochs", type=int, default=200)
-    p.add_argument("--patience", type=int, default=5)
+    add_patience_args(p)
     p.add_argument("--limit-train", type=int, default=None)
     p.add_argument("--limit-val", type=int, default=None)
     p.add_argument("--out", default=None, help="checkpoint (default: model.pt in the run's artifacts folder)")
@@ -191,6 +193,8 @@ def main():
         for group in opt.param_groups:  # the settings given now
             group.update(lr=args.lr, initial_lr=args.lr, weight_decay=args.weight_decay)
         history, step, first = ckpt["metrics"], ckpt["step"], ckpt["epoch"] + 1
+        for h in history:  # (from before train_mse was kept: the objective is the same thing)
+            h.setdefault("train_mse", h["objective"][-1])
         grown = max(ckpt["grown"], first - args.grow_every)  # grow as it resumes, not to catch up
         if encoder.depths == K and ckpt.get("best"):
             best = tuple(ckpt["best"])  # the same full depth: early stopping carries on
@@ -241,8 +245,8 @@ def main():
         improved = full and val[-1] < best[0]
         if improved:
             best = (val[-1], epoch)
-        history.append(dict(epoch=epoch, val_mse=val, objective=objective, one_sided=lone, val_one_sided=val_lone,
-                            trained=encoder.depths - 1, seconds=time.time() - began))
+        history.append(dict(epoch=epoch, val_mse=val, train_mse=objective[-1], objective=objective, one_sided=lone,
+                            val_one_sided=val_lone, trained=encoder.depths - 1, seconds=time.time() - began))
         plot_depths(history, args.plot or os.path.splitext(args.log)[0] + ".png")
         log(f"  epoch {epoch:2d}: val mse after {encoder.depths} tokens {val[-1]:.6f} (psnr {psnr(val[-1]):.2f} dB); "
             "per depth " + fmt(val) + "; objective per depth " + fmt(objective)
@@ -251,7 +255,7 @@ def main():
             + f" ({t1 - t0:.0f}s train, {time.time() - t1:.0f}s val){'  *' if improved else ''}")
         if not full or improved:
             save(epoch)  # the latest while growing, then the best
-        elif epoch - best[1] >= args.patience:
+        elif stagnant(epoch, best[1], args):
             break
     if best[1] < 0:
         log(f"stopped at {encoder.depths} of {K} depths; the latest state is in {args.out}")

@@ -37,10 +37,12 @@ def _colorbar(fig, ax, norm, label):
 
 
 def plot_depths(history, path):
-    """Save an encoder run's progress (train_encoder.py): the val mse after every code length, one line
-    per epoch (darker is later); the val mse after the full code by epoch; and, from the latest epoch, the val
-    mse gain of every Lloyd step at every depth, one line per depth (darker is deeper). history holds dicts with
-    "epoch", "val_mse" (after 1..K tokens) and optionally "step_gains" (per depth, each step's gain)."""
+    """Save an encoder run's progress (train_encoder.py, train_centroids.py): the val mse after every code
+    length, one line per epoch (darker is later); the val mse after the full code by epoch, beside the train mse
+    when there is one; and, from the latest epoch, the val mse gain of every Lloyd step at every depth, one line
+    per depth (darker is deeper). history holds dicts with "epoch", "val_mse" (after 1..K tokens) and optionally
+    "train_mse" (after the epoch's last token, over the epoch's batches) and "step_gains" (per depth, each step's
+    gain)."""
     if not history:
         return
     gains = history[-1].get("step_gains") or []
@@ -61,12 +63,16 @@ def plot_depths(history, path):
     xs = [h["epoch"] for h in history]
     final = [h["val_mse"][-1] for h in history]
     K = len(history[-1]["val_mse"])
-    by_epoch.plot(xs, final, color="#2a78d6", linewidth=1.6, marker="o", markersize=4)
+    by_epoch.plot(xs, final, color="#2a78d6", linewidth=1.6, marker="o", markersize=4, label="val")
+    train = [(h["epoch"], h["train_mse"]) for h in history if "train_mse" in h]
+    if train:
+        by_epoch.plot(*zip(*train), color="#e8743b", linewidth=1.6, marker="o", markersize=3, label="train")
+        by_epoch.legend(frameon=False, labelcolor=INK)
     best = min(range(len(final)), key=final.__getitem__)
     by_epoch.annotate(f"best {final[best]:.4f}", (xs[best], final[best]), textcoords="offset points",
                       xytext=(0, 10), ha="right" if best > 0.8 * len(xs) else "center", fontsize=9, color=INK)
     by_epoch.xaxis.set_major_locator(MaxNLocator(integer=True))
-    _style(by_epoch, f"Val mse after each epoch's last token ({K} now) by epoch", "epoch", "val mse")
+    _style(by_epoch, f"{'Val and train' if train else 'Val'} mse after the last token ({K} now)", "epoch", "mse")
 
     if panels == 3:
         by_step = axes[2]

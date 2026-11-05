@@ -31,7 +31,8 @@ consecutive runs joined into batches, so a batch's images share more tokens and 
 cost does not depend on its images). C = --batch makes each batch one run; smaller C mixes more of the tree.
 
 Early stopping watches the held-out (val) images' mse after all --depths tokens, routed the same way, once the
-encoder has grown to them; every depth's val mse is logged. A checkpoint holds everything training needs (the
+encoder has grown to them, and stops a run that goes a --patience-frac share of its epochs (at least --patience)
+without a better one (dvae/stopping.py); every depth's val mse is logged. A checkpoint holds everything training needs (the
 optimizer's state, the tracked starts, the step and the history): saved every epoch while the encoder grows, then
 at each new best. --resume continues from one, growing on to --depths if that is deeper. The progress plot
 (dvae/plots.py's plot_depths) is redrawn every epoch.
@@ -55,6 +56,7 @@ from dvae.logs import RunLog  # noqa: E402
 from dvae.deltatree import (D, Encoder, Split, by_nodes, cat_splits, children, chunk_sse, lloyd,  # noqa: E402
                             node_order, pixels, root_frontier, split, top_direction)
 from dvae.plots import plot_depths  # noqa: E402
+from dvae.stopping import add_patience_args, stagnant  # noqa: E402
 
 
 def tree_order(keys, depth):
@@ -234,7 +236,7 @@ def main():
     p.add_argument("--ema", type=float, default=0.95, help="running statistics' decay per step (without --seeded)")
     p.add_argument("--refresh", type=int, default=50, help="steps between start updates (without --seeded)")
     p.add_argument("--epochs", type=int, default=200)
-    p.add_argument("--patience", type=int, default=5)
+    add_patience_args(p)
     p.add_argument("--limit-train", type=int, default=None)
     p.add_argument("--limit-val", type=int, default=None)
     p.add_argument("--out", default=None, help="checkpoint (default: model.pt in the run's artifacts folder)")
@@ -385,7 +387,7 @@ def main():
             + f" ({t1 - t0:.0f}s train, {time.time() - t1:.0f}s val){'  *' if improved else ''}")
         if not full or improved:
             save(epoch)  # the latest while growing, then the best
-        elif epoch - best[1] >= args.patience:
+        elif stagnant(epoch, best[1], args):
             break
     if best[1] < 0:
         log(f"stopped at {encoder.depths} of {K} depths; the latest state is in {args.out}")

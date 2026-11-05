@@ -9,8 +9,8 @@ fixed subset, scored as val is) and the val codes' cost per image and per range 
 the prior has to beat: the encoder's own shares (the rare side with probability m / (1 + m)) and the best
 constant share per depth (fit on the train codes). Early stopping watches the val cost separately in each of
 --bands bands of depths (equal widths), since depths need different amounts of training: each band keeps the
-weights of the epoch with its lowest val cost, stops once --patience epochs pass without a better one (the model
-still trains on every depth), and the run ends when every band has stopped. The kept prior answers each depth
+weights of the epoch with its lowest val cost, stops once it goes a --patience-frac share of the run's epochs (at least --patience) without
+a better one (dvae/stopping.py; the model still trains on every depth), and the run ends when every band has stopped. The kept prior answers each depth
 with its band's weights (dvae/prior.py's BandedPrior; --bands 1 is one early stop for all), and at the end it is
 scored on the test codes against the same baselines. The progress plot (dvae/plots.py's plot_prior) is redrawn
 every epoch.
@@ -33,6 +33,7 @@ from dvae.data import get_device
 from dvae.logs import RunLog
 from dvae.plots import plot_prior
 from dvae.prior import SidePrior, band_edges, load_prior, token_bits
+from dvae.stopping import add_patience_args, patience, stagnant
 
 LN2 = math.log(2)
 
@@ -61,7 +62,7 @@ def main():
     p.add_argument("--warmup", type=int, default=500, help="steps of linear learning-rate warmup")
     p.add_argument("--batch", type=int, default=256)
     p.add_argument("--epochs", type=int, default=1000)
-    p.add_argument("--patience", type=int, default=10, help="epochs without a better val cost before a band stops")
+    add_patience_args(p)
     p.add_argument("--bands", type=int, default=8, help="bands of depths, each early-stopped on its own")
     p.add_argument("--train-eval", type=int, default=5000, help="train codes scored each epoch, beside val")
     p.add_argument("--seed", type=int, default=0)
@@ -154,7 +155,7 @@ def main():
             states = {e: w for e, w in states.items() if e in kept}
             torch.save(dict(config=prior.config, bands=edges, band_epochs=kept, states=states, args=vars(args),
                             codes=args.codes, encoder=train.ckpt, epoch=epoch, history=history), args.out)
-        stopped = [done or epoch - e >= args.patience for done, (_, e) in zip(stopped, best)]
+        stopped = [done or stagnant(epoch, e, args) for done, (_, e) in zip(stopped, best)]
         plot_prior(history, edges, [e for _, e in best], args.plot)
         bands_now = ", ".join(f"{n}@{e}" + (" stopped" if done else "")
                               for n, (_, e), done in zip(names, best, stopped))
@@ -164,7 +165,7 @@ def main():
             f"{'; better in ' + ', '.join(improved) if improved else ''} ({trained:.0f}s train, "
             f"{time.time() - began - trained:.0f}s eval)")
         if all(stopped):
-            log(f"every band went {args.patience} epochs without a better val cost: stopping")
+            log(f"every band went {patience(epoch, args)} epochs or more without a better val cost: stopping")
             break
 
     kept = load_prior(torch.load(args.out, map_location=device, weights_only=False), device)

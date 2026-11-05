@@ -5,7 +5,7 @@ dump_encoder.py wrote.
 It reads a code's delta history and its node's predicted mean image (the training mean plus the deltas), so it
 adds what the encoder's mean leaves out: each pixel's spread around it. Every epoch logs and plots
 (dvae/plots.py's plot_decoder) the val and train images' pixel bits per dimension under it, and early
-stopping watches val. Then val and test are scored as -log2 p(code) - log2 p(x | code), the one-code upper bound
+stopping watches val (dvae/stopping.py's patience). Then val and test are scored as -log2 p(code) - log2 p(x | code), the one-code upper bound
 on -log2 p(x): the code priced by --prior (train_prior.py's) when given, else by the encoder's own shares.
 
 Run from the repo: python train_decoder.py --codes artifacts/<dump job>
@@ -32,6 +32,7 @@ from dvae.deltatree import D, Decoder  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
 from dvae.plots import plot_decoder  # noqa: E402
 from dvae.prior import load_prior  # noqa: E402
+from dvae.stopping import add_patience_args, stagnant  # noqa: E402
 
 
 def main():
@@ -48,7 +49,7 @@ def main():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--patience", type=int, default=3)
+    add_patience_args(p)
     p.add_argument("--out", default=None, help="checkpoint (default: decoder.pt in the run's artifacts folder)")
     p.add_argument("--results", default=None, help="results prefix (default: results in the run's artifacts folder)")
     p.add_argument("--log", default=None, help="summary log (default: run.log in the run's artifacts folder)")
@@ -113,7 +114,7 @@ def main():
             best = (val, epoch, {key: v.detach().clone() for key, v in decoder.state_dict().items()})
             torch.save(dict(config=decoder.config, state_dict=best[2], codes=args.codes,
                             encoder=codes["train"].ckpt, tokens=K, args=vars(args), history=history), out)
-        elif epoch - best[1] >= args.patience:
+        elif stagnant(epoch, best[1], args):
             break
     assert best[2] is not None
     decoder.load_state_dict(best[2])
