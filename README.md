@@ -14,6 +14,149 @@ plot every epoch, with a QA script for each trained model:
 | 3 | `train_prior.py` | which codes are valid: p(each token's side given the ones before) | `qa_prior.py` |
 | 4 | `train_decoder.py` | p(image given its code), 256 grey levels per pixel | `qa_decoder.py` |
 
+## Motivation
+
+Each major choice in the design follows from the one before it.
+
+### A learned prior, after the fact
+
+A VAE fixes the prior, usually a standard Gaussian, and trains the encoder to fit it. VQ-VAE
+([van den Oord et al., 2017](https://arxiv.org/abs/1711.00937)) dropped that constraint: the encoder and decoder
+train first, the latent space takes whatever shape suits them, and a separate prior learns that shape
+afterwards. This model does the same. The encoder is free to build whatever space is easiest to compress into,
+and the prior is fit to its codes later.
+
+### A one-dimensional sequence of tokens
+
+TiTok ([Yu et al., 2024](https://arxiv.org/abs/2406.07550)) showed that an image's latent can be a short,
+one-dimensional sequence of discrete tokens rather than a two-dimensional grid. Here a code is such a sequence,
+of binary tokens.
+
+### One fixed order
+
+The encoder and the prior both decide tokens one at a time, each given the tokens before it, in the same order
+every time. If tokens are decided one at a time, a fixed order is the simplest choice:
+
+- **It costs no expressiveness.** By the chain rule, any distribution over codes factors in a fixed order.
+- **It narrows what the models must learn.** They only ever see the situations that one order produces.
+- **It makes every prefix of a code a code in its own right.** So the same models give a compression pipeline
+  alongside the generation one.
+
+![Generation, compression and decompression pipelines](docs/pipelines.png)
+
+- **Generation:** the prior samples every token, and the decoder draws an image from the code.
+- **Compression:** the encoder writes the image's tokens, and the first $k$ are kept. With an entropy coder, each
+  token costs about its bits under the prior.
+- **Decompression:** the prior fills in the dropped tokens given the first $k$, and the decoder draws an image
+  consistent with all of them. (The current QA scripts decode a $k$-token prefix as its node's predicted mean
+  instead.)
+
+### The encoder's objective: decompression loss
+
+A node holds every image whose code begins with its prefix. Decompressing it means producing an image consistent
+with it, and the error is set by how spread out the node's images are. So the loss of a node $\pi$ is the
+expected distance between two of its images drawn independently:
+
+```math
+D(\pi) = \mathbb{E}_{x, y \sim \pi}\, d(x, y).
+```
+
+A decoder that samples from the node errs by exactly $D$ on average, and one that outputs the node's mean errs by
+$D/2$. With $d$ the mean squared distance over $n = 784$ pixels, $D$ is twice the node's total variance per pixel:
+
+```math
+D(\pi) = \frac{2}{n} \operatorname{tr} \operatorname{Cov}_\pi(x).
+```
+
+**At one node this is the k-means objective.** Splitting a node into $V$ children $v$ with shares $p_v$ and
+means $\mu_v$, the loss after the token is the share-weighted sum of the children's losses:
+
+```math
+\sum_v p_v\, D(\pi_v) = \frac{2}{n}\, \mathbb{E}_{x \sim \pi} \lVert x - \mu_{v(x)} \rVert^2 ,
+```
+
+the within-cluster sum of squares. So the best split of a node is a k-means clustering of its images, with
+$k = V$. Splitting greedily, one node at a time, keeps the problem tractable.
+
+**With $V = 2$, each token is the side of a hyperplane.** Two-means assigns each point to the nearer of two
+centroids. The boundary is the set of points equidistant from both, which is the hyperplane bisecting the
+segment between them. So a binary token answers which side of a hyperplane the image lies on. Binary is the
+simplest split, and any $V$-way decision can be built from binary ones.
+
+### Predict means, not hyperplanes
+
+The ideal encoder would output the best hyperplane for any node. But the two-means objective is not convex in
+the hyperplane. It has many separate good optima, and swapping the two sides gives the same split. A network
+trained to regress the best hyperplane would average between optima and land on a split that is good for none of
+them.
+
+What is well defined for any hyperplane is the mean of the images on each side. That is a conditional
+expectation, smooth in the hyperplane, and regression learns it well. So the encoder predicts the two side means
+for a given node and hyperplane, and Lloyd's algorithm does the search: move the hyperplane to the bisector of the
+predicted means, and repeat. That is k-means' own algorithm, with the network standing in for the node's images.
+So it also works at deep nodes, which hold one training image or none.
+
+### Why a separate prior
+
+The encoder already implies a share for every split: its $m$, with $p = m / (1 + m)$. With unlimited data and
+capacity, that share and a separately trained prior would converge to the same answer. In practice both must
+compromise, and they compromise differently.
+
+**The encoder's $m$ is trained to place a mean, not to predict a share.** Its loss only asks that the common
+side's predicted mean, $-m\,r$, land on the actual common-side mean $\bar c$. The best $m$ is then the projection
+
+```math
+m = -\frac{\langle \bar c, r \rangle}{\lVert r \rVert^2},
+```
+
+which equals the share ratio $p / (1 - p)$ only when $p\,r + (1 - p)\,\bar c = 0$. That holds when the node's
+images really are centred on its predicted mean. Any error left by earlier tokens breaks it. For example, along
+$r$'s direction, with the node's predicted mean at 0:
+
+| side | actual share | actual mean |
+|---|---|---|
+| rare | 0.25 | +2.0 |
+| common | 0.75 | -0.2 |
+
+The node's images are centred at $0.25 \cdot 2 - 0.75 \cdot 0.2 = 0.35$, not 0.
+- **The encoder's fit:** $r = 2$ and $m = 0.1$, which put both side means exactly right. That implies a share of
+  $0.1 / 1.1 \approx 0.09$.
+- **The cost to compression:** pricing the token at 0.09 costs 0.968 bits on average. The true share of 0.25,
+  which a prior trained on cross-entropy learns, costs 0.811. That wastes 0.16 bits on this token.
+- **The cost to sampling:** a sampler using the encoder's share picks the rare side about a third as often as
+  real images go there.
+
+Errors build up with depth, so this gap should grow with depth, and it does. At 119 tokens, the encoder's own
+shares cost about 1.00 bit per token at depths 65-119, while the prior's cost 0.90.
+
+Two more differences:
+- **A cap:** $m \le 1$ caps the encoder's share at one half. It can never say that the rare side holds most of a
+  node's images, and the prior can.
+- **The right loss:** cross-entropy is the loss whose compromise compression and sampling actually pay for.
+
+(When the encoder merely cannot tell two situations apart, but each has its images centred on its predicted mean,
+both models settle on the same pooled share. It takes error in the means to pull them apart.)
+
+So the two predictions serve different purposes:
+- **The encoder's is to produce a space with an easy-to-learn prior.**
+- **The prior's is to learn which codes in that space are valid,** correcting the encoder's shares where they
+  are wrong.
+
+### Why a separate decoder
+
+For a code, the encoder outputs a single image: its node's predicted mean. That is the best single guess under
+squared error. But a node still holds many images, so the mean is a blur of them, and a point estimate gives no
+likelihood to score.
+
+The decoder models $p(x \mid \text{code})$: a distribution over each pixel's 256 grey levels, given the code and
+its mean image.
+- **Likelihoods:** the whole model can then report bits per dimension.
+- **Sharp samples:** samples, or each pixel's most likely level, have sharp strokes where the mean is blurry.
+
+Keeping it separate leaves the codes alone. The encoder chooses its splits for the decompression loss, and the
+decoder is fit afterwards to the frozen codes, without pulling them toward whatever is easiest to model one pixel
+at a time. It does treat pixels as independent given the code, which is why its single draws look speckled.
+
 ## How it works
 
 ### Stage 1: the encoder
@@ -47,19 +190,6 @@ side means of the batch's images there (each side weighted by its image count, s
 depth), averaged over its Lloyd steps. The network starts with one depth and grows one more every
 `--grow-every` epochs, up to `--depths` (0: no cap). Early stopping watches the held-out (val) images' mse after
 the full code.
-
-### Two share predictions, two purposes
-
-The encoder already predicts each split's shares (its $m$), and the prior predicts them again. They answer to
-different objectives:
-
-- **The encoder's purpose is to produce a space with an easy-to-learn prior.** Its $m$ is trained only so that
-  its side means come out right.
-- **The prior's purpose is to learn which codes in that space are valid.** It is trained on cross-entropy alone,
-  so it fixes the encoder's mistakes in exactly the quantity that sampling and compression depend on.
-
-With unlimited data and model capacity both would converge to the same shares. With finite ones they compromise
-in different places, and the prior's compromise is the one that matters for generation.
 
 ### Stage 2: the dump
 
