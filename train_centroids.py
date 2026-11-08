@@ -9,6 +9,12 @@ of the images it won, so training does Lloyd's algorithm across batches. Each ep
 nodes (of those holding at least two of the batch's images) that sent every image to one centroid: a centroid
 that never wins gets no gradient.
 
+With --seed-deepest, a depth's first --grow-every epochs choose its basin as train_encoder.py's Lloyd steps start:
+each image goes to the centroid on its side of the hyperplane through its node's predicted mean, normal to the
+depth's top principal direction (tracked as train_encoder.py's --start depth tracks it, the next depth's from
+before it joins), and is scored against that centroid; afterwards the depth assigns to the nearer centroid like the
+others. Val always assigns to the nearer one.
+
 As in train_encoder.py, the encoder grows one depth every --grow-every epochs, from 1 up to --depths (0: no cap),
 and every step trains all its depths; early stopping watches the val images' mse after all --depths tokens once the
 encoder has grown to them, and stops a run that goes a --patience-frac share of its epochs (at least --patience)
@@ -32,17 +38,19 @@ import torch  # noqa: E402
 from dvae.artifacts import artifact  # noqa: E402
 from dvae.centroids import CentroidEncoder, centroid_children, nearer  # noqa: E402
 from dvae.data import get_device, load_mnist  # noqa: E402
-from dvae.deltatree import D, Frontier, by_nodes, node_order, pixels, root_frontier  # noqa: E402
+from dvae.deltatree import D, Frontier, by_nodes, node_order, pixels, root_frontier, top_direction  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
 from dvae.plots import plot_depths  # noqa: E402
 from dvae.stopping import add_patience_args, stagnant  # noqa: E402
 
 
-def depth_step(encoder, fr: Frontier, args):
+def depth_step(encoder, fr: Frontier, args, label=None):
     """One depth of train_step, in pieces of at most --max-nodes nodes: the objective summed over fr's images
-    (backward done) and every node's centroids [Nn, 2, D], detached."""
+    (backward done), every node's centroids [Nn, 2, D] and, from a tower encoder, its m [Nn] (else None),
+    detached. Each image is scored against its nearer centroid, or with label [N] (True: c1) against that one."""
     Nn, device = len(fr.bits), fr.R.device
     C = fr.R.new_zeros(Nn, 2, D)
+    M = fr.R.new_zeros(Nn) if encoder.m_head is not None else None
     total = fr.R.new_zeros(())
     if Nn <= args.max_nodes:  # one piece: no sorting or cutting, which would wait on the GPU
         pieces = [None]
@@ -51,16 +59,21 @@ def depth_step(encoder, fr: Frontier, args):
         pieces = by_nodes(order, fr.node[order], args.max_nodes)
     for imgs in pieces:
         if imgs is None:
-            R, inverse, nodes = fr.R, fr.node, torch.arange(Nn, device=device)
+            R, inverse, nodes, mine = fr.R, fr.node, torch.arange(Nn, device=device), label
         else:
-            R = fr.R[imgs]
+            R, mine = fr.R[imgs], None if label is None else label[imgs]
             nodes, inverse = torch.unique(fr.node[imgs], return_inverse=True)
-        c = encoder.centroids(encoder.memory(*fr.history(nodes, device)))
-        loss = nearer(R, c[inverse])[1].sum()
+        c, m = encoder.centroids(encoder.memory(*fr.history(nodes, device)))
+        if mine is None:
+            loss = nearer(R, c[inverse])[1].sum()
+        else:
+            loss = (R - c[inverse, mine.long()]).square().sum()
         (loss / (args.batch * D)).backward()  # a fixed divisor, so every image weighs the same
         total = total + loss.detach()
         C[nodes] = c.detach()
-    return total, C
+        if M is not None and m is not None:
+            M[nodes] = m.detach()
+    return total, C, M
 
 
 def one_sided(fr: Frontier, side):
@@ -73,17 +86,43 @@ def one_sided(fr: Frontier, side):
     return (held & ((ones == 0) | (ones == counts))).sum(), held.sum()
 
 
-def train_step(encoder, X, mean, args):
-    """Send the batch X down every depth of the encoder as it splits them, accumulating each depth's gradient.
-    Returns, per depth [K]: the objective summed over the batch, the nodes split, and one_sided's two counts."""
+def fold(grams, depth, R, ema):
+    grams[depth].mul_(ema).add_(R.T @ R / len(R), alpha=1 - ema)
+
+
+@torch.no_grad()
+def refresh(grams, tracked, depths):
+    """The depths' tracked directions (tracked [n, D]) from their running Gram matrices, each keeping its sign
+    from before (so its centroids keep their sides)."""
+    for depth in depths:
+        gram = grams[depth].double() if grams.device.type == "cuda" else grams[depth].cpu().double()
+        top = torch.linalg.eigh(gram)[1][:, -1].float().to(tracked.device)
+        tracked[depth] = top if top @ tracked[depth] >= 0 else -top
+
+
+def train_step(encoder, X, mean, args, labelled=(), tracked=None, grams=None):
+    """Send the batch X down every depth of the encoder as it splits them, accumulating each depth's gradient. At
+    the depths in labelled, each image goes to the centroid on its side of the hyperplane through its node's
+    predicted mean normal to the depth's tracked direction (tracked [n, D]; the positive side to c1), not the
+    nearer one. With grams [n, D, D], every depth's remainders, and the next depth's while grams has one more,
+    are folded into its running Gram matrix. Returns, per depth [K]: the objective summed over the batch, the
+    nodes split, and one_sided's two counts."""
     fr = root_frontier(X, mean, resident=True)
     rows = []
     for depth in range(encoder.depths):
-        total, C = depth_step(encoder, fr, args)
-        child, side = centroid_children(fr, C)
+        if grams is not None:
+            fold(grams, depth, fr.R, args.ema)
+        label = None
+        if depth in labelled:
+            assert tracked is not None
+            label = fr.R @ tracked[depth] >= 0
+        total, C, M = depth_step(encoder, fr, args, label)
+        child, side = centroid_children(fr, C, M, label)
         lone, held = one_sided(fr, side)
         rows.append(torch.stack([total, total.new_tensor(float(len(fr.bits))), lone.to(total), held.to(total)]))
         fr = child
+    if grams is not None and len(grams) > encoder.depths:
+        fold(grams, encoder.depths, fr.R, args.ema)
     return torch.stack(rows, 1)
 
 
@@ -96,10 +135,11 @@ def evaluate(encoder, X, mean, args):
     device = X.device
     for _ in range(encoder.depths):
         Nn = len(fr.bits)
-        C = torch.cat([encoder.centroids(encoder.memory(*fr.history(torch.arange(i, min(i + args.node_batch, Nn)),
-                                                                     device)))
-                       for i in range(0, Nn, args.node_batch)])
-        child, side = centroid_children(fr, C)
+        parts = [encoder.centroids(encoder.memory(*fr.history(torch.arange(i, min(i + args.node_batch, Nn)), device)))
+                 for i in range(0, Nn, args.node_batch)]
+        C = torch.cat([c for c, _ in parts])
+        ms = [m for _, m in parts if m is not None]
+        child, side = centroid_children(fr, C, torch.cat(ms) if ms else None)
         lone, held = one_sided(fr, side)
         lones.append((lone / held.clamp_min(1)).item())
         fr = child
@@ -133,6 +173,13 @@ def main():
                    help="continue from a checkpoint (its architecture and data mean; training settings from now)")
     p.add_argument("--node-mean", action="store_true",
                    help="also show the network each node's predicted mean image (dvae/deltatree.py's HistoryReader)")
+    p.add_argument("--tower", action="store_true",
+                   help="keep the tower property: predict r and m, the centroids being r and -m r")
+    p.add_argument("--seed-deepest", action="store_true",
+                   help="for --grow-every epochs after a depth joins, assign its images by the side of Lloyd's start "
+                        "(train_encoder.py's --start depth), not the nearer centroid")
+    p.add_argument("--ema", type=float, default=0.95, help="running Gram matrices' decay per step (--seed-deepest)")
+    p.add_argument("--refresh", type=int, default=50, help="steps between direction updates (--seed-deepest)")
     p.add_argument("--width", type=int, default=256)
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--heads", type=int, default=4)
@@ -166,6 +213,7 @@ def main():
     if ckpt is not None:  # the architecture is the checkpoint's
         cfg = ckpt["shared"]["config"]
         args.width, args.layers, args.heads, args.node_mean = cfg["width"], cfg["layers"], cfg["heads"], cfg["node_mean"]
+        args.tower = cfg.get("tower", False)
     log(f"=== {time.strftime('%Y-%m-%d')} {vars(args)}")
     X = pixels(load_mnist("train", args.data_root)[:args.limit_train]).to(device)
     V = pixels(load_mnist("val", args.data_root)[:args.limit_val]).to(device)
@@ -174,7 +222,8 @@ def main():
 
     torch.manual_seed(args.seed)
     if ckpt is None:
-        encoder = CentroidEncoder(1, args.width, args.layers, args.heads, node_mean=args.node_mean).to(device)
+        encoder = CentroidEncoder(1, args.width, args.layers, args.heads, node_mean=args.node_mean,
+                                  tower=args.tower).to(device)
         if args.node_mean:
             with torch.no_grad():
                 encoder.mean.copy_(mean)
@@ -182,8 +231,21 @@ def main():
         encoder = CentroidEncoder(**ckpt["shared"]["config"]).to(device)
         encoder.load_state_dict(ckpt["shared"]["state_dict"])
         assert encoder.depths <= K, f"--depths {K} is below the checkpoint's {encoder.depths}"
-    log(f"centroid encoder: {sum(q.numel() for q in encoder.parameters()) / 1e6:.1f}M parameters, "
+    log(f"centroid encoder{' (tower)' if args.tower else ''}: "
+        f"{sum(q.numel() for q in encoder.parameters()) / 1e6:.1f}M parameters, "
         f"{encoder.depths} depths, growing to {K}")
+
+    # with --seed-deepest: each depth's direction and running Gram matrix, the encoder's and the next one's (the
+    # root's until tracked), and when (in epochs) each depth joined
+    tracked = grams = None
+    joined = [0.0] * encoder.depths if ckpt is None else list(ckpt.get("joined") or [-math.inf] * encoder.depths)
+    if args.seed_deepest:
+        R = X - mean
+        n = encoder.depths + 1 if encoder.depths < K else encoder.depths
+        tracked, grams = top_direction(R).expand(n, D).clone(), (R.T @ R / N).expand(n, D, D).clone()
+        if ckpt is not None and ckpt.get("grams") is not None:
+            kept = ckpt["grams"].to(device)[:n]
+            grams[:len(kept)], tracked[:len(kept)] = kept, ckpt["tracked"].to(device)[:len(kept)]
 
     opt = torch.optim.AdamW(encoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     history, step, first, best = [], 0, 0, (math.inf, -1)
@@ -208,7 +270,9 @@ def main():
         torch.save(dict(args=vars(args), mean=mean.cpu(), epoch=epoch, step=step, metrics=history, best=best,
                         shared=dict(config=encoder.config,
                                     state_dict={k: v.cpu() for k, v in encoder.state_dict().items()}),
-                        optimizer=opt.state_dict(), grown=grown), args.out)
+                        optimizer=opt.state_dict(), grown=grown, joined=joined,
+                        tracked=None if tracked is None else tracked.cpu(),
+                        grams=None if grams is None else grams.cpu()), args.out)
 
     def fmt(values, digits=5):
         return " ".join(f"{v:.{digits}f}" for v in values)
@@ -219,12 +283,23 @@ def main():
         totals = torch.zeros(4, encoder.depths, device=device)  # (widened as the encoder grows)
         gen = torch.Generator().manual_seed(args.seed * 1_000_003 + epoch)
         batches, seen = list(torch.randperm(N, generator=gen).split(args.batch)), 0
+        labelled_now = set()  # the depths labelled by their directions this epoch
         for i, idx in enumerate(batches):
-            if encoder.depths < K and epoch + i / len(batches) - grown >= args.grow_every - 1e-9:
+            now = epoch + i / len(batches)
+            if encoder.depths < K and now - grown >= args.grow_every - 1e-9:
                 grow(encoder, opt, encoder.depths + 1)
                 grown += args.grow_every
+                joined.append(grown)
+                if grams is not None and tracked is not None:
+                    refresh(grams, tracked, [encoder.depths - 1])
+                    if encoder.depths < K:
+                        tracked = torch.cat([tracked, tracked[:1]])  # the root's, until tracked
+                        grams = torch.cat([grams, grams[:1]])
+            labelled = [d for d, t in enumerate(joined) if now - t < args.grow_every - 1e-9] \
+                if args.seed_deepest else []
+            labelled_now.update(labelled)
             opt.zero_grad(set_to_none=True)
-            stats = train_step(encoder, X[idx.to(device)], mean, args)
+            stats = train_step(encoder, X[idx.to(device)], mean, args, labelled, tracked, grams)
             if stats.shape[1] > totals.shape[1]:
                 totals = torch.cat([totals, totals.new_zeros(4, stats.shape[1] - totals.shape[1])], 1)
             totals[:, :stats.shape[1]] += stats
@@ -233,6 +308,8 @@ def main():
             opt.step()
             sched.step()
             step += 1
+            if grams is not None and tracked is not None and labelled and step % args.refresh == 0:
+                refresh(grams, tracked, labelled)
             if time.time() - last >= args.log_interval:
                 last = time.time()
                 log.detail(f"    step {step} ({seen}/{N} images this epoch)")
@@ -252,6 +329,8 @@ def main():
             "per depth " + fmt(val) + "; objective per depth " + fmt(objective)
             + "; one-sided nodes per depth train " + fmt(lone, 3) + ", val " + fmt(val_lone, 3)
             + "; nodes per batch " + fmt((totals[1] / len(batches)).tolist(), 0)
+            + (f"; labelled by direction: depths {' '.join(str(d + 1) for d in sorted(labelled_now)) or 'none'}"
+               if args.seed_deepest else "")
             + f" ({t1 - t0:.0f}s train, {time.time() - t1:.0f}s val){'  *' if improved else ''}")
         if not full or improved:
             save(epoch)  # the latest while growing, then the best

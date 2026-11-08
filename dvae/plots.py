@@ -7,7 +7,7 @@ import matplotlib
 matplotlib.use("Agg")  # files only, no display
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap, Normalize  # noqa: E402
-from matplotlib.ticker import MaxNLocator  # noqa: E402
+from matplotlib.ticker import FormatStrFormatter, LogLocator, MaxNLocator, NullFormatter  # noqa: E402
 
 # a single-hue ordinal ramp, light to dark: later epochs are darker
 RAMP = LinearSegmentedColormap.from_list("epochs", ["#86b6ef", "#3987e5", "#184f95", "#0d366b"])
@@ -27,6 +27,14 @@ def _style(ax, title, xlabel, ylabel):
     ax.tick_params(colors=MUTED)
 
 
+def _log_y(ax):
+    """A log y axis labelled in plain numbers at 1, 2, 3 and 5 times each power of ten."""
+    ax.set_yscale("log")
+    ax.yaxis.set_major_locator(LogLocator(subs=(1.0, 2.0, 3.0, 5.0)))
+    ax.yaxis.set_major_formatter(FormatStrFormatter("%.3g"))
+    ax.yaxis.set_minor_formatter(NullFormatter())
+
+
 def _colorbar(fig, ax, norm, label):
     bar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=RAMP), ax=ax, pad=0.02)
     bar.locator = MaxNLocator(integer=True)
@@ -39,7 +47,7 @@ def _colorbar(fig, ax, norm, label):
 def plot_depths(history, path):
     """Save an encoder run's progress (train_encoder.py, train_centroids.py): the val mse after every code
     length, one line per epoch (darker is later); the val mse after the full code by epoch, beside the train mse
-    when there is one; and, from the latest epoch, the val mse gain of every Lloyd step at every depth, one line
+    when there is one (both on log scales); and, from the latest epoch, the val mse gain of every Lloyd step at every depth, one line
     per depth (darker is deeper). history holds dicts with "epoch", "val_mse" (after 1..K tokens) and optionally
     "train_mse" (after the epoch's last token, over the epoch's batches) and "step_gains" (per depth, each step's
     gain)."""
@@ -55,23 +63,26 @@ def plot_depths(history, path):
     for h in history:
         mses = h["val_mse"]
         by_depth.plot(range(1, len(mses) + 1), mses, color=RAMP(norm(h["epoch"])), linewidth=1.6,
-                      marker="o" if len(mses) <= 12 else None, markersize=3)
+                      marker="o" if len(mses) == 1 else None, markersize=3)  # a lone point needs a dot to show
     by_depth.xaxis.set_major_locator(MaxNLocator(integer=True))
+    _log_y(by_depth)
     _style(by_depth, "Val mse by code length, one line per epoch", "tokens", "val mse")
     _colorbar(fig, by_depth, norm, "epoch")
 
     xs = [h["epoch"] for h in history]
     final = [h["val_mse"][-1] for h in history]
     K = len(history[-1]["val_mse"])
-    by_epoch.plot(xs, final, color="#2a78d6", linewidth=1.6, marker="o", markersize=4, label="val")
+    lone = "o" if len(xs) == 1 else None  # a lone point needs a dot to show
+    by_epoch.plot(xs, final, color="#2a78d6", linewidth=1.6, marker=lone, markersize=4, label="val")
     train = [(h["epoch"], h["train_mse"]) for h in history if "train_mse" in h]
     if train:
-        by_epoch.plot(*zip(*train), color="#e8743b", linewidth=1.6, marker="o", markersize=3, label="train")
+        by_epoch.plot(*zip(*train), color="#e8743b", linewidth=1.6, marker=lone, markersize=3, label="train")
         by_epoch.legend(frameon=False, labelcolor=INK)
     best = min(range(len(final)), key=final.__getitem__)
     by_epoch.annotate(f"best {final[best]:.4f}", (xs[best], final[best]), textcoords="offset points",
                       xytext=(0, 10), ha="right" if best > 0.8 * len(xs) else "center", fontsize=9, color=INK)
     by_epoch.xaxis.set_major_locator(MaxNLocator(integer=True))
+    _log_y(by_epoch)
     _style(by_epoch, f"{'Val and train' if train else 'Val'} mse after the last token ({K} now)", "epoch", "mse")
 
     if panels == 3:

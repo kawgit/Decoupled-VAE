@@ -32,7 +32,8 @@ cost does not depend on its images). C = --batch makes each batch one run; small
 
 Early stopping watches the held-out (val) images' mse after all --depths tokens, routed the same way, once the
 encoder has grown to them, and stops a run that goes a --patience-frac share of its epochs (at least --patience)
-without a better one (dvae/stopping.py); every depth's val mse is logged. A checkpoint holds everything training needs (the
+without a better one (dvae/stopping.py); every depth's val mse is logged, beside the train mse after the last token
+(over the epoch's batches, each as training split it). A checkpoint holds everything training needs (the
 optimizer's state, the tracked starts, the step and the history): saved every epoch while the encoder grows, then
 at each new best. --resume continues from one, growing on to --depths if that is deeper. The progress plot
 (dvae/plots.py's plot_depths) is redrawn every epoch.
@@ -112,10 +113,12 @@ def train_step(encoder, X, mean, grams, args, caps):
     without seeds, fold the remainders each depth sees into its running Gram matrix (grams [n, D, D]), and the
     next depth's too while grams has one more (it tracks its start before it joins). Returns, per depth [K]: the
     objective and the PCA reconstruction error summed over the batch, and the Lloyd steps taken and nodes split;
+    the batch's squared error summed after its last token (the train mse's numerator, as val's is measured);
     and each image's key (child_key) at the deepest depth it reached [b], on the CPU."""
     K = encoder.depths
     ahead = grams is not None and len(grams) > K
     fr = root_frontier(X, mean, resident=True)
+    child = fr
     zero = X.new_zeros(())
     sses, pcas, steps, nodes = [zero] * K, [zero] * K, [zero] * K, [zero] * K
     for depth in range(K):
@@ -125,13 +128,14 @@ def train_step(encoder, X, mean, grams, args, caps):
         total, pca_total, s = depth_step(encoder, fr, args, caps[depth])
         sses[depth], pcas[depth] = total, pca_total
         steps[depth], nodes[depth] = s.steps.sum(), R.new_tensor(float(len(s.steps)))
+        child, _ = children(fr, s)
         if depth + 1 < K or ahead:
-            fr, _ = children(fr, s)
+            fr = child
     if ahead:
         assert grams is not None
         fold(grams, K, fr.R, args.ema)
     return torch.stack([torch.stack(sses), torch.stack(pcas), torch.stack(steps), torch.stack(nodes)]), \
-        fr.bits[fr.node.to(fr.bits.device)].cpu()
+        child.R.detach().square().sum(), fr.bits[fr.node.to(fr.bits.device)].cpu()
 
 
 @torch.no_grad()
@@ -342,6 +346,7 @@ def main():
         t0, last = time.time(), time.time()
         encoder.train()
         totals = torch.zeros(4, encoder.depths, device=device)  # (widened as the encoder grows)
+        last_sse = torch.zeros((), device=device)  # after each batch's last token
         gen = torch.Generator().manual_seed(args.seed * 1_000_003 + epoch)
         batches, seen = epoch_batches(N, codes, args, gen), 0
         codes = torch.zeros(N, dtype=torch.int64)
@@ -350,7 +355,8 @@ def main():
                 add_depth()
                 grown += args.grow_every
             opt.zero_grad(set_to_none=True)
-            stats, keys = train_step(encoder, X[idx.to(device)], mean, grams, args, caps)
+            stats, sse, keys = train_step(encoder, X[idx.to(device)], mean, grams, args, caps)
+            last_sse += sse
             if stats.shape[1] > totals.shape[1]:
                 totals = torch.cat([totals, totals.new_zeros(4, stats.shape[1] - totals.shape[1])], 1)
             totals[:, :stats.shape[1]] += stats
@@ -370,17 +376,18 @@ def main():
         totals = totals[:, :encoder.depths]  # (a depth added mid-epoch counts only the images it saw)
         objective = (totals[0] / (N * D)).tolist()
         pca = (totals[1] / (N * D)).tolist()
+        train_mse = last_sse.item() / (N * D)
         train_steps = (totals[2] / totals[3].clamp_min(1)).tolist()
         full = encoder.depths == K
         improved = full and val[-1] < best[0]
         if improved:
             best = (val[-1], epoch)
-        history.append(dict(epoch=epoch, val_mse=val, objective=objective, pca=pca, train_steps=train_steps,
+        history.append(dict(epoch=epoch, val_mse=val, train_mse=train_mse, objective=objective, pca=pca, train_steps=train_steps,
                             val_steps=val_steps, val_capped=capped, trained=encoder.depths - 1, caps=list(caps),
                             step_gains=step_gains, seconds=time.time() - began))
         plot_depths(history, args.plot or os.path.splitext(args.log)[0] + ".png")
         log(f"  epoch {epoch:2d}: val mse after {encoder.depths} tokens {val[-1]:.6f} (psnr {psnr(val[-1]):.2f} dB); "
-            "per depth " + fmt(val) + "; objective per depth " + fmt(objective)
+            "per depth " + fmt(val) + f"; train mse {train_mse:.6f}; objective per depth " + fmt(objective)
             + (("; pca per depth " + fmt(pca)) if args.seeded else "")
             + "; lloyd steps per depth train " + fmt(train_steps, 2) + ", val " + fmt(val_steps, 2)
             + ", val capped " + fmt(capped, 2) + "; nodes per batch " + fmt((totals[3] / len(batches)).tolist(), 0)
