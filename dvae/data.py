@@ -1,5 +1,7 @@
 """MNIST as in-memory uint8 tensors, with a fixed train/val split."""
 
+import os
+
 import torch
 from torchvision.datasets import MNIST
 
@@ -9,11 +11,14 @@ SPLIT_SEED = 0  # fixed so every stage sees the same train/val split
 
 
 def get_device(name=None):
-    """The named device, else the best available: CUDA, then Apple's MPS, then the CPU."""
+    """The named device, else the best available: CUDA, then Apple's MPS, then the CPU. With $DVAE_REQUIRE_CUDA set
+    (SCC's holders set it), no CUDA is an error, not a fall back to the CPU."""
     if name:
         return torch.device(name)
     if torch.cuda.is_available():
         return torch.device("cuda")
+    if os.environ.get("DVAE_REQUIRE_CUDA"):
+        raise RuntimeError("no CUDA device, and $DVAE_REQUIRE_CUDA is set")
     return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 

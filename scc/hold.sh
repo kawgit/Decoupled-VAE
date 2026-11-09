@@ -35,6 +35,12 @@ limit=$(qstat -j "$JOB_ID" | grep -o 'h_rt=[0-9]*' | head -1 | cut -d= -f2)
 end=$(( $(date +%s) + ${limit:-0} ))
 echo "$(date) holder $JOB_ID on $HOSTNAME: $(nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=name,memory.total \
   --format=csv,noheader); ${limit}s, idle $IDLE, min left $MIN_LEFT"
+# a node whose GPU the job cannot see (it happens) would run every experiment on the CPU: give the slot back
+if ! $PY -c "import sys, torch; sys.exit(not torch.cuda.is_available())"; then
+  echo "$(date) no usable GPU here (CUDA_VISIBLE_DEVICES='$CUDA_VISIBLE_DEVICES'): stopping"
+  exit 1
+fi
+export DVAE_REQUIRE_CUDA=1  # (dvae/data.py's get_device then fails rather than fall back to the CPU)
 
 idle_since=$(date +%s)
 while true; do
