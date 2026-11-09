@@ -42,7 +42,7 @@ def splitmix64(x):
 
 
 def pixels(images):
-    """uint8 [N, 28, 28] -> float [N, 784]: each grey level's bin center."""
+    """uint8 images [N, ...] -> float [N, pixels]: each level's bin center ([N, 28, 28] -> [N, 784])."""
     return ((images.float() + 0.5) / 256).flatten(1)
 
 
@@ -70,25 +70,30 @@ def top_direction(R):
 
 
 class ImageHead(nn.Module):
-    """A feature vector -> channels of a 28 x 28 image. With channels_last, the convolutions run in that memory
-    layout (faster on tensor cores; the same results)."""
+    """A feature vector -> channels images of shape (C, H, W) (28 x 28 grey by default), each flattened as
+    pixels() flattens: [..., channels, C * H * W]. With channels_last, the convolutions run in that memory layout
+    (faster on tensor cores; the same results)."""
 
-    def __init__(self, width, channels, channels_last=False):
+    def __init__(self, width, channels, channels_last=False, shape=(1, 28, 28)):
         super().__init__()
-        self.fc = nn.Linear(width, 64 * 7 * 7)
+        C, H, W = shape
+        self.shape, self.channels = shape, channels
+        self.fc = nn.Linear(width, 64 * (H // 4) * (W // 4))
         self.up = nn.Sequential(nn.GELU(), nn.ConvTranspose2d(64, 64, 4, 2, 1), nn.GELU(),
-                                nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.GELU(), nn.Conv2d(32, channels, 3, padding=1))
+                                nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.GELU(),
+                                nn.Conv2d(32, channels * C, 3, padding=1))
         self.channels_last = channels_last
         if channels_last:
             self.up.to(memory_format=torch.channels_last)
 
     def forward(self, f):
         lead = f.shape[:-1]
-        x = self.fc(f.reshape(-1, f.shape[-1])).view(-1, 64, 7, 7)
+        C, H, W = self.shape
+        x = self.fc(f.reshape(-1, f.shape[-1])).view(-1, 64, H // 4, W // 4)
         if self.channels_last:
             x = x.contiguous(memory_format=torch.channels_last)
         x = self.up(x)
-        return x.reshape(*lead, x.shape[1], D)
+        return x.reshape(*lead, self.channels, C * H * W)
 
 
 class Block(nn.Module):
@@ -148,13 +153,14 @@ class HistoryReader(nn.Module):
     with self-attention among them. A query reads it and itself at every layer (Block with mem), so a node's
     memory is computed once for all its queries. With node_mean, the memory also holds a token for the node's
     predicted mean image (the training mean, the buffer mean, plus the deltas), read by a small convolutional
-    net, so the network sees what the node looks like rather than only the steps that led there."""
+    net, so the network sees what the node looks like rather than only the steps that led there. With plain, the
+    tokens read only each delta (its sides and ms are not shown: an ablation)."""
 
     mean: Tensor  # [D] the training mean, with node_mean
 
-    def __init__(self, depth, width, layers, heads, node_mean=False):
+    def __init__(self, depth, width, layers, heads, node_mean=False, plain=False):
         super().__init__()
-        self.width = width
+        self.width, self.plain = width, plain
         self.delta_in = nn.Linear(D + 3, width)
         self.position = nn.Parameter(torch.randn(max(1, depth), width) * 0.02)
         self.blocks = nn.ModuleList(Block(width, heads) for _ in range(layers))
@@ -168,6 +174,8 @@ class HistoryReader(nn.Module):
         """Each layer's normalized memory tokens [B, extra + k, W] for histories deltas [B, k, D], sides and ms
         [B, k]: the node's mean image's token (with node_mean), then the history's."""
         B, k = sides.shape
+        if self.plain:
+            sides, ms = torch.zeros_like(sides), torch.zeros_like(ms)
         length = deltas.norm(dim=-1, keepdim=True).clamp_min(EPS)
         h = self.delta_in(torch.cat([deltas / length, length.log(), sides[..., None], ms[..., None]], -1))
         h = h + self.position[:k]
@@ -188,8 +196,8 @@ class SliceNet(HistoryReader):
     hyperplane biases and r then being in its units); subclasses say where they come from. A seeded encoder
     also predicts each side's top principal direction, which seeds that side's own Lloyd start."""
 
-    def __init__(self, depth, width, layers, heads, seeded=False, node_mean=False):
-        super().__init__(depth, width, layers, heads, node_mean)
+    def __init__(self, depth, width, layers, heads, seeded=False, node_mean=False, plain_history=False):
+        super().__init__(depth, width, layers, heads, node_mean, plain_history)
         self.query_in = nn.Linear(D + 1, width)
         self.out_norm = nn.LayerNorm(width)
         self.r_head = ImageHead(width, 1)
@@ -227,10 +235,11 @@ class Encoder(SliceNet):
     starts: Tensor  # [depths, D]
     scales: Tensor  # [depths], when scaled
 
-    def __init__(self, depths, width=256, layers=4, heads=4, scaled=False, seeded=False, node_mean=False):
-        super().__init__(depths, width, layers, heads, seeded, node_mean)
+    def __init__(self, depths, width=256, layers=4, heads=4, scaled=False, seeded=False, node_mean=False,
+                 plain_history=False):
+        super().__init__(depths, width, layers, heads, seeded, node_mean, plain_history)
         self.config = dict(depths=depths, width=width, layers=layers, heads=heads, scaled=scaled, seeded=seeded,
-                           node_mean=node_mean)
+                           node_mean=node_mean, plain_history=plain_history)
         self.scaled = scaled
         with torch.no_grad():
             self.position.copy_(self.position_rows(0, len(self.position)))

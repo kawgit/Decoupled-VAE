@@ -1,11 +1,12 @@
-"""MNIST as in-memory uint8 tensors, with a fixed train/val split."""
+"""MNIST (and CIFAR-10) as in-memory uint8 tensors, with a fixed train/val split."""
 
 import os
 
 import torch
-from torchvision.datasets import MNIST
+from torchvision.datasets import CIFAR10, MNIST
 
 NUM_PIXELS = 28 * 28
+SHAPES = {"mnist": (1, 28, 28), "cifar10": (3, 32, 32)}  # each dataset's images: channels, height, width
 NUM_VAL = 5000
 SPLIT_SEED = 0  # fixed so every stage sees the same train/val split
 
@@ -30,6 +31,26 @@ def _load(split, root):
         keep = perm[NUM_VAL:] if split == "train" else perm[:NUM_VAL]
         images, labels = images[keep], labels[keep]
     return images, labels
+
+
+def _load_cifar(split, root):
+    dataset = CIFAR10(root, train=split != "test", download=True)
+    images = torch.from_numpy(dataset.data).permute(0, 3, 1, 2).contiguous()  # [N, 3, 32, 32]
+    labels = torch.tensor(dataset.targets)
+    if split != "test":
+        perm = torch.randperm(len(images), generator=torch.Generator().manual_seed(SPLIT_SEED))
+        keep = perm[NUM_VAL:] if split == "train" else perm[:NUM_VAL]
+        images, labels = images[keep], labels[keep]
+    return images, labels
+
+
+def load_images(dataset, split, root="data", device: str | torch.device = "cpu"):
+    """uint8 images of dataset ("mnist": [N, 28, 28]; "cifar10": [N, 3, 32, 32], channels first) for split in
+    {"train", "val", "test"} (val: a fixed 5000 of the training set)."""
+    if dataset == "mnist":
+        return load_mnist(split, root, device)
+    assert dataset == "cifar10", dataset
+    return _load_cifar(split, root)[0].to(device)
 
 
 def load_mnist(split, root="data", device: str | torch.device = "cpu"):

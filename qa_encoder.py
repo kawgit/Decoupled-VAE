@@ -72,7 +72,8 @@ def main():
               + ", ".join(f"{v:.4f}" for v in values))
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for s, color in (("test", "#2a78d6"), ("train", "#eb6834")):
-        ax.plot(range(1, K + 1), mse[s], color=color, linewidth=1.6, label=f"{s} ({mse[s][-1]:.4f} after {K})")
+        ax.plot(range(1, K + 1), mse[s], color=color, linewidth=1.6, marker="o", markersize=3,
+                label=f"{s} ({mse[s][-1]:.4f} after {K})")
     ax.set_yscale("log")
     ax.set_xlabel("tokens")
     ax.set_ylabel("mse per pixel")

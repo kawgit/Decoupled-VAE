@@ -1,5 +1,6 @@
 """Training progress plots, one per stage, each redrawn every epoch."""
 
+import itertools
 import os
 
 import matplotlib
@@ -47,13 +48,18 @@ def _colorbar(fig, ax, norm, label):
 def plot_depths(history, path):
     """Save an encoder run's progress (train_encoder.py, train_centroids.py): the val mse after every code
     length, one line per epoch (darker is later); the val mse after the full code by epoch, beside the train mse
-    when there is one (both on log scales); and, from the latest epoch, the val mse gain of every Lloyd step at every depth, one line
-    per depth (darker is deeper). history holds dicts with "epoch", "val_mse" (after 1..K tokens) and optionally
-    "train_mse" (after the epoch's last token, over the epoch's batches) and "step_gains" (per depth, each step's
-    gain)."""
+    when there is one (both on log scales); and, from the latest epoch, the cumulative val mse gain after every
+    Lloyd step at every depth (what steps 1..t take off together; averaged over epochs when the run averages
+    them), one line per depth (darker is deeper), on a log axis fit to the positive gains (a gain at or below zero
+    is drawn far below it, off the panel), each depth's number of steps these gains choose ringed. Every line has
+    a dot at each point. history holds dicts with "epoch", "val_mse" (after 1..K tokens) and optionally
+    "train_mse" (after the epoch's last token, over the epoch's batches), "step_gains" (per depth, each step's
+    gain), "smoothed_gains" (their running average over epochs, drawn in their place) and "chosen" (per depth,
+    the steps the drawn gains choose)."""
     if not history:
         return
-    gains = history[-1].get("step_gains") or []
+    gains = history[-1].get("smoothed_gains") or history[-1].get("step_gains") or []
+    averaged = bool(history[-1].get("smoothed_gains"))
     panels = 3 if any(gains) else 2
     fig, axes = plt.subplots(1, panels, figsize=(6 * panels, 4.5),
                              gridspec_kw={"width_ratios": [3, 2, 3][:panels]})
@@ -62,8 +68,8 @@ def plot_depths(history, path):
     norm = Normalize(vmin=first, vmax=max(last, first + 1))
     for h in history:
         mses = h["val_mse"]
-        by_depth.plot(range(1, len(mses) + 1), mses, color=RAMP(norm(h["epoch"])), linewidth=1.6,
-                      marker="o" if len(mses) == 1 else None, markersize=3)  # a lone point needs a dot to show
+        by_depth.plot(range(1, len(mses) + 1), mses, color=RAMP(norm(h["epoch"])), linewidth=1.6, marker="o",
+                      markersize=3)
     by_depth.xaxis.set_major_locator(MaxNLocator(integer=True))
     _log_y(by_depth)
     _style(by_depth, "Val mse by code length, one line per epoch", "tokens", "val mse")
@@ -72,11 +78,10 @@ def plot_depths(history, path):
     xs = [h["epoch"] for h in history]
     final = [h["val_mse"][-1] for h in history]
     K = len(history[-1]["val_mse"])
-    lone = "o" if len(xs) == 1 else None  # a lone point needs a dot to show
-    by_epoch.plot(xs, final, color="#2a78d6", linewidth=1.6, marker=lone, markersize=4, label="val")
+    by_epoch.plot(xs, final, color="#2a78d6", linewidth=1.6, marker="o", markersize=3, label="val")
     train = [(h["epoch"], h["train_mse"]) for h in history if "train_mse" in h]
     if train:
-        by_epoch.plot(*zip(*train), color="#e8743b", linewidth=1.6, marker=lone, markersize=3, label="train")
+        by_epoch.plot(*zip(*train), color="#e8743b", linewidth=1.6, marker="o", markersize=3, label="train")
         by_epoch.legend(frameon=False, labelcolor=INK)
     best = min(range(len(final)), key=final.__getitem__)
     by_epoch.annotate(f"best {final[best]:.4f}", (xs[best], final[best]), textcoords="offset points",
@@ -88,15 +93,25 @@ def plot_depths(history, path):
     if panels == 3:
         by_step = axes[2]
         deep = Normalize(vmin=0, vmax=max(len(gains) - 1, 1))
-        for depth, g in enumerate(gains):
-            if g:
-                by_step.plot(range(1, len(g) + 1), g, color=RAMP(deep(depth)), linewidth=1.4, marker="o",
-                             markersize=2.5)
-        by_step.set_yscale("symlog", linthresh=1e-6)
-        by_step.axhline(0, color=MUTED, linewidth=0.8)
+        totals = [list(itertools.accumulate(g)) for g in gains]
+        positive = [v for total in totals for v in total if v > 0]
+        floor = min(positive) / 1e6 if positive else 1e-12  # where gains at or below zero go: off the panel
+        stops = history[-1].get("chosen") or []
+        for depth, total in enumerate(totals):
+            if total:
+                shown = [max(v, floor) for v in total]
+                color = RAMP(deep(depth))
+                by_step.plot(range(1, len(total) + 1), shown, color=color, linewidth=1.4, marker="o", markersize=2.5)
+                if depth < len(stops) and 1 <= stops[depth] <= len(total):
+                    by_step.plot([stops[depth]], [shown[stops[depth] - 1]], "o", markersize=7, markerfacecolor="none",
+                                 markeredgecolor=color, markeredgewidth=1.4, zorder=3)
+        _log_y(by_step)
+        if positive:
+            by_step.set_ylim(min(positive) / 1.3, max(positive) * 1.3)
         by_step.xaxis.set_major_locator(MaxNLocator(integer=True))
-        _style(by_step, f"Val mse gain of each Lloyd step, one line per depth (epoch {history[-1]['epoch']})",
-               "Lloyd step", "val mse taken off by the step")
+        what = "Averaged cumulative" if averaged else "Cumulative"  # (one line per depth: the colorbar says so)
+        _style(by_step, f"{what} val mse gain by Lloyd step (epoch {history[-1]['epoch']})",
+               "Lloyd step", "val mse taken off by steps 1..t")
         _colorbar(fig, by_step, deep, "depth")
     _save(fig, path)
 
@@ -122,7 +137,7 @@ def plot_prior(history, edges, kept, path):
         for b, (lo, hi) in enumerate(zip(edges, edges[1:])):
             ys = [sum(h[split][lo:hi]) / (hi - lo) for h in history]
             color = RAMP(deep(b))
-            ax.plot(epochs, ys, color=color, linewidth=1.6, label=f"depths {lo + 1}-{hi}")
+            ax.plot(epochs, ys, color=color, linewidth=1.6, marker="o", markersize=3, label=f"depths {lo + 1}-{hi}")
             if kept[b] in epochs:
                 at = epochs.index(kept[b])
                 ax.plot([kept[b]], [ys[at]], "o", color=color, markersize=6.5, markeredgecolor="white",
@@ -161,7 +176,7 @@ def plot_rounds(history, path):
             mses = h.get(key) or []
             if mses:
                 by_length.plot(range(1, len(mses) + 1), mses, color=RAMP(norm(h["round"])), linewidth=1.4,
-                               linestyle=style, marker="o" if len(mses) == 1 else None, markersize=3)
+                               linestyle=style, marker="o", markersize=3)
     by_length.xaxis.set_major_locator(MaxNLocator(integer=True))
     if any(h.get("encoder_out") for h in history):
         _log_y(by_length)
@@ -186,7 +201,7 @@ def plot_rounds(history, path):
             scores = h.get(key) or []
             if scores:
                 ax.plot(range(len(scores)), scores, color=RAMP(norm(h["round"])), linewidth=1.6,
-                        marker="o" if len(scores) == 1 else None, markersize=3)
+                        marker="o", markersize=3)
         ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         if key in ("decoder_mean", "encoder") and any(h.get(key) for h in history):
             _log_y(ax)

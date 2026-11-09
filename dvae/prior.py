@@ -24,19 +24,21 @@ from dvae.deltatree import EPS, Block
 
 
 class SideMeans(nn.Module):
-    """Features [..., W] of the two side means [..., 2, D], read as a two-channel 28x28 image."""
+    """Features [..., W] of the count side means [..., count, D] (two by default), read as a count-channel 28x28
+    image."""
 
-    def __init__(self, width, channels=32):
+    def __init__(self, width, channels=32, count=2):
         super().__init__()
         c = channels
-        self.net = nn.Sequential(nn.Conv2d(2, c, 3, stride=2, padding=1), nn.GELU(),  # 14 x 14
+        self.count = count
+        self.net = nn.Sequential(nn.Conv2d(count, c, 3, stride=2, padding=1), nn.GELU(),  # 14 x 14
                                  nn.Conv2d(c, 2 * c, 3, stride=2, padding=1), nn.GELU(),  # 7 x 7
                                  nn.Conv2d(2 * c, 2 * c, 3, padding=1), nn.GELU(),
                                  nn.Flatten(), nn.Linear(2 * c * 49, width))
 
     def forward(self, images):
         lead = images.shape[:-2]
-        return self.net(images.reshape(-1, 2, 28, 28)).reshape(*lead, -1)
+        return self.net(images.reshape(-1, self.count, 28, 28)).reshape(*lead, -1)
 
 
 class SidePrior(nn.Module):
@@ -123,4 +125,99 @@ def token_bits(prior: SidePrior | BandedPrior, rare: Tensor, m: Tensor, r: Tenso
         rb = rare[i:i + batch].to(device)
         logits = prior(r[i:i + batch].to(device).float(), m[i:i + batch].to(device).float(), rb)
         out.append(F.binary_cross_entropy_with_logits(logits, rb.float(), reduction="none").cpu() / math.log(2))
+    return torch.cat(out)
+
+
+class TokenPrior(nn.Module):
+    """A prior over a refining tree's codes (dvae/refine.py, dvae/codes.py's TokenCodes): p(token k | tokens
+    before it), V-way. Each token reads its node's V children (each centroid offset's direction and log length
+    plus a slot embedding, summed over the children) and the token before (none at the root); causal attention
+    lets it see everything earlier but not its own token. It does not read the encoder's implied shares (they are
+    train_prior.py's baseline); its head starts at zero, so an untrained prior is uniform. With images=True, each
+    token also shows its children's centroids as images (the node's predicted mean plus each offset), one
+    V-channel 28x28 image read by a small convolutional net."""
+
+    mean: Tensor  # [D] the tree's training mean, with images
+
+    def __init__(self, depths, V=2, width=256, layers=4, heads=4, dropout=0.0, D=784, images=False):
+        super().__init__()
+        self.config = dict(depths=depths, V=V, width=width, layers=layers, heads=heads, dropout=dropout, D=D,
+                           images=images)
+        self.child_in = nn.Linear(D + 1, width)
+        self.slot = nn.Parameter(torch.randn(V, width) * 0.02)
+        self.means_in = SideMeans(width, count=V) if images else None
+        if images:
+            self.register_buffer("mean", torch.zeros(D))
+        self.token_in = nn.Embedding(V + 1, width)  # the token before, or none (V, the root)
+        self.position = nn.Parameter(torch.randn(depths, width) * 0.02)
+        self.drop = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList(Block(width, heads, dropout) for _ in range(layers))
+        self.out_norm = nn.LayerNorm(width)
+        self.head = nn.Linear(width, V)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+        self.V = V
+
+    def forward(self, offsets: Tensor, tokens: Tensor) -> Tensor:
+        """Logits [B, k, V] for each token of codes with children offsets [B, k, V, D] and tokens [B, k] (only
+        those before each token are read, so the last may be anything)."""
+        B, k = tokens.shape
+        length = offsets.norm(dim=-1, keepdim=True).clamp_min(EPS)
+        h = (self.child_in(torch.cat([offsets / length, length.log()], -1)) + self.slot).sum(2)
+        before = torch.cat([tokens.new_full((B, 1), self.V), tokens[:, :-1]], 1)
+        h = h + self.token_in(before)
+        if self.means_in is not None:
+            taken = offsets.gather(2, tokens[:, :, None, None].expand(B, k, 1, offsets.shape[-1]))[:, :, 0]
+            mu = self.mean + torch.cumsum(taken, 1) - taken  # each node's predicted mean, from the tokens before it
+            h = h + self.means_in(mu[:, :, None] + offsets)
+        h = self.drop(h + self.position[:k])
+        for blk in self.blocks:
+            h, _ = blk(h, causal=True)
+        return self.head(self.out_norm(h))
+
+
+class BandedTokenPrior(nn.Module):
+    """BandedPrior for TokenPriors: snapshot i answers for band i's depths (edges [bands + 1])."""
+
+    def __init__(self, priors: list[TokenPrior], edges: list[int]):
+        super().__init__()
+        self.priors, self.edges = nn.ModuleList(priors), edges
+        self.config = priors[0].config
+
+    def forward(self, offsets: Tensor, tokens: Tensor) -> Tensor:
+        k = tokens.shape[1]
+        logits = offsets.new_zeros(offsets.shape[:3])
+        for prior, lo, hi in zip(self.priors, self.edges, self.edges[1:]):
+            if lo < k:
+                hi = min(hi, k)
+                logits[:, lo:hi] = prior(offsets[:, :hi], tokens[:, :hi])[:, lo:hi]
+        return logits
+
+
+def load_token_prior(ckpt, device):
+    """train_prior.py's checkpoint as a TokenPrior, or with per-band early stopping a BandedTokenPrior of each
+    band's kept snapshot, in eval mode."""
+    def snapshot(state):
+        prior = TokenPrior(**ckpt["config"]).to(device)
+        prior.load_state_dict(state)
+        return prior
+
+    if "bands" not in ckpt:
+        return snapshot(ckpt["state_dict"]).eval()
+    priors = [snapshot(ckpt["states"][epoch]) for epoch in ckpt["band_epochs"]]
+    return BandedTokenPrior(priors, ckpt["bands"]).eval()
+
+
+@torch.no_grad()
+def code_token_bits(prior: TokenPrior | BandedTokenPrior, offsets: Tensor, tokens: Tensor, device,
+                    batch=256) -> Tensor:
+    """The bits [N, K] each token of N codes costs under the prior (inputs as TokenPrior's, on any device), on
+    the CPU."""
+    prior.eval()
+    out = []
+    for i in range(0, len(tokens), batch):
+        tb = tokens[i:i + batch].to(device)
+        logits = prior(offsets[i:i + batch].to(device).float(), tb)
+        out.append(F.cross_entropy(logits.flatten(0, 1).float(), tb.flatten(), reduction="none")
+                   .view(tb.shape).cpu() / math.log(2))
     return torch.cat(out)

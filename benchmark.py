@@ -1,7 +1,7 @@
 """Test bits per dimension of the whole model: each test image scored as -log2 p(code) - log2 p(x | code), its
 code (the encoder's, from dump_encoder.py) priced by the prior and its pixels by the decoder.
 This is the one-code upper bound on -log2 p(x): the image's own code only, not summed over every code that could
-have drawn it. With --prior, the code is also priced by the encoder's own shares (m / (1 + m)) for
+have drawn it. With --prior, the code is also priced by the encoder's implied shares (dvae/refine.py's) for
 comparison; without, by those alone. The table goes to stdout and to benchmark.md and .json in the run's
 artifacts folder.
 
@@ -16,11 +16,11 @@ import os
 import torch
 
 from dvae.artifacts import artifact
-from dvae.decoder import Leaves, code_bits, load_decoder, pixel_bits
-from dvae.codes import load_codes
+from dvae.decoder import TokenLeaves, load_token_decoder, pixel_bits, token_code_bits
+from dvae.codes import load_token_codes
 from dvae.data import get_device, load_mnist
 from dvae.deltatree import D
-from dvae.prior import load_prior
+from dvae.prior import load_token_prior
 
 
 def main():
@@ -36,15 +36,15 @@ def main():
     args = p.parse_args()
     device = get_device(args.device)
     dckpt = torch.load(args.decoder, map_location=device, weights_only=False)
-    decoder, K = load_decoder(dckpt, device), dckpt["tokens"]
+    decoder, K = load_token_decoder(dckpt, device), dckpt["tokens"]
     folder = args.codes or dckpt["codes"]
-    codes = load_codes(os.path.join(folder, f"{args.split}.pt"))
-    priors = {"the encoder's own shares": None}
+    codes = load_token_codes(os.path.join(folder, f"{args.split}.pt"))
+    priors = {"the encoder's implied shares": None}
     if args.prior:
-        priors = {f"the prior ({args.prior})": load_prior(torch.load(args.prior, map_location=device,
+        priors = {f"the prior ({args.prior})": load_token_prior(torch.load(args.prior, map_location=device,
                                                                      weights_only=False), device), **priors}
-    priced = {name: code_bits(codes, K, prior, device) for name, prior in priors.items()}  # before Leaves
-    pixels = pixel_bits(decoder, Leaves(codes, load_mnist(args.split, args.data_root)[:len(codes)], K), device,
+    priced = {name: token_code_bits(codes, K, prior, device) for name, prior in priors.items()}
+    pixels = pixel_bits(decoder, TokenLeaves(codes, load_mnist(args.split, args.data_root)[:len(codes)], K), device,
                         args.batch)
 
     rows = []

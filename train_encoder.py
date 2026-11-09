@@ -220,6 +220,8 @@ def main():
                    help="Lloyd steps per node (with --tol, the most a node takes)")
     p.add_argument("--tol", type=float, default=0.0, help="stop a node's Lloyd steps once its hyperplane moves less")
     p.add_argument("--seeded", action="store_true", help="start each node from its parent's predicted direction")
+    p.add_argument("--plain-history", action="store_true",
+                   help="history tokens read only each delta, not its side or m (an ablation)")
     p.add_argument("--node-mean", action="store_true",
                    help="also show the network each node's predicted mean image (dvae/deltatree.py's HistoryReader)")
     p.add_argument("--start", choices=("depth", "root"), default="depth",
@@ -261,7 +263,7 @@ def main():
     if ckpt is not None:  # the architecture is the checkpoint's
         cfg = ckpt["shared"]["config"]
         args.width, args.layers, args.heads, args.seeded = cfg["width"], cfg["layers"], cfg["heads"], cfg["seeded"]
-        args.node_mean = cfg.get("node_mean", False)
+        args.node_mean, args.plain_history = cfg.get("node_mean", False), cfg.get("plain_history", False)
     log(f"=== {time.strftime('%Y-%m-%d')} {vars(args)}")
     X = pixels(load_mnist("train", args.data_root)[:args.limit_train]).to(device)
     V = pixels(load_mnist("val", args.data_root)[:args.limit_val]).to(device)
@@ -275,7 +277,7 @@ def main():
     torch.manual_seed(args.seed)
     if ckpt is None:
         encoder = Encoder(1, args.width, args.layers, args.heads, seeded=args.seeded,
-                          node_mean=args.node_mean).to(device)
+                          node_mean=args.node_mean, plain_history=args.plain_history).to(device)
         with torch.no_grad():
             encoder.starts[0] = root_top
             if args.node_mean:

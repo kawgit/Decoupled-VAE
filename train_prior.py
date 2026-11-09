@@ -1,13 +1,12 @@
-"""Stage 3: train the prior (dvae/prior.py's SidePrior), a causal transformer over the encoder's codes that
-predicts each token's side, on the codes dump_encoder.py wrote.
+"""Stage 3: train the prior (dvae/prior.py's TokenPrior), a causal transformer over the encoder's codes that
+predicts each token (one of V children), on the codes dump_encoder.py wrote.
 
-The encoder already predicts each side's share (its m), trained so its side means are right; the prior is
-trained on cross-entropy alone, so it learns which codes in the encoder's space are valid and corrects the
-encoder's shares where they are wrong. Each step takes a batch of training codes and minimizes the
-cross-entropy of every token's side, all depths at once. Every epoch logs, in bits, the train codes' cost (a
-fixed subset, scored as val is) and the val codes' cost per image and per range of depths, beside two baselines
-the prior has to beat: the encoder's own shares (the rare side with probability m / (1 + m)) and the best
-constant share per depth (fit on the train codes). Early stopping watches the val cost separately in each of
+The prior reads each node's children (their centroids) and the tokens before, not the shares the encoder's
+centroids imply (dvae/refine.py), and starts uniform; it is trained on cross-entropy alone. Each step takes a batch of
+training codes and minimizes the cross-entropy of every token, all depths at once. Every epoch logs, in bits, the
+train codes' cost (a fixed subset, scored as val is) and the val codes' cost per image and per range of depths,
+beside two baselines the prior has to beat: the encoder's implied shares and the best constant share of each token
+per depth (fit on the train codes). Early stopping watches the val cost separately in each of
 --bands bands of depths (equal widths), since depths need different amounts of training: each band keeps the
 weights of the epoch with its lowest val cost, stops once it goes a --patience-frac share of the run's epochs (at least --patience) without
 a better one (dvae/stopping.py; the model still trains on every depth), and the run ends when every band has stopped. The kept prior answers each depth
@@ -28,11 +27,11 @@ import torch
 import torch.nn.functional as F
 
 from dvae.artifacts import artifact
-from dvae.codes import bits_of, load_codes, own_shares
+from dvae.codes import TokenCodes, load_token_codes, own_bits
 from dvae.data import get_device
 from dvae.logs import RunLog
 from dvae.plots import plot_prior
-from dvae.prior import SidePrior, band_edges, load_prior, token_bits
+from dvae.prior import TokenPrior, band_edges, code_token_bits, load_token_prior
 from dvae.stopping import add_patience_args, patience, stagnant
 
 LN2 = math.log(2)
@@ -56,7 +55,7 @@ def main():
     p.add_argument("--heads", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--images", action="store_true",
-                   help="also show each token the two side means it chooses between, as images (dvae/prior.py)")
+                   help="also show each token the children's centroids it chooses between, as images (dvae/prior.py)")
     p.add_argument("--wd", type=float, default=0.05, help="AdamW weight decay (on weight matrices only)")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--warmup", type=int, default=500, help="steps of linear learning-rate warmup")
@@ -81,25 +80,26 @@ def main():
     log(f"=== train_prior.py {vars(args)}")
 
     began = time.time()
-    train, val, test = (load_codes(os.path.join(args.codes, f"{s}.pt")) for s in ("train", "val", "test"))
-    N, K = len(train), train.depths
-    log(f"codes: {N} train, {len(val)} val, {len(test)} test, {K} tokens, from {train.ckpt} "
+    train, val, test = (load_token_codes(os.path.join(args.codes, f"{s}.pt")) for s in ("train", "val", "test"))
+    N, K, V = len(train), train.depths, train.V
+    log(f"codes: {N} train, {len(val)} val, {len(test)} test, {K} tokens of {V} children, from {train.ckpt} "
         f"({time.time() - began:.0f}s to load)")
 
-    def baselines(codes):
-        own = bits_of(own_shares(codes.m.float()), codes.rare).mean(0)
-        share = train.rare.float().mean(0).clamp(1e-6, 1 - 1e-6)
-        return own, bits_of(share.expand_as(codes.rare), codes.rare).mean(0)
+    freq = torch.zeros(K, V).scatter_add_(1, train.tokens.T, torch.ones(K, N)) / N  # each token's share per depth
 
-    def cost(model, codes):
-        return token_bits(model, codes.rare, codes.m, codes.r, device, args.batch).mean(0)
+    def baselines(codes: TokenCodes):
+        constant = -freq.clamp_min(1e-6).log2().gather(1, codes.tokens.T).T
+        return own_bits(codes).mean(0), constant.mean(0)
+
+    def cost(model, codes: TokenCodes):
+        return code_token_bits(model, codes.offsets, codes.tokens, device, args.batch).mean(0)
 
     own, constant = baselines(val)
-    log(f"val baselines: the encoder's own shares {describe(own)}")
+    log(f"val baselines: the encoder's implied shares {describe(own)}")
     log(f"val baselines: constant share per depth {describe(constant)}")
 
-    prior = SidePrior(K, args.width, args.layers, args.heads, args.dropout, images=args.images).to(device)
-    if args.images:  # the side means start from the training mean
+    prior = TokenPrior(K, V, args.width, args.layers, args.heads, args.dropout, images=args.images).to(device)
+    if args.images:  # the children's centroids are offsets from the predicted means, which start from the training mean
         prior.mean.copy_(train.mean.to(device))
     decay = [q for q in prior.parameters() if q.dim() >= 2]
     rest = [q for q in prior.parameters() if q.dim() < 2]
@@ -126,10 +126,9 @@ def main():
         running = 0.0
         for i in range(0, N, args.batch):
             idx = order[i:i + args.batch]
-            rare = train.rare[idx].to(device, non_blocking=True)
-            logits = prior(train.r[idx].to(device, non_blocking=True).float(),
-                           train.m[idx].to(device, non_blocking=True).float(), rare)
-            loss = F.binary_cross_entropy_with_logits(logits, rare.float())
+            tokens = train.tokens[idx].to(device, non_blocking=True)
+            logits = prior(train.offsets[idx].to(device, non_blocking=True).float(), tokens)
+            loss = F.cross_entropy(logits.flatten(0, 1), tokens.flatten())
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
@@ -160,7 +159,7 @@ def main():
         bands_now = ", ".join(f"{n}@{e}" + (" stopped" if done else "")
                               for n, (_, e), done in zip(names, best, stopped))
         log(f"epoch {epoch}: val {describe(va)}; train {describe(tr)}; training loss "
-            f"{running / N / LN2:.4f} bits/token; encoder's own shares {own.sum():.3f}; kept bands "
+            f"{running / N / LN2:.4f} bits/token; encoder's implied shares {own.sum():.3f}; kept bands "
             f"{sum(c for c, _ in best):.3f} bits/image ({bands_now})"
             f"{'; better in ' + ', '.join(improved) if improved else ''} ({trained:.0f}s train, "
             f"{time.time() - began - trained:.0f}s eval)")
@@ -168,13 +167,13 @@ def main():
             log(f"every band went {patience(epoch, args)} epochs or more without a better val cost: stopping")
             break
 
-    kept = load_prior(torch.load(args.out, map_location=device, weights_only=False), device)
+    kept = load_token_prior(torch.load(args.out, map_location=device, weights_only=False), device)
     own, constant = baselines(test)
     te = cost(kept, test)
     log(f"kept epochs per band {', '.join(f'{n}@{e}' for n, (_, e) in zip(names, best))} (val "
         f"{sum(c for c, _ in best):.3f} bits/image), saved {args.out}")
     log(f"test: prior {describe(te)}")
-    log(f"test: encoder's own shares {describe(own)}")
+    log(f"test: encoder's implied shares {describe(own)}")
     log(f"test: constant share per depth {describe(constant)}")
 
 

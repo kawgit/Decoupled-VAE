@@ -252,7 +252,7 @@ def plot(curves, depths):
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     tokens = list(range(1, depths + 1))
     for c in curves:
-        style = dict(ls="--", color="k") if c["label"].startswith("real") else {}
+        style = dict(marker="o", markersize=3) | (dict(ls="--", color="k") if c["label"].startswith("real") else {})
         axes[0].plot(tokens, c["val"], label=c["label"], **style)
         axes[1].plot(tokens, c["fit"], label=c["label"], **style)
     for ax, title in zip(axes, ("val mse (real val images)", "fit mse (the images it was fit on)")):
