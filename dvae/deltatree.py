@@ -70,18 +70,25 @@ def top_direction(R):
 
 
 class ImageHead(nn.Module):
-    """A feature vector -> channels of a 28 x 28 image."""
+    """A feature vector -> channels of a 28 x 28 image. With channels_last, the convolutions run in that memory
+    layout (faster on tensor cores; the same results)."""
 
-    def __init__(self, width, channels):
+    def __init__(self, width, channels, channels_last=False):
         super().__init__()
         self.fc = nn.Linear(width, 64 * 7 * 7)
         self.up = nn.Sequential(nn.GELU(), nn.ConvTranspose2d(64, 64, 4, 2, 1), nn.GELU(),
                                 nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.GELU(), nn.Conv2d(32, channels, 3, padding=1))
+        self.channels_last = channels_last
+        if channels_last:
+            self.up.to(memory_format=torch.channels_last)
 
     def forward(self, f):
         lead = f.shape[:-1]
-        x = self.up(self.fc(f.reshape(-1, f.shape[-1])).view(-1, 64, 7, 7))
-        return x.view(*lead, x.shape[1], D)
+        x = self.fc(f.reshape(-1, f.shape[-1])).view(-1, 64, 7, 7)
+        if self.channels_last:
+            x = x.contiguous(memory_format=torch.channels_last)
+        x = self.up(x)
+        return x.reshape(*lead, x.shape[1], D)
 
 
 class Block(nn.Module):

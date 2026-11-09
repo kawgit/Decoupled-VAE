@@ -135,6 +135,66 @@ def plot_prior(history, edges, kept, path):
     _save(fig, path)
 
 
+def plot_rounds(history, path):
+    """Save a rounds run's progress (train_rounds.py), one line per round (darker is later): the val (solid) and
+    train (dashed) mse after every code length for each round's encoder; decoder_mean's final val and train mse by
+    round; and each stage's val score by epoch: the encoder's val mse after all tokens, the prior's bits per image,
+    decoder_mean's mse and decoder_cov's bits per pixel (when there is one). history holds a dict per round with
+    "round", each stage's scores ("encoder", "prior", "decoder_mean", optionally "decoder_cov"), "encoder_out" and
+    "encoder_out_train" (its encoder's val and train mse after each token) and, once the round is done,
+    "decoder_mean_val" and "decoder_mean_train"."""
+    if not history:
+        return
+    fig = plt.figure(figsize=(19, 10))
+    stages = [("encoder", "Encoder: val mse after all tokens", "mse"),
+              ("prior", "Prior: val bits per image", "bits per image"),
+              ("decoder_mean", "decoder_mean: val mse", "mse"),
+              ("decoder_cov", "decoder_cov: val bits per pixel", "bits per pixel")]
+    stages = [s for s in stages if s[0] != "decoder_cov" or any(h.get("decoder_cov") for h in history)]
+    grid = fig.add_gridspec(2, 12)
+    by_length, by_round = fig.add_subplot(grid[0, :8]), fig.add_subplot(grid[0, 8:])
+    span = 12 // len(stages)
+    axes = [fig.add_subplot(grid[1, span * i:span * (i + 1)]) for i in range(len(stages))]
+    norm = Normalize(vmin=0, vmax=max(history[-1]["round"], 1))
+    for h in history:
+        for key, style in (("encoder_out", "-"), ("encoder_out_train", "--")):
+            mses = h.get(key) or []
+            if mses:
+                by_length.plot(range(1, len(mses) + 1), mses, color=RAMP(norm(h["round"])), linewidth=1.4,
+                               linestyle=style, marker="o" if len(mses) == 1 else None, markersize=3)
+    by_length.xaxis.set_major_locator(MaxNLocator(integer=True))
+    if any(h.get("encoder_out") for h in history):
+        _log_y(by_length)
+        by_length.plot([], [], color=MUTED, linestyle="-", label="val")
+        by_length.plot([], [], color=MUTED, linestyle="--", label="train")
+        by_length.legend(frameon=False, labelcolor=INK)
+    _style(by_length, "Mse by code length, one line pair per round's encoder", "tokens", "mse")
+    _colorbar(fig, by_length, norm, "round")
+
+    for key, color, label in (("decoder_mean_val", "#2a78d6", "val"), ("decoder_mean_train", "#e8743b", "train")):
+        points = [(h["round"], h[key]) for h in history if key in h]
+        if points:
+            by_round.plot(*zip(*points), color=color, linewidth=1.6, marker="o", markersize=3.5, label=label)
+    if any("decoder_mean_val" in h for h in history):
+        _log_y(by_round)
+        by_round.legend(frameon=False, labelcolor=INK)
+    by_round.xaxis.set_major_locator(MaxNLocator(integer=True))
+    _style(by_round, "decoder_mean: final val and train mse by round", "round", "mse")
+
+    for ax, (key, title, ylabel) in zip(axes, stages):
+        for h in history:
+            scores = h.get(key) or []
+            if scores:
+                ax.plot(range(len(scores)), scores, color=RAMP(norm(h["round"])), linewidth=1.6,
+                        marker="o" if len(scores) == 1 else None, markersize=3)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        if key in ("decoder_mean", "encoder") and any(h.get(key) for h in history):
+            _log_y(ax)
+        _style(ax, title, "epoch of the round's stage", ylabel)
+    _colorbar(fig, axes[-1], norm, "round")
+    _save(fig, path)
+
+
 def plot_decoder(history, path):
     """Save a decoder run's progress (train_decoder.py): the val and train pixel bits per
     dimension by epoch, the best val marked. history holds dicts with "epoch", "val" and "train"."""
