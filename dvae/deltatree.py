@@ -15,6 +15,8 @@ r / |r|, bias |r| (1 - m) / 2, which is >= 0 since m <= 1. Every query depends o
 replays the encoder's choices exactly.
 """
 
+import contextlib
+import math
 from dataclasses import dataclass
 
 import torch
@@ -158,21 +160,34 @@ class HistoryReader(nn.Module):
 
     mean: Tensor  # [D] the training mean, with node_mean
 
-    def __init__(self, depth, width, layers, heads, node_mean=False, plain=False):
+    def __init__(self, depth, width, layers, heads, node_mean=False, plain=False, pixels=D):
         super().__init__()
-        self.width, self.plain = width, plain
-        self.delta_in = nn.Linear(D + 3, width)
+        self.width, self.plain, self.D = width, plain, pixels
+        self.bf16 = False  # (set by the trainer: run the network under bfloat16 autocast, see amp)
+        self.delta_in = nn.Linear(pixels + 3, width)
         self.position = nn.Parameter(torch.randn(max(1, depth), width) * 0.02)
         self.blocks = nn.ModuleList(Block(width, heads) for _ in range(layers))
         self.mean_in = MeanImage(width) if node_mean else None
         self.extra = int(node_mean)  # memory tokens besides the history's
         if node_mean:
+            assert pixels == D, "node_mean reads 28 x 28 images"
             self.mean_token = nn.Parameter(torch.randn(width) * 0.02)
             self.register_buffer("mean", torch.zeros(D))
+
+    def amp(self):
+        """The network's autocast context: bfloat16 when self.bf16 (geometry, partitions and losses stay float32),
+        else nothing."""
+        if not self.bf16:
+            return contextlib.nullcontext()
+        return torch.autocast(self.position.device.type, dtype=torch.bfloat16)
 
     def memory(self, deltas, sides, ms):
         """Each layer's normalized memory tokens [B, extra + k, W] for histories deltas [B, k, D], sides and ms
         [B, k]: the node's mean image's token (with node_mean), then the history's."""
+        with self.amp():
+            return self._memory(deltas, sides, ms)
+
+    def _memory(self, deltas, sides, ms):
         B, k = sides.shape
         if self.plain:
             sides, ms = torch.zeros_like(sides), torch.zeros_like(ms)
@@ -196,13 +211,14 @@ class SliceNet(HistoryReader):
     hyperplane biases and r then being in its units); subclasses say where they come from. A seeded encoder
     also predicts each side's top principal direction, which seeds that side's own Lloyd start."""
 
-    def __init__(self, depth, width, layers, heads, seeded=False, node_mean=False, plain_history=False):
-        super().__init__(depth, width, layers, heads, node_mean, plain_history)
-        self.query_in = nn.Linear(D + 1, width)
+    def __init__(self, depth, width, layers, heads, seeded=False, node_mean=False, plain_history=False,
+                 shape=(1, 28, 28)):
+        super().__init__(depth, width, layers, heads, node_mean, plain_history, shape[0] * shape[1] * shape[2])
+        self.query_in = nn.Linear(self.D + 1, width)
         self.out_norm = nn.LayerNorm(width)
-        self.r_head = ImageHead(width, 1)
+        self.r_head = ImageHead(width, 1, shape=shape)
         self.m_head = nn.Linear(width, 1)
-        self.dir_head = ImageHead(width, 2) if seeded else None
+        self.dir_head = ImageHead(width, 2, shape=shape) if seeded else None
 
     def scale_at(self, k) -> Tensor | float:
         raise NotImplementedError
@@ -214,15 +230,18 @@ class SliceNet(HistoryReader):
         """For a hyperplane n [B, D], b [B] at each of B nodes with memory mems: r [B, D], m [B], and from a
         seeded encoder the rare and common sides' unit directions u [B, 2, D] (else None)."""
         scale = self.scale_at(mems[0].shape[1] - self.extra)  # the nodes' depth
-        q = self.query_in(torch.cat([n, (b / scale)[:, None]], -1))[:, None]
-        for blk, mem in zip(self.blocks, mems):
-            q, _ = blk(q, mem)
-        f = self.out_norm(q)[:, 0]
-        u = None
-        if self.dir_head is not None:
-            u = self.dir_head(f)
+        with self.amp():
+            q = self.query_in(torch.cat([n, (b / scale)[:, None]], -1))[:, None]
+            for blk, mem in zip(self.blocks, mems):
+                q, _ = blk(q, mem)
+            f = self.out_norm(q)[:, 0]
+            r, m = self.r_head(f)[:, 0].float(), self.m_head(f)[:, 0].float()
+            u = None
+            if self.dir_head is not None:
+                u = self.dir_head(f).float()
+        if u is not None:
             u = u / u.norm(dim=-1, keepdim=True).clamp_min(EPS)
-        return self.r_head(f)[:, 0] * scale, torch.sigmoid(self.m_head(f)[:, 0]), u
+        return r * scale, torch.sigmoid(m), u
 
 
 class Encoder(SliceNet):
@@ -236,14 +255,15 @@ class Encoder(SliceNet):
     scales: Tensor  # [depths], when scaled
 
     def __init__(self, depths, width=256, layers=4, heads=4, scaled=False, seeded=False, node_mean=False,
-                 plain_history=False):
-        super().__init__(depths, width, layers, heads, seeded, node_mean, plain_history)
+                 plain_history=False, shape=(1, 28, 28)):
+        shape = tuple(shape)
+        super().__init__(depths, width, layers, heads, seeded, node_mean, plain_history, shape)
         self.config = dict(depths=depths, width=width, layers=layers, heads=heads, scaled=scaled, seeded=seeded,
-                           node_mean=node_mean, plain_history=plain_history)
+                           node_mean=node_mean, plain_history=plain_history, shape=shape)
         self.scaled = scaled
         with torch.no_grad():
             self.position.copy_(self.position_rows(0, len(self.position)))
-        self.register_buffer("starts", torch.zeros(depths, D))
+        self.register_buffer("starts", torch.zeros(depths, self.D))
         if scaled:
             self.register_buffer("scales", torch.ones(depths))
 
@@ -301,16 +321,20 @@ class Decoder(HistoryReader):
         return logits + self.mean_path(mu.view(-1, 1, 28, 28)).flatten(2)
 
 
-def lloyd(encoder: SliceNet, mems: list[Tensor], start: Tensor, steps: int, tol: float = 0.0):
+def lloyd(encoder: SliceNet, mems: list[Tensor], start: Tensor, steps: int, tol: float = 0.0,
+          grad: set[int] | None = None):
     """Yields (active, n, b, r, m, u) at each step: the nodes still moving (indices into the B nodes with
     memory mems), the hyperplanes queried there and the encoder's answers. Every node starts from start [B, D]
     through its predicted mean; each next hyperplane is the bisector of the last answers, detached. With
     tol > 0 a node stops once that would move its hyperplane by less than tol (1 - cos of the normals plus the
-    bias's change relative to |r|, squared); every node stops after steps queries."""
+    bias's change relative to |r|, squared); every node stops after steps queries. With grad, only the steps it
+    names (from 0) keep a graph for the backward pass (each query's hyperplane is detached, so no gradient
+    crosses from one step to the next)."""
     active = torch.arange(len(start), device=start.device)
     n, b = start, start.new_zeros(len(start))
     for step in range(steps):
-        r, m, u = encoder.query(mems, n, b)
+        with torch.set_grad_enabled(torch.is_grad_enabled() and (grad is None or step in grad)):
+            r, m, u = encoder.query(mems, n, b)
         yield active, n, b, r, m, u
         if step + 1 == steps:
             break
@@ -361,7 +385,7 @@ class Frontier:
         """Lloyd's first normals [len(nodes), D] at nodes."""
         if self.seed is not None:
             return self.seed[nodes.to(self.seed.device)]
-        return encoder.start_at(self.depth).expand(len(nodes), D)
+        return encoder.start_at(self.depth).expand(len(nodes), -1)
 
 
 @dataclass
@@ -382,7 +406,7 @@ def root_frontier(X, mean, resident=False):
     store = X.device if resident else torch.device("cpu")
     return Frontier(R=X - mean, node=torch.zeros(len(X), dtype=torch.long, device=X.device),
                     bits=torch.zeros(1, dtype=torch.int64, device=store),
-                    deltas=torch.zeros(1, 0, D, dtype=torch.half, device=store),
+                    deltas=torch.zeros(1, 0, X.shape[1], dtype=torch.half, device=store),
                     sides=torch.zeros(1, 0, device=store), ms=torch.zeros(1, 0, device=store))
 
 
@@ -402,14 +426,53 @@ def by_nodes(imgs, node, cap):
     return list(imgs.split(torch.unique_consecutive(piece, return_counts=True)[1].tolist()))
 
 
-def chunk_sse(encoder, fr, imgs, steps, select=False, tol=0.0, dir_weight=1.0):
+def tilted_draw(steps: int, draws: int, tilt: float | None, rng: float | None = None):
+    """Which of steps Lloyd steps to backpropagate, draws of them without replacement, step i drawn with
+    probability proportional to 1 + tilt - i / steps (tilt None: all alike), and each drawn step's weight
+    1 / (steps * its chance of being drawn), so the weighted sum of the drawn steps' losses is, in expectation,
+    the average over all steps. Systematic sampling makes each chance exact: draws times its share, with any
+    step whose chance would pass 1 always drawn and the rest shared among the others. rng: the uniform draw (default
+    torch's). Returns {step: weight}."""
+    if draws >= steps:
+        return {i: 1 / steps for i in range(steps)}
+    p = [1.0 if tilt is None else 1 + tilt - i / steps for i in range(steps)]
+    chance, sure, rest = [0.0] * steps, set(), list(range(steps))
+    while True:  # steps whose chance would pass 1 are always drawn
+        left = draws - len(sure)
+        total = sum(p[i] for i in rest)
+        over = [i for i in rest if left * p[i] >= total]
+        if not over:
+            break
+        sure.update(over)
+        rest = [i for i in rest if i not in over]
+    left = draws - len(sure)
+    for i in sure:
+        chance[i] = 1.0
+    picked = set(sure)
+    if left > 0 and rest:
+        total = sum(p[i] for i in rest)
+        u = float(torch.rand(())) if rng is None else rng
+        edge = 0.0
+        for i in rest:  # systematic: the points u, u + 1, ..., each in at most one interval of length < 1
+            chance[i] = left * p[i] / total
+            lo, edge = edge, edge + chance[i]
+            if u + math.ceil(lo - u) < edge:
+                picked.add(i)
+    return {i: 1 / (steps * chance[i]) for i in picked}
+
+
+def chunk_sse(encoder, fr, imgs, steps, select=False, tol=0.0, dir_weight=1.0, grad_steps=0,
+              grad_tilt: float | None = None, clock=None):
     """The objective's sum over images imgs of a frontier, each node's averaged over its Lloyd steps: the
     split's error and, for a seeded encoder, dir_weight times its sides' rank-1 PCA reconstruction error (each
     image's remainder after the split, less its projection on its side's predicted direction). Also returns
     the reconstruction error's own sum (detached; 0 when not seeded); with select, what the last step's split
     does to the images (their squared error before and after it and the bits of their tokens); the chunk's
     nodes [b]; and their Split (detached). imgs=None takes all of fr, whose nodes are known without asking the
-    GPU (so without waiting for it)."""
+    GPU (so without waiting for it). With 0 < grad_steps < steps (and tol = 0), only that many steps are
+    backpropagated, drawn by tilted_draw (grad_tilt; None: uniformly): the objective's value is all of them, its
+    gradient the drawn steps' weighted sum (the same in expectation, a cheaper backward pass with bounded
+    memory). clock (train_encoder.py's DepthClock) times the memory and the steps' forward pass."""
     if imgs is None:
         R, inverse = fr.R, fr.node
         nodes = torch.arange(len(fr.bits), device=R.device)
@@ -417,22 +480,33 @@ def chunk_sse(encoder, fr, imgs, steps, select=False, tol=0.0, dir_weight=1.0):
         R = fr.R[imgs]
         nodes, inverse = torch.unique(fr.node[imgs], return_inverse=True)
     B, device = len(nodes), R.device
+    began = None if clock is None else clock.start()
     mems = encoder.memory(*fr.history(nodes, device))
+    if clock is not None:
+        clock.stop(fr.depth, began, "memory")
+        began = clock.start()
     all_n = R.new_zeros(B).index_add_(0, inverse, R.new_ones(len(R)))
-    all_sum = R.new_zeros(B, D).index_add_(0, inverse, R)
+    P = R.shape[1]  # pixels
+    all_sum = R.new_zeros(B, P).index_add_(0, inverse, R)
     node_loss, node_pca, node_steps = R.new_zeros(B), R.new_zeros(B), R.new_zeros(B)
-    last_n, last_b, last_r, last_m = R.new_zeros(B, D), R.new_zeros(B), R.new_zeros(B, D), R.new_zeros(B)
+    last_n, last_b, last_r, last_m = R.new_zeros(B, P), R.new_zeros(B), R.new_zeros(B, P), R.new_zeros(B)
     last_u = None
     slot = torch.full((B,), -1, dtype=torch.long, device=device)
-    for active, n, b, r, m, u in lloyd(encoder, mems, fr.starts(encoder, nodes), steps, tol):
-        slot.fill_(-1)
-        slot[active] = torch.arange(len(active), device=device)
-        at = slot[inverse]
-        mine = at >= 0
-        Ra, ia = R[mine], at[mine]
+    weights = tilted_draw(steps, grad_steps, grad_tilt) if 0 < grad_steps < steps and tol == 0 else None
+    grad = None if weights is None else set(weights)
+    drawn = R.new_zeros(B)  # with grad, the drawn steps' weighted loss per node
+    for i, (active, n, b, r, m, u) in enumerate(lloyd(encoder, mems, fr.starts(encoder, nodes), steps, tol, grad)):
+        if len(active) == B:  # every node still moving (always, with tol = 0): no masking, which would wait
+            Ra, ia = R, inverse
+        else:
+            slot.fill_(-1)
+            slot[active] = torch.arange(len(active), device=device)
+            at = slot[inverse]
+            mine = at >= 0
+            Ra, ia = R[mine], at[mine]
         rare = (Ra * n[ia]).sum(-1) >= b[ia]
         rare_n = R.new_zeros(len(active)).index_add_(0, ia, rare.to(R.dtype))
-        rare_sum = R.new_zeros(len(active), D).index_add_(0, ia, Ra * rare[:, None])
+        rare_sum = R.new_zeros(len(active), P).index_add_(0, ia, Ra * rare[:, None])
         loss = split_sse(r, m, rare_n, rare_sum, all_n[active], all_sum[active])
         if u is not None:
             child = (Ra - torch.where(rare[:, None], r[ia], -m[ia, None] * r[ia])).detach()
@@ -442,12 +516,19 @@ def chunk_sse(encoder, fr, imgs, steps, select=False, tol=0.0, dir_weight=1.0):
             loss = loss + dir_weight * pca
             node_pca = node_pca.index_add(0, active, pca.detach())
             if last_u is None:
-                last_u = R.new_zeros(B, 2, D)
+                last_u = R.new_zeros(B, 2, P)
             last_u[active] = u.detach()
-        node_loss = node_loss.index_add(0, active, loss)
+        node_loss = node_loss.index_add(0, active, loss if grad is None else loss.detach())
+        if weights is not None and i in weights:
+            drawn = drawn.index_add(0, active, loss * weights[i])
         node_steps[active] += 1
         last_n[active], last_b[active], last_r[active], last_m[active] = n, b, r.detach(), m.detach()
+    if clock is not None:
+        clock.stop(fr.depth, began, "steps")
     sse = (node_loss / node_steps).sum()
+    if weights is not None:  # every step's value, the drawn steps' gradient
+        estimate = drawn.sum()
+        sse = sse + estimate - estimate.detach()
     pca_sum = (node_pca / node_steps).sum()
     split = Split(last_n, last_b, last_r, last_m, last_u, node_steps)
     if not select:
@@ -478,12 +559,13 @@ def choose(encoder, fr, steps, batch, tol=0.0):
         mems = encoder.memory(*fr.history(part, device))
         start = fr.starts(encoder, part)
         B = len(part)
-        n, b, r, m = start.new_zeros(B, D), start.new_zeros(B), start.new_zeros(B, D), start.new_zeros(B)
+        P = start.shape[1]
+        n, b, r, m = start.new_zeros(B, P), start.new_zeros(B), start.new_zeros(B, P), start.new_zeros(B)
         u, taken = None, start.new_zeros(B)
         for active, sn, sb, sr, sm, su in lloyd(encoder, mems, start, steps, tol):
             n[active], b[active], r[active], m[active] = sn, sb, sr, sm
             if su is not None:
-                u = start.new_zeros(B, 2, D) if u is None else u
+                u = start.new_zeros(B, 2, P) if u is None else u
                 u[active] = su
             taken[active] += 1
         parts.append(Split(n, b, r, m, u, taken))
