@@ -189,9 +189,8 @@ an earlier run's network at the same (depth, step).
 
 **Three counts, one rule.** Epochs per network, Lloyd steps per depth and depths are each chosen as the $n$
 maximizing (val mse gain after $n$) $-$ threshold $\cdot n$, giving up once $n$ passes the best by a patience
-(`--epoch-*`, `--lloyd-*`, `--depth-*`). A depth costs a token while steps and epochs cost only time, so the
-thresholds are ordered: unless given, the step threshold is the depth threshold / 25 and the epoch threshold the
-step threshold / 40. An epoch is `--images-per-epoch` training images (22,528 by default, with a val measurement
+(`--epoch-*`, `--lloyd-*`, `--depth-*`). By default the depth threshold is 0, so the tree grows until val mse
+has gone 20 depths without a new low; a step must buy 2e-6 and an epoch 5e-8. An epoch is `--images-per-epoch` training images (22,528 by default, with a val measurement
 after each), taken from one endless stream of shuffles of the training set that every network reads in turn, so
 an epoch means the same however big the dataset is (`--flip` doubles it with mirror images).
 
@@ -271,7 +270,7 @@ The device is picked automatically (CUDA, then Apple's MPS, then the CPU); `--de
 files go to `artifacts/<job>/`, named by `$DVAE_JOB` or else by the script and the time.
 
 ```bash
-python train_encoder_components.py --dataset cifar10 --tf32 --bf16 --depth-threshold 1e-6
+python train_encoder_components.py --dataset cifar10 --tf32 --bf16 --layers 4 --history-window 16
 python qa_components.py --run artifacts/<encoder job>
 python train_prior.py --tree artifacts/<encoder job> --images --tf32
 python train_decoder.py --tree artifacts/<encoder job> --prior artifacts/<prior job>/prior.pt --tf32

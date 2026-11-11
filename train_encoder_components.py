@@ -14,9 +14,9 @@ maximizing (val mse gain after n) - threshold * n, giving up once n passes the b
   split;
 - depths (--depth-threshold, --depth-patience): the val mse at the root less after n depths.
 
-So each threshold is in val mse per pixel per epoch, per step and per depth. A depth is a token while steps and
-epochs cost only time, so unless given the step threshold is the depth threshold / 25 and the epoch threshold the
-step threshold / 40. Steps and depths tried past the best
+So each threshold is in val mse per pixel per epoch, per step and per depth. By default the depth threshold is 0:
+the tree grows until val mse has gone --depth-patience (20) depths without a new low. Steps and depths tried past
+the best
 (within the patience) are trained and kept on disk but are not part of the tree. A network starts from whichever
 of these has the lowest val mse at its step: the most recently trained network, the previous depth's network at
 the same step, and with --init the earlier run's network at the same (depth, step).
@@ -94,18 +94,18 @@ def model_path(folder, d, t):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--depth-threshold", type=float, default=5e-5, help="val mse per pixel a depth must buy")
-    p.add_argument("--lloyd-threshold", type=float, default=None,
-                   help="val mse per pixel a Lloyd step must buy (default: the depth threshold / 25)")
-    p.add_argument("--epoch-threshold", type=float, default=None,
-                   help="val mse per pixel an epoch must buy (default: the Lloyd threshold / 40)")
-    p.add_argument("--depth-patience", type=int, default=2, help="depths tried past the best before stopping")
+    p.add_argument("--depth-threshold", type=float, default=0.0,
+                   help="val mse per pixel a depth must buy (0: grow until val mse stops improving)")
+    p.add_argument("--lloyd-threshold", type=float, default=2e-6, help="val mse per pixel a Lloyd step must buy")
+    p.add_argument("--epoch-threshold", type=float, default=5e-8, help="val mse per pixel an epoch must buy")
+    p.add_argument("--depth-patience", type=int, default=20,
+                   help="depths tried past the best before stopping (one depth's val gain is noisy deep down)")
     p.add_argument("--lloyd-patience", type=int, default=2, help="steps tried past a depth's best before moving on")
     p.add_argument("--epoch-patience", type=int, default=2, help="epochs trained past a network's best")
     p.add_argument("--init-patience", type=int, default=1,
                    help="epochs trained past the best for a network that starts from the init run's (already trained "
                         "for its step, so it needs less to show that more training does not pay)")
-    p.add_argument("--max-depths", type=int, default=500)
+    p.add_argument("--max-depths", type=int, default=100000)
     p.add_argument("--max-steps", type=int, default=64)
     p.add_argument("--max-epochs", type=int, default=200)
     p.add_argument("--images-per-epoch", type=int, default=22528,
@@ -165,10 +165,6 @@ def main():
     p.add_argument("--dataset", choices=sorted(SHAPES), default="cifar10")
     args = p.parse_args()
     parser_defaults = {a.dest: a.default for a in p._actions}
-    if args.lloyd_threshold is None:  # (epoch << step << depth: what each must buy, in val mse per pixel)
-        args.lloyd_threshold = args.depth_threshold / 25
-    if args.epoch_threshold is None:
-        args.epoch_threshold = args.lloyd_threshold / 40
     out = args.out or os.path.dirname(artifact("run.log"))
     for sub in ("models", "tree/train", "tree/val", "tree/test"):
         os.makedirs(os.path.join(out, sub), exist_ok=True)
@@ -293,15 +289,16 @@ def main():
                 records["depths"].append(dict(r))
                 for t in range(r["tried"]):
                     records["models"].append(dict(old_models[(d, t)], reused=True))
-                    if args.save_models and init != out:
+                    if args.save_models and init != out and os.path.exists(model_path(init, d, t)):
                         link(model_path(init, d, t), model_path(out, d, t))
                 if init != out:
                     for s in groups:
                         link(os.path.join(init, "tree", s, f"d{d:03d}.pt"), os.path.join(out, "tree", s, f"d{d:03d}.pt"))
             tried = old_depths[last]["tried"]
+            # (a run without its networks saved resumes with no warm starts for its next depth)
             prev_depth = {t: torch.load(model_path(init, last, t), map_location=device, weights_only=False)
-                          ["state_dict"] for t in range(tried)}
-            recent = prev_depth[tried - 1]
+                          ["state_dict"] for t in range(tried) if os.path.exists(model_path(init, last, t))}
+            recent = prev_depth.get(tried - 1)
             records["kept"] = best_count(depth_gains, args.depth_threshold)
             first_d = last + 1
             offset = old_depths[last]["seconds"] - (time.time() - began)  # (the init run's clock goes on)
@@ -375,7 +372,8 @@ def main():
             t_other = time.time()
             mine = model_path(out, d, t)
             prior_rec = old_models.get((d, t))
-            reused = exact_step and prior_rec is not None and prior_rec["lineage"] == lineage
+            reused = (exact_step and prior_rec is not None and prior_rec["lineage"] == lineage and init is not None
+                      and os.path.exists(model_path(init, d, t)))  # (a network not saved is trained anew)
             complete = True  # (a reused network's file holds all it needs: step 0's holds its start)
             if reused:
                 assert init is not None and prior_rec is not None
