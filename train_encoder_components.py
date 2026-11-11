@@ -32,9 +32,9 @@ without training; from the first difference on each network trains, starting fro
 --resume is --init from this run's own folder, so an interrupted run replays what it has and goes on.
 
 What the run keeps in its folder (artifacts/<job>/ by default), which the prior and decoder read instead of a
-dump: models/dDDD_sSS.pt (every network trained), tree/<split>/dDDD.pt (for train, val and test, each depth's
-chosen split: every node's r, m and b, each image's side and next node, each next node's parent, side and key),
-records.json (every network's and depth's numbers; "kept" the depths in the tree) and the plot run.png. Each
+dump: models/dDDD_sSS.pt (every network trained; step 0's also holds the depth's start, so a code replays from the
+models alone), tree/<split>/dDDD.pt (for train, val and test, each depth's chosen split: every node's r, m and b,
+each image's side and next node, each next node's parent, side and key), records.json (every network's and depth's numbers; "kept" the depths in the tree) and the plot run.png. Each
 network logs a line (epochs, its start, train and val mse, gains, seconds split into training, val and the
 rest), each depth a summary line with train, val and test mse and the GPU's utilization.
 
@@ -376,10 +376,12 @@ def main():
             mine = model_path(out, d, t)
             prior_rec = old_models.get((d, t))
             reused = exact_step and prior_rec is not None and prior_rec["lineage"] == lineage
+            complete = True  # (a reused network's file holds all it needs: step 0's holds its start)
             if reused:
                 assert init is not None and prior_rec is not None
                 saved = torch.load(model_path(init, d, t), map_location=device, weights_only=False)
                 net.load_state_dict(saved["state_dict"])
+                complete = t > 0 or "start" in saved
                 if t == 0:  # (the start's sign the network was trained with)
                     start = orient(net, train, start, prior_rec["train"], args.node_batch)
                     hyper = {s: (start.expand(groups[s].nodes, -1), train.R.new_zeros(groups[s].nodes))
@@ -430,11 +432,11 @@ def main():
             state = {k: v.detach().clone() for k, v in net.state_dict().items()}
             states[t] = state
             recent = state
-            if args.save_models and reused and init is not None and init != out:
+            if args.save_models and reused and complete and init is not None and init != out:
                 link(model_path(init, d, t), mine)
-            elif args.save_models and not reused:
-                atomic_save(dict(config=net.config, state_dict={k: v.cpu() for k, v in state.items()}, d=d, t=t),
-                            mine)
+            elif args.save_models and not (reused and complete):  # (step 0's network keeps the start it asks about)
+                atomic_save(dict(config=net.config, state_dict={k: v.cpu() for k, v in state.items()}, d=d, t=t,
+                                 **(dict(start=start.cpu()) if t == 0 else {})), mine)
             timing["other"] += time.time() - t_other
             seconds = sum(timing.values())
             for k in timing:

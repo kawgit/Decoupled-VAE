@@ -207,15 +207,18 @@ after an interruption, starts from there at once instead of replaying. Reused ne
 links, not copies. An exact replay needs the same GPU type and precision: bfloat16 networks replayed on a V100
 drift.
 
-**What a run keeps** (in `artifacts/<job>/`): `models/dDDD_sSS.pt` (every network trained), `tree/<split>/dDDD.pt`
+**What a run keeps** (in `artifacts/<job>/`): `models/dDDD_sSS.pt` (every network trained; step 0's
+also holds the depth's start), `tree/<split>/dDDD.pt`
 (for train, val and test, each depth's chosen split: every node's $r$, $m$ and $b$, each image's side and next
 node, each next node's parent, side and key: what the prior and decoder read), `records.json` (every network's
 and depth's numbers; `kept` is the depths in the tree), `run.log` and the plot `run.png`.
 
-`qa_components.py --run artifacts/<job>` replays the kept tree on every training image and on some val and test
-images, and writes `compress_{train,val,test}.png` (images, then their reconstructions after a spread of code
-lengths), `samples.png` and `samples_by_depth.png` (codes sampled with the encoder's own shares), `real.png`, and
-`mse.png` (the replay's mse by depth beside the run's records, which match on the same GPU type).
+`qa_components.py --run artifacts/<job>` replays the kept tree from the models alone (step 0's checkpoint holds
+its depth's start) on every val image and some train and test images, and writes `compress_{train,val,test}.png`
+(images, then their reconstructions after a spread of code lengths), `samples.png` and `samples_by_depth.png`
+(codes sampled with the encoder's own shares), `real.png`, and `mse.png` (the replay's mse by depth beside the
+run's records, which the val replay matches exactly on the same GPU type). For a run from before starts were
+saved, it recomputes the missing ones from every training image once and writes them into the checkpoints.
 
 ### Stage 2: the prior
 
