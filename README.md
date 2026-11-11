@@ -203,8 +203,9 @@ faster than float32, which is about 4x slower than the L40S).
 trains from the first difference on. A run saves `state.pt` (every split's remainders, nodes and history tables)
 every `--snapshot-every` depths and at the end, so a rerun that only lowers `--depth-threshold`, or `--resume`
 after an interruption, starts from there at once instead of replaying. Reused networks and tree files are hard
-links, not copies. An exact replay needs the same GPU type and precision: bfloat16 networks replayed on a V100
-drift.
+links, not copies. Replays read each depth's start from its checkpoint, so other GPUs and precisions stay
+close: 569's bfloat16 networks replayed in fp32 or fp16 on a V100 stay within 0.1% of its val mse at every
+depth (recomputing the starts from replayed training images instead drifted 10% within 80 depths).
 
 **What a run keeps** (in `artifacts/<job>/`): `models/dDDD_sSS.pt` (every network trained; step 0's
 also holds the depth's start), `tree/<split>/dDDD.pt`
