@@ -48,6 +48,13 @@ PRIOR = "#a8a8ad"  # the rest of a depth's seconds
 COMPONENT_COLORS = dict(train="#e8743b", val="#2a78d6", test="#3aa57a")
 
 
+def _bars(ax, xs, ys, color, label, bottom=None):
+    """A bar per x, drawn as one stepped area: with more bars than pixels, separate bars round to zero width in
+    stretches and vanish."""
+    lo = bottom if bottom is not None else [0.0] * len(ys)
+    ax.fill_between(xs, lo, [a + b for a, b in zip(lo, ys)], step="mid", color=color, linewidth=0, label=label)
+
+
 def plot_components(records, path):
     """Save a train_encoder_components.py run's progress (its records.json): the train, val and test mse after
     every code length (the depths past the kept ones, tried for the depth patience, dashed); the val and train mse
@@ -107,7 +114,7 @@ def plot_components(records, path):
 
     xs = [h["d"] for h in depths]
     trains = [root["train"]] + [h["train"] for h in depths]
-    gain_ax.bar(xs, [max(h["gain"], 1e-12) for h in depths], color=COMPONENT_COLORS["val"], width=0.8, label="val")
+    _bars(gain_ax, xs, [max(h["gain"], 1e-12) for h in depths], COMPONENT_COLORS["val"], "val")
     gain_ax.plot(xs, [max(trains[i] - trains[i + 1], 1e-12) for i in range(K)], "o", color=COMPONENT_COLORS["train"],
                  markersize=3, label="train")
     gain_ax.axhline(args["depth_threshold"], color=INK, linestyle=":", linewidth=1.2, label="depth threshold")
@@ -115,8 +122,8 @@ def plot_components(records, path):
     gain_ax.legend(frameon=False, labelcolor=INK, fontsize=8)
     _style(gain_ax, "Each depth's mse gain", "depth", "mse taken off")
 
-    steps_ax.bar(xs, [h["tried"] for h in depths], color=GRID, width=0.8, label="tried")
-    steps_ax.bar(xs, [h["steps"] for h in depths], color=COMPONENT_COLORS["val"], width=0.8, label="chosen")
+    _bars(steps_ax, xs, [h["tried"] for h in depths], GRID, "tried")
+    _bars(steps_ax, xs, [h["steps"] for h in depths], COMPONENT_COLORS["val"], "chosen")
     epochs: dict[int, list[float]] = {}
     for m in records["models"]:
         if not m.get("reused"):
@@ -135,7 +142,7 @@ def plot_components(records, path):
     bottom = [0.0] * K
     for part, color in (("train", COMPONENT_COLORS["val"]), ("val", COMPONENT_COLORS["train"]), ("other", PRIOR)):
         ys = [h["timing"][part] for h in depths]
-        time_ax.bar(xs, ys, bottom=bottom, color=color, width=0.8, label=part)
+        _bars(time_ax, xs, ys, color, part, bottom)
         bottom = [a + b for a, b in zip(bottom, ys)]
     busy = [(h["d"], h["util"]) for h in depths if h.get("util") is not None]
     if busy:
