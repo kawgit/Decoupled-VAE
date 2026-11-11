@@ -4,22 +4,22 @@ The tree grows one depth at a time and each depth one Lloyd step at a time. Step
 depth's start (the top principal direction of the training remainders there, through each node's predicted
 mean); step t about the bisector of step t - 1's answers. Each step's network trains on its fixed nodes (every
 network above it frozen) and is then frozen itself. Three counts are each chosen the same way, as the n
-maximizing (val mse gain after n) - threshold * n, giving up once n passes the best by a patience:
+maximizing (val mse gain after n) * (1 - discount) ** n - threshold * n, giving up once n passes the best by a
+patience (so one more must buy the threshold, and that share of what the n before it bought):
 
-- epochs, per network (--epoch-threshold, --epoch-patience): the gain is the val mse after the step's split,
+- epochs, per network (--epoch-discount 1%, --epoch-patience): the gain is the val mse after the step's split,
   under the network at its start less under it after n epochs; the network kept is the best epoch's. An epoch is
   --images-per-epoch training images (one val measurement after each), taken from one endless stream of shuffles
   of the training set that every network reads in turn, so it means the same however big the dataset is;
-- Lloyd steps, per depth (--lloyd-threshold, --lloyd-patience): the val mse before the depth less after n steps'
+- Lloyd steps, per depth (--lloyd-discount 10%, --lloyd-patience): the val mse before the depth less after n steps'
   split. A depth tries at most as many steps as the most any of the last --lloyd-lookback (10) depths chose, one
   more on a --lloyd-explore (20%) share of depths (drawn from the seed and the depth, so a replay draws the same),
   so the cap can grow again: deep down, where one step is chosen, the steps past it are rarely trained at all;
-- depths (--depth-threshold, --depth-patience): the val mse at the root less after n depths.
+- depths (--depth-threshold 0, --depth-patience): the val mse at the root less after n depths.
 
-So each threshold is in val mse per pixel per epoch, per step and per depth. By default the depth threshold is 0:
-the tree grows until val mse has gone --depth-patience (20) depths without a new low. Steps and depths tried past
-the best
-(within the patience) are trained and kept on disk but are not part of the tree. A network starts from whichever
+Each threshold is in val mse per pixel per epoch, per step and per depth (--epoch-threshold and --lloyd-threshold
+default to 0: their discounts are relative instead); the depth threshold of 0 grows the tree until val mse has
+gone --depth-patience (20) depths without a new low. Steps and depths tried past the best (within the patience) are trained and kept on disk but are not part of the tree. A network starts from whichever
 of these has the lowest val mse at its step: the most recently trained network, the previous depth's network at
 the same step, and with --init the earlier run's network at the same (depth, step).
 
@@ -99,8 +99,13 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--depth-threshold", type=float, default=0.0,
                    help="val mse per pixel a depth must buy (0: grow until val mse stops improving)")
-    p.add_argument("--lloyd-threshold", type=float, default=2e-6, help="val mse per pixel a Lloyd step must buy")
-    p.add_argument("--epoch-threshold", type=float, default=5e-8, help="val mse per pixel an epoch must buy")
+    p.add_argument("--lloyd-threshold", type=float, default=0.0, help="val mse per pixel a Lloyd step must buy")
+    p.add_argument("--epoch-threshold", type=float, default=0.0, help="val mse per pixel an epoch must buy")
+    p.add_argument("--lloyd-discount", type=float, default=0.1,
+                   help="a depth keeps the n steps maximizing its gain * (1 - this) ** n: one more must add this "
+                        "share of the gain so far (1 / (1 - this) - 1 of it)")
+    p.add_argument("--epoch-discount", type=float, default=0.01,
+                   help="a network keeps the epoch e maximizing its gain * (1 - this) ** e")
     p.add_argument("--depth-patience", type=int, default=20,
                    help="depths tried past the best before stopping (one depth's val gain is noisy deep down)")
     p.add_argument("--lloyd-patience", type=int, default=2, help="steps tried past a depth's best before moving on")
@@ -273,8 +278,9 @@ def main():
     first_d = 0
     state_path = os.path.join(init, "state.pt") if init is not None else ""
     if old is not None and old["depths"] and os.path.exists(state_path):
-        choice = ("lloyd_threshold", "lloyd_patience", "max_steps")
-        differ = [k for k in choice if old["args"].get(k, parser_defaults.get(k)) != getattr(args, k)]
+        choice = ("lloyd_threshold", "lloyd_discount", "lloyd_patience", "max_steps")
+        legacy = dict(lloyd_discount=0.0)  # (what a run from before an option existed did)
+        differ = [k for k in choice if old["args"].get(k, legacy.get(k, parser_defaults.get(k))) != getattr(args, k)]
         if differ:
             log(f"{state_path} unused: the run differs in {', '.join(differ)}, so its steps would be chosen anew")
         else:
@@ -347,7 +353,7 @@ def main():
             t1 = time.time()
             timing["train"] += t1 - t0
             v = val_mse(model, s_va, hyper_va)
-            objective = (v0 - v) - args.epoch_threshold * e
+            objective = (v0 - v) * (1 - args.epoch_discount) ** e - args.epoch_threshold * e
             if objective > best[0]:
                 best = (objective, e, v, copy.deepcopy(model.state_dict()))
             log.detail(f"      {label} epoch {e}: val mse {v:.6f} (gain {v0 - v:.2e}, objective {objective:.2e}; "
@@ -435,7 +441,7 @@ def main():
             after = dict(train=split_mse(s_tr, r_tr, m_tr), val=split_mse(s_va, r_va, m_va))
             # (a reused network's step counts as the init run measured it, so a replay's rounding can't flip a choice)
             gains.append(prior_rec["gain"] if reused and prior_rec is not None else before["val"] - after["val"])
-            n_best = best_count(gains, args.lloyd_threshold)
+            n_best = best_count(gains, args.lloyd_threshold, args.lloyd_discount)
             if n_best == t + 1:
                 best_n = n_best
                 best_split = dict(train=(hyper["train"][0], hyper["train"][1], r_tr, m_tr),

@@ -352,9 +352,10 @@ class Utilization:
         return sum(xs) / len(xs) if xs else None
 
 
-def best_count(gains: list[float], threshold: float) -> int:
-    """The n (1-based) maximizing gains[n - 1] - threshold * n."""
-    return max(range(1, len(gains) + 1), key=lambda n: gains[n - 1] - threshold * n)
+def best_count(gains: list[float], threshold: float, discount: float = 0.0) -> int:
+    """The n (1-based) maximizing gains[n - 1] * (1 - discount) ** n - threshold * n: each one more must buy the
+    threshold, and with a discount also that share of what the n before it bought."""
+    return max(range(1, len(gains) + 1), key=lambda n: gains[n - 1] * (1 - discount) ** n - threshold * n)
 
 
 def fmt_e(x: float) -> str:

@@ -188,9 +188,10 @@ its step: the most recently trained network, the previous depth's network at the
 an earlier run's network at the same (depth, step).
 
 **Three counts, one rule.** Epochs per network, Lloyd steps per depth and depths are each chosen as the $n$
-maximizing (val mse gain after $n$) $-$ threshold $\cdot n$, giving up once $n$ passes the best by a patience
-(`--epoch-*`, `--lloyd-*`, `--depth-*`). By default the depth threshold is 0, so the tree grows until val mse
-has gone 20 depths without a new low; a step must buy 2e-6 and an epoch 5e-8. A depth tries at most as many
+maximizing (val mse gain after $n$) $\cdot (1 - \text{discount})^n - \text{threshold} \cdot n$, giving up once $n$
+passes the best by a patience (`--epoch-*`, `--lloyd-*`, `--depth-*`). By default steps and epochs are discounted
+(10% and 1%: one more step must raise the depth's gain by over 11%, one more epoch the network's by over 1%) and
+depths are not, with threshold 0, so the tree grows until val mse has gone 20 depths without a new low. A depth tries at most as many
 steps as the most any of the last 10 depths chose (one more on 20% of depths, so the cap can grow), so deep
 down, where one step is chosen, the steps past it are rarely trained. An epoch is `--images-per-epoch` training images (22,528 by default, with a val measurement
 after each), taken from one endless stream of shuffles of the training set that every network reads in turn, so
