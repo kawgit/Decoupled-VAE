@@ -20,8 +20,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 import torch  # noqa: E402
 
 from dvae.artifacts import artifact  # noqa: E402
-from dvae.data import get_device, load_mnist  # noqa: E402
-from dvae.deltatree import D, descend, pixels, root_frontier  # noqa: E402
+from dvae.data import SHAPES, get_device, load_images  # noqa: E402
+from dvae.deltatree import descend, pixels, root_frontier  # noqa: E402
 from dvae.sampling import columns, load_encoder  # noqa: E402
 from dvae.viz import save_grid  # noqa: E402
 
@@ -41,12 +41,15 @@ def main():
     device = get_device(args.device)
     encoders, mean, steps, batch, tol = load_encoder(args.ckpt, device)
     K = len(encoders)
+    ckpt_args = torch.load(args.ckpt, map_location="cpu", weights_only=False, mmap=True)["args"]
+    dataset = ckpt_args.get("dataset", "mnist")
+    shape = SHAPES[dataset]
     out = args.out or artifact("")
     os.makedirs(out, exist_ok=True)
 
     count = max(args.n, args.score)
-    X = {s: pixels(load_mnist(s, args.data_root)[:count]).to(device) for s in ("train", "test")}
-    T = pixels(load_mnist("train", args.data_root)).to(device) if args.train_means else None
+    X = {s: pixels(load_images(dataset, s, args.data_root)[:count]).to(device) for s in ("train", "test")}
+    T = pixels(load_images(dataset, "train", args.data_root)).to(device) if args.train_means else None
     fr = {s: root_frontier(x, mean) for s, x in X.items()}
     if T is not None:
         fr["all"] = root_frontier(T, mean)
@@ -62,7 +65,7 @@ def main():
             row = []
             for c in code.tolist():
                 inside = (train_code == c).nonzero()[:, 0].to(device)
-                row.append(T[inside].mean(0) if len(inside) else torch.zeros(D, device=device))
+                row.append(T[inside].mean(0) if len(inside) else torch.zeros(T.shape[1], device=device))
             empirical.append(torch.stack(row))
 
     mse = {s: [(preds[s][k][:args.score] - x[:args.score]).square().mean().item() for k in range(1, K + 1)]
@@ -92,11 +95,11 @@ def main():
     for s, name in (("train", "training"), ("test", "test")):
         path = os.path.join(out, f"compress_{s}.png")
         grid = torch.stack([x[:args.n] for x in preds[s]], 1)[:, cols]
-        save_grid(grid.clamp(0, 1).reshape(-1, 1, 28, 28), path, nrow=len(cols))
+        save_grid(grid.clamp(0, 1).reshape(-1, *shape), path, nrow=len(cols))
         print(f"{path}: rows are {name} images, then their predicted mean after {shown} tokens")
     if T is not None:
         path = os.path.join(out, "compress_train_means.png")
-        save_grid(torch.stack(empirical, 1)[:, cols].clamp(0, 1).reshape(-1, 1, 28, 28), path, nrow=len(cols))
+        save_grid(torch.stack(empirical, 1)[:, cols].clamp(0, 1).reshape(-1, *shape), path, nrow=len(cols))
         print(f"{path}: rows are test images, then the mean of the training images in the same node after "
               f"{shown} tokens")
 

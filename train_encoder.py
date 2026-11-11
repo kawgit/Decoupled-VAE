@@ -42,6 +42,7 @@ Next: dump_encoder.py writes every image's code for the prior and the decoder.
 """
 
 import argparse
+import contextlib
 import itertools
 import math
 import os
@@ -51,12 +52,14 @@ os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.5")  # ~6.5 GB: fai
 os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.4")
 
 import torch  # noqa: E402
+from torch import Tensor  # noqa: E402
 
 from dvae.artifacts import artifact  # noqa: E402
 from dvae.data import SHAPES, get_device, load_images  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
 from dvae.deltatree import (Encoder, Split, by_nodes, cat_splits, children, choose, chunk_sse,  # noqa: E402
-                            lloyd, node_order, pixels, root_frontier, split, top_direction)
+                            lloyd, node_order, pixels, root_frontier, split, tilted_draw, top_direction)
+from dvae.persist import PrefixCache, load_checkpoint, save_checkpoint  # noqa: E402
 from dvae.plots import plot_depths  # noqa: E402
 from dvae.stopping import add_patience_args, stagnant  # noqa: E402
 
@@ -86,34 +89,47 @@ def fold(grams, depth, R, ema):
     grams[depth].mul_(ema).add_(R.T @ R / len(R), alpha=1 - ema)
 
 
-def depth_step(encoder, fr, args, steps, weight: float | None = 1.0, clock: "DepthClock | None" = None):
+def depth_step(encoder, fr, args, steps, weight: float | None = 1.0, clock: "DepthClock | None" = None,
+               step_weights: dict[int, float] | None = None, norms: dict[int, Tensor] | None = None):
     """One depth of train_step, steps Lloyd steps at its nodes, in pieces of at most --max-nodes nodes: the
     objective and PCA error summed over fr's images (backward done) and every node's Split. weight scales the
     loss and both sums (1 / the depth's chance of training this step, so their expected values are unchanged);
-    None: the depth trains not at all this step, only splits the batch."""
+    None: the depth trains not at all this step, only splits the batch. step_weights (--grad-budget): the steps
+    backpropagated and their weights (chunk_sse's), the same for every piece; empty: the depth runs without a
+    graph (its objective still measured), its memory timed as "memory_skip"; norms: chunk_sse's."""
     if weight is None:
         zero = fr.R.new_zeros(())
         return zero, zero, choose(encoder, fr, steps, args.max_nodes, args.tol)
     grad_steps, tilt = getattr(args, "grad_steps", 0), getattr(args, "grad_tilt", None)
     tilt = None if tilt is None or tilt < 0 else tilt
+    skip = step_weights is not None and not step_weights
+    label = "memory_skip" if skip else "memory"
+    context = torch.no_grad() if skip else contextlib.nullcontext()
 
     def backward(loss):
+        if skip:
+            return
         began = None if clock is None else clock.start()
         loss.backward()
         if clock is not None:
             clock.stop(fr.depth, began, "backward")
 
     if len(fr.bits) <= args.max_nodes:  # one piece: no sorting or cutting, which would wait on the GPU
-        sse, pca, _, _, s = chunk_sse(encoder, fr, None, steps, tol=args.tol, dir_weight=args.dir_weight,
-                                      grad_steps=grad_steps, grad_tilt=tilt, clock=clock)
+        with context:
+            sse, pca, _, _, s = chunk_sse(encoder, fr, None, steps, tol=args.tol, dir_weight=args.dir_weight,
+                                          grad_steps=grad_steps, grad_tilt=tilt, clock=clock,
+                                          step_weights=step_weights, norms=norms, memory_label=label)
         backward(sse * (weight / (args.batch * fr.R.shape[1])))
         return sse.detach() * weight, pca * weight, s
     order, _ = node_order(fr)
     total, pca_total = fr.R.new_zeros(()), fr.R.new_zeros(())
     ids, parts = [], []
     for piece in by_nodes(order, fr.node[order], args.max_nodes):
-        sse, pca, _, piece_nodes, s = chunk_sse(encoder, fr, piece, steps, tol=args.tol, dir_weight=args.dir_weight,
-                                                grad_steps=grad_steps, grad_tilt=tilt, clock=clock)
+        with context:
+            sse, pca, _, piece_nodes, s = chunk_sse(encoder, fr, piece, steps, tol=args.tol,
+                                                    dir_weight=args.dir_weight, grad_steps=grad_steps,
+                                                    grad_tilt=tilt, clock=clock, step_weights=step_weights,
+                                                    norms=norms, memory_label=label)
         backward(sse * (weight / (args.batch * fr.R.shape[1])))  # a fixed divisor: every image weighs the same
         total, pca_total = total + sse.detach() * weight, pca_total + pca * weight
         ids.append(piece_nodes)
@@ -143,8 +159,8 @@ def nonneg_fit(feats: list[list[float]], ys: list[float]) -> list[float]:
 
 class DepthClock:
     """GPU seconds each depth's training takes, by part (labels: the whole depth, its memory, its Lloyd steps'
-    forward pass, its backward pass, its routing), timed with CUDA events (nothing waits until totals) or, on the
-    CPU, the host clock."""
+    forward pass, its backward pass, its routing; "memory_skip": the memory of a depth run without a graph),
+    timed with CUDA events (nothing waits until totals) or, on the CPU, the host clock."""
 
     def __init__(self, cuda: bool):
         self.cuda, self.marks = cuda, []
@@ -163,7 +179,7 @@ class DepthClock:
         """Each label's seconds per depth since the last totals {label: [K]}."""
         if self.cuda:
             torch.cuda.synchronize()
-        out = {label: [0.0] * K for label in ("depth", "memory", "steps", "backward", "route")}
+        out = {label: [0.0] * K for label in ("depth", "memory", "memory_skip", "steps", "backward", "route")}
         for label, depth, a, b in self.marks:
             out[label][depth] += a.elapsed_time(b) / 1000 if self.cuda else b - a
         self.marks = []
@@ -171,27 +187,39 @@ class DepthClock:
 
 
 def train_step(encoder, X, mean, grams, args, caps, weights: list[float | None] | None = None,
-               clock: DepthClock | None = None):
+               clock: DepthClock | None = None, step_weights: list[dict[int, float]] | None = None,
+               norms: list[dict[int, Tensor]] | None = None, cache: PrefixCache | None = None,
+               idx: Tensor | None = None, start: int = 0):
     """Send the batch X down every depth of the encoder as it splits them (depth d with caps[d] Lloyd steps),
     accumulating each depth's gradient;
     without seeds, fold the remainders each depth sees into its running Gram matrix (grams [n, D, D]), and the
     next depth's too while grams has one more (it tracks its start before it joins). Returns, per depth [K]: the
     objective and the PCA reconstruction error summed over the batch, and the Lloyd steps taken and nodes split;
     the batch's squared error summed after its last token (the train mse's numerator, as val's is measured);
-    and each image's key (child_key) at the deepest depth it reached [b], on the CPU."""
+    and each image's key (child_key) at the deepest depth it reached [b], on the CPU. step_weights and norms
+    (--grad-budget): each depth's depth_step ones. With cache (--cache-depths) and the batch's image indices idx
+    [b] (CPU), the batch starts at depth start from the cache (the depths above it neither run nor train) and
+    the cache takes its new paths."""
     K = encoder.depths
     ahead = grams is not None and len(grams) > K
-    fr = root_frontier(X, mean, resident=True)
+    if cache is not None and start > 0:
+        assert idx is not None
+        fr = cache.frontier(idx, X, mean, start)
+    else:
+        fr = root_frontier(X, mean, resident=True)
+    first_node = fr.node
+    rows: list[tuple[Tensor, Tensor, Tensor, Tensor]] = []
     child = fr
     zero = X.new_zeros(())
     sses, pcas, steps, nodes = [zero] * K, [zero] * K, [zero] * K, [zero] * K
-    for depth in range(K):
+    for depth in range(start, K):
         R = fr.R
         if grams is not None:
             fold(grams, depth, R, args.ema)
         began = None if clock is None else clock.start()
         total, pca_total, s = depth_step(encoder, fr, args, caps[depth], 1.0 if weights is None else weights[depth],
-                                         clock)
+                                         clock, None if step_weights is None else step_weights[depth],
+                                         None if norms is None else norms[depth])
         if clock is not None:
             clock.stop(depth, began)
         sses[depth], pcas[depth] = total, pca_total
@@ -201,11 +229,18 @@ def train_step(encoder, X, mean, grams, args, caps, weights: list[float | None] 
         child, _ = children(fr, s)
         if clock is not None:
             clock.stop(depth, routed, "route")
+        if cache is not None and depth < cache.depths:
+            assert child.seed is None, "--cache-depths keeps no seeds"
+            at = child.node.to(child.deltas.device)
+            rows.append((child.deltas[at, -1], child.sides[at, -1], child.ms[at, -1], child.bits[at]))
         if depth + 1 < K or ahead:
             fr = child
     if ahead:
         assert grams is not None
         fold(grams, K, fr.R, args.ema)
+    if cache is not None:
+        assert idx is not None
+        cache.write(idx, start, first_node if start > 0 else None, rows)
     return torch.stack([torch.stack(sses), torch.stack(pcas), torch.stack(steps), torch.stack(nodes)]), \
         child.R.detach().square().sum(), fr.bits[fr.node.to(fr.bits.device)].cpu()
 
@@ -367,6 +402,34 @@ def main():
                    help="train each depth on a step with a chance rising linearly from this at depth 1 to 1 at the "
                         "deepest (its loss weighted by 1 / the chance, so the expected gradient is unchanged; the "
                         "other steps only split the batch there); 1: every depth every step")
+    p.add_argument("--grad-budget", type=int, default=0,
+                   help="backpropagate this many Lloyd steps per batch in all, drawn without replacement from every "
+                        "depth's steps at once (replacing --grad-steps): the (depth, step) pairs ranked by "
+                        "--grad-rank, drawn with chance proportional to 1 + --budget-tilt - rank / pairs; a depth "
+                        "with none drawn runs without a graph; 0: off")
+    p.add_argument("--grad-rank", choices=("norm", "benefit"), default="norm",
+                   help="(--grad-budget) norm: by each pair's running gradient size in the encoder's answers, per "
+                        "its share of the objective, over the square root of its depth's modeled step cost (the "
+                        "draw with the least gradient noise per second, given unbiased weights); benefit: by how "
+                        "fast its val gain has grown per step backpropagated there (needs --step-threshold). Pairs "
+                        "not yet measured come first")
+    p.add_argument("--grad-unweighted", action="store_true",
+                   help="(--grad-budget) weight drawn steps alike instead of by 1 / their chance, so training "
+                        "leans to the top-ranked pairs (the gradient is no longer all steps' in expectation)")
+    p.add_argument("--budget-tilt", type=float, default=0.1,
+                   help="(--grad-budget) the last-ranked pair is drawn about tilt / (1 + tilt) as often as the first")
+    p.add_argument("--cache-depths", type=int, default=0,
+                   help="keep every training image's path through this many of the shallowest depths (-1: all, the "
+                        "cache growing with the tree; CIFAR-10 takes ~0.28 GB of host memory per depth) as last "
+                        "trained (PrefixCache), and start each batch at a depth k drawn from those (with "
+                        "--cache-full chance 0, else uniformly), the depths above k neither run nor train; depth "
+                        "d's loss is weighted by 1 / its chance of training, P(k <= d); 0: off")
+    p.add_argument("--cache-dir", default=None,
+                   help="(--cache-depths) the cache's folder of memory-mapped files, kept across jobs (default: "
+                        "cache/ beside --out, so a resume onto the same --out picks it up; another run's to start "
+                        "from its paths); -: in memory only, for this job")
+    p.add_argument("--cache-full", type=float, default=0.1,
+                   help="(--cache-depths) each batch's chance of starting at the root, every depth trained and cached")
     p.add_argument("--max-nodes", type=int, default=256,
                    help="nodes per forward pass; a depth spanning more is run in pieces with accumulated gradients")
     p.add_argument("--node-batch", type=int, default=512, help="nodes split at once when evaluating")
@@ -394,7 +457,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = args.tf32
     log = RunLog(args.log, device)
 
-    ckpt = torch.load(args.resume, map_location=device, weights_only=False) if args.resume else None
+    ckpt = load_checkpoint(args.resume, device, log) if args.resume else None
     if ckpt is not None:  # the architecture is the checkpoint's
         cfg = ckpt["shared"]["config"]
         args.width, args.layers, args.heads, args.seeded = cfg["width"], cfg["layers"], cfg["heads"], cfg["seeded"]
@@ -451,6 +514,12 @@ def main():
     over_cost: list[float] = []  # and for its overhead
     step_fit: list[float] = []  # the cost models' coefficients (see the threshold schedule), averaged over epochs
     over_fit: list[float] = []
+    # --grad-budget: each (depth, step)'s running squared gradient size, its val gain's growth per backpropagated
+    # step and its last val gain (for that growth), and the steps backpropagated there this epoch
+    norm_ema: dict[tuple[int, int], float] = {}
+    benefit: dict[tuple[int, int], float] = {}
+    prev_gain: dict[tuple[int, int], float] = {}
+    epoch_backed: dict[tuple[int, int], int] = {}
     if ckpt is not None:
         if "optimizer" in ckpt:
             opt.load_state_dict(ckpt["optimizer"])
@@ -464,6 +533,8 @@ def main():
         joined = (list(ckpt.get("joined") or []) + [0.0] * encoder.depths)[:encoder.depths]
         smoothed = list(ckpt.get("smoothed") or [])
         step_fit, over_fit = list(ckpt.get("step_fit") or []), list(ckpt.get("over_fit") or [])
+        norm_ema, benefit = dict(ckpt.get("norm_ema") or {}), dict(ckpt.get("benefit") or {})
+        prev_gain = dict(ckpt.get("prev_gain") or {})
         if encoder.depths == K and ckpt.get("best"):
             best = tuple(ckpt["best"])  # the same full depth: early stopping carries on
         log(f"resumed {args.resume} after epoch {ckpt['epoch']} (step {step}), saving to {args.out}")
@@ -472,17 +543,16 @@ def main():
     began = time.time() - (history[-1].get("seconds", 0.0) if history else 0.0)
     codes = None  # each training image's code in the last epoch
 
-    def save(epoch):
-        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-        torch.save(dict(args=vars(args), mean=mean.cpu(), epoch=epoch, step=step, metrics=history, best=best,
-                        shared=dict(config=encoder.config,
-                                    state_dict={k: v.cpu() for k, v in encoder.state_dict().items()}),
-                        optimizer=opt.state_dict(), tracked=tracked.cpu(), grown=grown, caps=caps, joined=joined,
-                        smoothed=smoothed, threshold=tau, threshold_since=since, peak_rate=peak,
-                        step_fit=step_fit, over_fit=over_fit,
-                        grams=None if grams is None or epoch % 10 else grams.cpu()), args.out)
-        # (the Gram matrices only every 10 epochs: at many depths of large images they are gigabytes; a resume
-        # without them restarts their running averages)
+    def save(epoch):  # (dvae/persist.py: model.pt, state.pt and grams.bin, and the cache flushed to disk)
+        save_checkpoint(args.out, dict(args=vars(args), mean=mean.cpu(), epoch=epoch, step=step, metrics=history,
+                                       best=best, shared=dict(config=encoder.config, state_dict={
+                                           k: v.cpu() for k, v in encoder.state_dict().items()}),
+                                       optimizer=opt.state_dict(), tracked=tracked.cpu(), grown=grown, caps=caps,
+                                       joined=joined, smoothed=smoothed, threshold=tau, threshold_since=since,
+                                       peak_rate=peak, step_fit=step_fit, over_fit=over_fit, norm_ema=norm_ema,
+                                       benefit=benefit, prev_gain=prev_gain), grams)
+        if cache is not None:
+            cache.flush()
 
     def fmt(values, digits=5):
         return " ".join(f"{v:.{digits}f}" for v in values)
@@ -515,6 +585,44 @@ def main():
         """The steps a depth that uses n tries, to see whether more would pay: half again as many."""
         return max(n + 1, math.ceil(1.5 * n))
 
+    def budget_draw(run, start=0):
+        """--grad-budget's draw for a batch whose depths run run[d] steps, from depth start: each depth's
+        {step: weight} (chunk_sse's step_weights) and, ranking by norm, an empty {step: squared gradient size} for
+        each to fill."""
+        pool = [(d, i) for d in range(start, len(run)) for i in range(run[d])]
+
+        def score(d, i):
+            if args.grad_rank == "norm":
+                v = norm_ema.get((d, i))
+                c = step_cost[d] if d < len(step_cost) and step_cost[d] > 0 else 1.0
+                return math.inf if v is None else math.sqrt(v) / run[d] / math.sqrt(c)
+            v = benefit.get((d, i))
+            return math.inf if v is None or math.isnan(v) else v
+
+        ties = torch.rand(len(pool), generator=gen).tolist()  # (unmeasured pairs in random order)
+        order = sorted(range(len(pool)), key=lambda j: (-score(*pool[j]), ties[j]))
+        drawn = tilted_draw(len(pool), args.grad_budget, args.budget_tilt, float(torch.rand(1, generator=gen)))
+        out: list[dict[int, float]] = [{} for _ in run]
+        for rank, w in drawn.items():  # w = 1 / (pairs * chance)
+            d, i = pool[order[rank]]
+            chance = 1 / (len(pool) * w)
+            out[d][i] = len(pool) / (len(drawn) * run[d]) if args.grad_unweighted else 1 / (run[d] * chance)
+            epoch_backed[(d, i)] = epoch_backed.get((d, i), 0) + 1
+        norms: list[dict[int, Tensor]] | None = [{} for _ in run] if args.grad_rank == "norm" else None
+        return out, norms
+
+    cache = None
+    if args.cache_depths != 0:
+        folder = None if args.cache_dir == "-" else args.cache_dir or os.path.join(os.path.dirname(args.out), "cache")
+        cache = PrefixCache(N, math.inf if args.cache_depths < 0 else args.cache_depths, D, folder, log)
+
+    def cache_chance(d):
+        """--cache-depths: depth d's chance of running in a batch, P(k <= d)."""
+        if cache is None:
+            return 1.0
+        top = int(min(cache.depths, encoder.depths - 1))  # (the deepest start drawn)
+        return 1.0 if top <= 0 else args.cache_full + (1 - args.cache_full) * min(d + 1, top + 1) / (top + 1)
+
     now = float(first)
     for epoch in range(first, first + args.epochs):
         t0, last = time.time(), time.time()
@@ -544,15 +652,38 @@ def main():
                 chance = torch.tensor([0.5 ** ((now - j) / args.full_half_life) for j in joined])
                 every = (torch.rand(len(joined), generator=gen) < chance).tolist()
                 run = [explore(c) if e else c for e, c in zip(every, caps)]
+            start = 0
+            if cache is not None:  # the batch's start: the root with --cache-full's chance, else uniform
+                top = int(min(cache.depths, encoder.depths - 1))
+                if top > 0 and float(torch.rand(1, generator=gen)) >= args.cache_full:
+                    start = int(torch.randint(0, top + 1, (1,), generator=gen))
+                start = min(start, int(cache.valid[idx].min()))  # (no deeper than every image's cached path)
+                base = weights if weights is not None else [1.0] * encoder.depths
+                weights = [None if w is None else w / cache_chance(d) for d, w in enumerate(base)]
+            step_weights, norms = None, None
+            if args.grad_budget > 0:
+                step_weights, norms = budget_draw(run, start)
             ran = (ran + [0] * len(run))[:len(run)]
             batched = (batched + [0] * len(run))[:len(run)]
             backed = (backed + [0] * len(run))[:len(run)]
             for d, n in enumerate(run):
+                if d < start:  # (neither run nor trained)
+                    continue
                 ran[d] += n
                 batched[d] += 1
-                backed[d] += n if args.grad_steps <= 0 else min(n, args.grad_steps)
+                if step_weights is not None:
+                    backed[d] += len(step_weights[d])
+                else:
+                    backed[d] += n if args.grad_steps <= 0 else min(n, args.grad_steps)
             opt.zero_grad(set_to_none=True)
-            stats, sse, keys = train_step(encoder, X[idx.to(device)], mean, grams, args, run, weights, clock)
+            stats, sse, keys = train_step(encoder, X[idx.to(device)], mean, grams, args, run, weights, clock,
+                                          step_weights, norms, cache, idx, start)
+            if norms is not None:  # (one wait on the GPU per batch)
+                items = [(d, i, v) for d in range(len(norms)) for i, v in norms[d].items()]
+                if items:
+                    for (d, i, _), v in zip(items, torch.stack([v for _, _, v in items]).tolist()):
+                        old = norm_ema.get((d, i))
+                        norm_ema[(d, i)] = v if old is None else 0.9 * old + 0.1 * v
             last_sse += sse
             if stats.shape[1] > totals.shape[1]:
                 totals = torch.cat([totals, totals.new_zeros(4, stats.shape[1] - totals.shape[1])], 1)
@@ -597,6 +728,19 @@ def main():
             # and ones not measured now keep their last value)
             smoothed = [[b * a + (1 - b) * x for a, x in zip(smoothed[d], g)] + g[len(smoothed[d]):]
                         + smoothed[d][len(g):] if d < len(smoothed) else list(g) for d, g in enumerate(step_gains)]
+            if args.grad_budget > 0 and args.grad_rank == "benefit":  # each pair's gain growth per step trained
+                for d, g in enumerate(smoothed):
+                    for i, x in enumerate(g):
+                        key, count = (d, i), epoch_backed.get((d, i), 0)
+                        if key in prev_gain and count > 0:
+                            rate = (x - prev_gain[key]) / count
+                            benefit[key] = rate if key not in benefit else b * benefit[key] + (1 - b) * rate
+                        prev_gain[key] = x
+        if args.grad_budget > 0:
+            log("    gradient budget: steps backpropagated per batch by depth "
+                + " ".join(f"{backed[d] / max(batched[d], 1):.2f}" for d in range(len(backed)))
+                + f"; {len(epoch_backed)} of the (depth, step) pairs trained this epoch")
+            epoch_backed.clear()
         grow_next = False
         if thresholding:  # steps: the best cumulative gain less the threshold's price; grow while the deepest's
             assert parts is not None  # first step beats its price
@@ -609,16 +753,18 @@ def main():
             # (every step runs the same forward pass and is priced with a backward pass)
             seen = [d for d in range(encoder.depths) if batched[d] > 0]
             feats = [[1.0, float(totals[3][d]) / batched[d], float(totals[3][d]) / batched[d] * (d + 1)] for d in seen]
-            ys_step, ys_over = [], []
-            for d in seen:
+            ys_step, ys_over, feats_step = [], [], []
+            for f, d in zip(feats, seen):
                 runs, backs = ran[d] / batched[d], backed[d] / batched[d]
                 forward = parts["steps"][d] / max(runs, 1e-9)
                 back = max(parts["backward"][d] - 2 * parts["memory"][d], 0.0) / max(backs, 1e-9)
-                ys_step.append((forward + back) / batched[d])  # (a step we rely on must also be trained)
+                if backed[d] > 0:  # (a depth never backpropagated this epoch (--grad-budget) cannot price one)
+                    ys_step.append((forward + back) / batched[d])  # (a step we rely on must also be trained)
+                    feats_step.append(f)
                 ys_over.append(max(parts["depth"][d] + parts["route"][d] - forward * runs - back * backs, 0.0)
                                / batched[d])
-            step_fit = [b * a + (1 - b) * x for a, x in zip(step_fit, nonneg_fit(feats, ys_step))] if step_fit \
-                else nonneg_fit(feats, ys_step)
+            step_fit = [b * a + (1 - b) * x for a, x in zip(step_fit, nonneg_fit(feats_step, ys_step))] if step_fit \
+                else nonneg_fit(feats_step, ys_step)
             over_fit = [b * a + (1 - b) * x for a, x in zip(over_fit, nonneg_fit(feats, ys_over))] if over_fit \
                 else nonneg_fit(feats, ys_over)
             per_epoch = len(batches)
@@ -627,8 +773,9 @@ def main():
                 return per_epoch * (fit[0] + fit[1] * nodes + fit[2] * nodes * (depth + 1))
 
             nodes_now = [float(totals[3][d]) / max(batched[d], 1) for d in range(encoder.depths)]
-            step_cost = [modeled(step_fit, n, d) for d, n in enumerate(nodes_now)]
-            over_cost = [modeled(over_fit, n, d) for d, n in enumerate(nodes_now)]
+            # (with --cache-depths a depth runs in only its share of the batches)
+            step_cost = [modeled(step_fit, n, d) * cache_chance(d) for d, n in enumerate(nodes_now)]
+            over_cost = [modeled(over_fit, n, d) * cache_chance(d) for d, n in enumerate(nodes_now)]
             secs = step_cost
             chosen = []
             for g, c in zip(smoothed, secs):  # (noise in the gains past the useful steps cancels in the sum)

@@ -47,6 +47,7 @@ import torch.nn.functional as F  # noqa: E402
 from dvae.artifacts import artifact  # noqa: E402
 from dvae.data import get_device, load_mnist  # noqa: E402
 from dvae.deltatree import D, pixels, top_direction  # noqa: E402
+from dvae.persist import load_checkpoint  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
 from dvae.plots import plot_rounds  # noqa: E402
 from dvae.rounds import (CodeEncoder, CodePrior, Decoder, DecoderCov, DecoderMean, LloydEncoder, Tree,  # noqa: E402
@@ -169,7 +170,7 @@ def train_stage(name, model, loss, val, N, args, log, gen, plot, draw=None, bf16
 
 def lloyd_from_checkpoint(path, steps, device):
     """A LloydEncoder from a train_encoder.py checkpoint (its network, data mean and tracked starts)."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = load_checkpoint(path, device)  # (model.pt with its state.pt and grams.bin, see dvae/persist.py)
     cfg = ckpt["shared"]["config"]
     assert not (cfg.get("seeded") or cfg.get("node_mean") or cfg.get("scaled")), \
         "the Lloyd encoder takes an unseeded, unscaled checkpoint without --node-mean"

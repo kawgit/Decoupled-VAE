@@ -64,7 +64,9 @@ while true; do
       echo "$(date) cancel $name"
       rm -f "$Q/cancel/$name"
       kill -TERM -- -$pid 2>/dev/null
-      for _ in $(seq 30); do kill -0 $pid 2>/dev/null || break; sleep 1; done
+      # (wait on the whole group, not the bash that runs it, which dies at once: its python may still be
+      # saving or flushing a cache)
+      for _ in $(seq 30); do kill -0 -- -$pid 2>/dev/null || break; sleep 1; done
       kill -KILL -- -$pid 2>/dev/null
     fi
     sleep 5

@@ -462,7 +462,8 @@ def tilted_draw(steps: int, draws: int, tilt: float | None, rng: float | None = 
 
 
 def chunk_sse(encoder, fr, imgs, steps, select=False, tol=0.0, dir_weight=1.0, grad_steps=0,
-              grad_tilt: float | None = None, clock=None):
+              grad_tilt: float | None = None, clock=None, step_weights: dict[int, float] | None = None,
+              norms: dict[int, Tensor] | None = None, memory_label="memory"):
     """The objective's sum over images imgs of a frontier, each node's averaged over its Lloyd steps: the
     split's error and, for a seeded encoder, dir_weight times its sides' rank-1 PCA reconstruction error (each
     image's remainder after the split, less its projection on its side's predicted direction). Also returns
@@ -472,7 +473,10 @@ def chunk_sse(encoder, fr, imgs, steps, select=False, tol=0.0, dir_weight=1.0, g
     GPU (so without waiting for it). With 0 < grad_steps < steps (and tol = 0), only that many steps are
     backpropagated, drawn by tilted_draw (grad_tilt; None: uniformly): the objective's value is all of them, its
     gradient the drawn steps' weighted sum (the same in expectation, a cheaper backward pass with bounded
-    memory). clock (train_encoder.py's DepthClock) times the memory and the steps' forward pass."""
+    memory). step_weights ({step: weight}) names the backpropagated steps and their weights instead (empty: none,
+    run it without a graph); norms then gathers, per drawn step, the squared norm of its summed loss's gradient in
+    the encoder's answers (r, m), added to over pieces. clock (train_encoder.py's DepthClock) times the memory
+    (under memory_label) and the steps' forward pass."""
     if imgs is None:
         R, inverse = fr.R, fr.node
         nodes = torch.arange(len(fr.bits), device=R.device)
@@ -483,7 +487,7 @@ def chunk_sse(encoder, fr, imgs, steps, select=False, tol=0.0, dir_weight=1.0, g
     began = None if clock is None else clock.start()
     mems = encoder.memory(*fr.history(nodes, device))
     if clock is not None:
-        clock.stop(fr.depth, began, "memory")
+        clock.stop(fr.depth, began, memory_label)
         began = clock.start()
     all_n = R.new_zeros(B).index_add_(0, inverse, R.new_ones(len(R)))
     P = R.shape[1]  # pixels
@@ -492,7 +496,10 @@ def chunk_sse(encoder, fr, imgs, steps, select=False, tol=0.0, dir_weight=1.0, g
     last_n, last_b, last_r, last_m = R.new_zeros(B, P), R.new_zeros(B), R.new_zeros(B, P), R.new_zeros(B)
     last_u = None
     slot = torch.full((B,), -1, dtype=torch.long, device=device)
-    weights = tilted_draw(steps, grad_steps, grad_tilt) if 0 < grad_steps < steps and tol == 0 else None
+    if step_weights is not None:
+        weights = step_weights
+    else:
+        weights = tilted_draw(steps, grad_steps, grad_tilt) if 0 < grad_steps < steps and tol == 0 else None
     grad = None if weights is None else set(weights)
     drawn = R.new_zeros(B)  # with grad, the drawn steps' weighted loss per node
     for i, (active, n, b, r, m, u) in enumerate(lloyd(encoder, mems, fr.starts(encoder, nodes), steps, tol, grad)):
@@ -521,6 +528,10 @@ def chunk_sse(encoder, fr, imgs, steps, select=False, tol=0.0, dir_weight=1.0, g
         node_loss = node_loss.index_add(0, active, loss if grad is None else loss.detach())
         if weights is not None and i in weights:
             drawn = drawn.index_add(0, active, loss * weights[i])
+            if norms is not None:  # (through the loss alone: the answers' gradient, not the network's)
+                gr, gm = torch.autograd.grad(loss.sum(), (r, m), retain_graph=True, allow_unused=True)
+                sq = sum((g.float().square().sum() for g in (gr, gm) if g is not None), loss.new_zeros(()))
+                norms[i] = norms[i] + sq if i in norms else sq
         node_steps[active] += 1
         last_n[active], last_b[active], last_r[active], last_m[active] = n, b, r.detach(), m.detach()
     if clock is not None:

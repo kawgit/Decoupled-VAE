@@ -116,6 +116,74 @@ def plot_depths(history, path):
     _save(fig, path)
 
 
+WAVES, PRIOR = "#2a78d6", "#a8a8ad"  # a wave run's own epochs, and the run it branched from
+OTHERS = ["#e8743b", "#3aa57a", "#8c5bd6", "#c4405a"]  # runs it is compared with
+
+
+def plot_waves(history, stages, path, compare=()):
+    """Save a train_waves.py run's progress against GPU hours (each entry's "seconds"): the val mse after the
+    whole tree and its depths at each full val (entries with "wave" are the run's own; earlier ones, from the
+    train_encoder.py run it branched from, grey), beside any compare runs (label, history); the sweep, each
+    depth's stage ending at its time, a line per wave (darker is later), the waves' starts dotted in the other
+    panels; and the latest full val's mse at each depth over a compare run's at the nearest earlier time
+    (without one, over its own at the end of the wave before, or its first). stages holds dicts with "seconds",
+    "wave" and "depth"."""
+    own = [h for h in history if "wave" in h]
+    if not own:
+        return
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    (final, tokens), (sweep, ratio) = axes
+    hours = lambda h: h["seconds"] / 3600  # noqa: E731
+    runs = [("", [h for h in history if "wave" not in h], PRIOR), ("this run", own, WAVES)]
+    runs += [(label, other, OTHERS[i % len(OTHERS)]) for i, (label, other) in enumerate(compare)]
+    for label, entries, color in runs:
+        if not entries:
+            continue
+        xs = [hours(h) for h in entries]
+        final.plot(xs, [h["val_mse"][-1] for h in entries], color=color, linewidth=1.6, marker="o", markersize=3,
+                   label=label or "before the waves")
+        tokens.plot(xs, [len(h["val_mse"]) for h in entries], color=color, linewidth=1.6, marker="o", markersize=3)
+    starts = {}
+    for s in stages:
+        starts.setdefault(s["wave"], s["seconds"] / 3600)
+    for ax in (final, tokens):
+        for x in starts.values():
+            ax.axvline(x, color=GRID, linestyle=":", linewidth=1.2, zorder=0)
+    _log_y(final)
+    final.legend(frameon=False, labelcolor=INK)
+    _style(final, f"Val mse after the whole tree ({len(own[-1]['val_mse'])} tokens now)", "GPU hours", "val mse")
+    _style(tokens, "Depths in the tree (waves' starts dotted)", "GPU hours", "tokens")
+    tokens.yaxis.set_major_locator(MaxNLocator(integer=True))
+
+    waves = sorted({s["wave"] for s in stages})
+    norm = Normalize(vmin=waves[0] if waves else 0, vmax=max(waves[-1] if waves else 1, (waves[0] if waves else 0) + 1))
+    for wave in waves:
+        done = [s for s in stages if s["wave"] == wave]
+        sweep.plot([s["seconds"] / 3600 for s in done], [s["depth"] for s in done], color=RAMP(norm(wave)),
+                   linewidth=1.4, marker="o", markersize=2.5)
+    sweep.yaxis.set_major_locator(MaxNLocator(integer=True))
+    _style(sweep, "The sweep: each depth's stage ending, a line per wave", "GPU hours", "depth")
+    if waves:
+        _colorbar(fig, sweep, norm, "wave")
+
+    last = own[-1]
+    if compare:
+        label, other = compare[0]
+        before = [h for h in other if h["seconds"] <= last["seconds"]] or other[:1]
+        base, what = before[-1]["val_mse"], f"{label} at {hours(before[-1]):.2f} h"
+    else:  # (the targets are the monitor set's, not the whole val set's: not comparable)
+        before = [h for h in own if h["wave"] < last["wave"]] or own[:1]
+        base = before[-1]["val_mse"]
+        what = f"wave {before[-1]['wave']}'s end" if before[-1]["wave"] < last["wave"] else "its first full val"
+    n = min(len(base), len(last["val_mse"]))
+    change = [100 * (last["val_mse"][d] / base[d] - 1) for d in range(n)]
+    ratio.axhline(0, color=MUTED, linewidth=1)
+    ratio.bar(range(n), change, color=[WAVES if c <= 0 else OTHERS[0] for c in change], width=0.8)
+    ratio.xaxis.set_major_locator(MaxNLocator(integer=True))
+    _style(ratio, f"Val mse at {hours(last):.2f} h by depth, against {what}", "depth", "% above (below: better)")
+    _save(fig, path)
+
+
 def _save(fig, path):
     fig.tight_layout()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
