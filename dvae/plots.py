@@ -3,6 +3,7 @@
 import os
 
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")  # files only, no display
 import matplotlib.pyplot as plt  # noqa: E402
@@ -48,27 +49,54 @@ PRIOR = "#a8a8ad"  # the rest of a depth's seconds
 COMPONENT_COLORS = dict(train="#e8743b", val="#2a78d6", test="#3aa57a")
 
 
-def _bars(ax, xs, ys, color, label, bottom=None):
+def _bars(ax, xs, ys, color, label, bottom=None, log=False):
     """A bar per x, drawn as one stepped area: with more bars than pixels, separate bars round to zero width in
-    stretches and vanish."""
+    stretches and vanish. log: from just under the smallest value up (0 has no place on a log axis)."""
+    if log:
+        lo = [min(ys) / 2] * len(ys)
+        ax.fill_between(xs, lo, ys, step="mid", color=color, linewidth=0, label=label)
+        return
     lo = bottom if bottom is not None else [0.0] * len(ys)
     ax.fill_between(xs, lo, [a + b for a, b in zip(lo, ys)], step="mid", color=color, linewidth=0, label=label)
 
 
-def plot_components(records, path):
+def _pair_grid(real, recon, per_row=6, gap=2, between=8):
+    """[n, C, H, W] images and their reconstructions as rows of per_row (real, reconstruction) pairs, [H', W', C]."""
+    n, C, H, W = real.shape
+    rows, pair_w = -(-n // per_row), 2 * W + gap
+    grid = np.ones((rows * H + (rows - 1) * between, per_row * pair_w + (per_row - 1) * between, C))
+    for i in range(n):
+        y, x = (i // per_row) * (H + between), (i % per_row) * (pair_w + between)
+        grid[y:y + H, x:x + W] = real[i].transpose(1, 2, 0)
+        grid[y:y + H, x + W + gap:x + pair_w] = recon[i].transpose(1, 2, 0)
+    return grid.clip(0, 1)
+
+
+def plot_components(records, path, pairs=None):
     """Save a train_encoder_components.py run's progress (its records.json): the train, val and test mse after
     every code length (the depths past the kept ones, tried for the depth patience, dashed); the val and train mse
     after the tree so far against hours; the
     cumulative val mse gain by Lloyd step at every depth (darker is deeper), each depth's chosen steps ringed;
-    each depth's val and train gain against the depth threshold; the Lloyd steps chosen and tried per depth with
-    the epochs its networks trained; and each depth's seconds split into training, val and the rest, with the
-    GPU's utilization."""
+    each depth's val and train gain against the depth threshold; the Lloyd steps chosen and tried per depth; each
+    depth's seconds split into training, val and the rest, with the GPU's utilization; and, given pairs (dict of
+    "real" and "recon" [n, C, H, W] arrays and "tokens"), test images beside their reconstructions so far."""
     depths = records["depths"]
     if not depths:
         return
     args, kept, root = records["args"], records["kept"], records["root"]
-    fig, axes = plt.subplots(2, 3, figsize=(19, 10), gridspec_kw={"width_ratios": [3, 2, 3]})
-    (by_depth, by_hour, by_step), (gain_ax, steps_ax, time_ax) = axes
+    fig = plt.figure(figsize=(19, 14.5 if pairs is not None else 10))
+    grid = fig.add_gridspec(3 if pairs is not None else 2, 3, width_ratios=[3, 2, 3],
+                            height_ratios=[1, 1, 0.9] if pairs is not None else [1, 1])
+    by_depth, by_hour, by_step = (fig.add_subplot(grid[0, i]) for i in range(3))
+    gain_ax, steps_ax, time_ax = (fig.add_subplot(grid[1, i]) for i in range(3))
+    if pairs is not None:
+        pair_ax = fig.add_subplot(grid[2, :])
+        shown = _pair_grid(pairs["real"], pairs["recon"])
+        pair_ax.imshow(shown[..., 0] if shown.shape[-1] == 1 else shown, cmap="gray", vmin=0, vmax=1,
+                       interpolation="nearest")
+        pair_ax.set_axis_off()
+        pair_ax.set_title(f"Test images, each beside its reconstruction after {pairs['tokens']} tokens", loc="left",
+                          fontsize=11, color=INK)
     K = len(depths)
     for split, color in COMPONENT_COLORS.items():
         ys = [root[split]] + [h[split] for h in depths]
@@ -114,30 +142,19 @@ def plot_components(records, path):
 
     xs = [h["d"] for h in depths]
     trains = [root["train"]] + [h["train"] for h in depths]
-    _bars(gain_ax, xs, [max(h["gain"], 1e-12) for h in depths], COMPONENT_COLORS["val"], "val")
+    _bars(gain_ax, xs, [max(h["gain"], 1e-12) for h in depths], COMPONENT_COLORS["val"], "val", log=True)
     gain_ax.plot(xs, [max(trains[i] - trains[i + 1], 1e-12) for i in range(K)], "o", color=COMPONENT_COLORS["train"],
                  markersize=3, label="train")
-    gain_ax.axhline(args["depth_threshold"], color=INK, linestyle=":", linewidth=1.2, label="depth threshold")
+    if args["depth_threshold"] > 0:  # (0, the default, has no place on a log axis)
+        gain_ax.axhline(args["depth_threshold"], color=INK, linestyle=":", linewidth=1.2, label="depth threshold")
     _log_y(gain_ax)
     gain_ax.legend(frameon=False, labelcolor=INK, fontsize=8)
     _style(gain_ax, "Each depth's mse gain", "depth", "mse taken off")
 
     _bars(steps_ax, xs, [h["tried"] for h in depths], GRID, "tried")
     _bars(steps_ax, xs, [h["steps"] for h in depths], COMPONENT_COLORS["val"], "chosen")
-    epochs: dict[int, list[float]] = {}
-    for m in records["models"]:
-        if not m.get("reused"):
-            epochs.setdefault(m["d"], []).append(m["epochs"])
-    twin = steps_ax.twinx()
-    ed = sorted(epochs)
-    twin.plot(ed, [sum(epochs[d]) / len(epochs[d]) for d in ed], color=COMPONENT_COLORS["train"], linewidth=1.4,
-              marker="o", markersize=2.5)
-    twin.set_ylabel("epochs per network trained", color=COMPONENT_COLORS["train"])
-    twin.tick_params(colors=MUTED)
-    for side in ("top", "right"):
-        twin.spines[side].set_visible(False)
     steps_ax.legend(frameon=False, labelcolor=INK, fontsize=8, loc="upper left")
-    _style(steps_ax, "Lloyd steps per depth, and epochs per network", "depth", "Lloyd steps")
+    _style(steps_ax, "Lloyd steps per depth", "depth", "Lloyd steps")
 
     bottom = [0.0] * K
     for part, color in (("train", COMPONENT_COLORS["val"]), ("val", COMPONENT_COLORS["train"]), ("other", PRIOR)):
@@ -211,8 +228,18 @@ def plot_decoder(history, path):
 
 
 if __name__ == "__main__":  # (python -m dvae.plots RECORDS PNG: a components run's redraw, in a process of its own
-    import json  # so that it never holds the training process's interpreter lock)
-    import sys
+    import json  # so that it never holds the training process's interpreter lock; test_pairs.pt beside RECORDS
+    import sys  # adds its sample test images)
+
+    import torch
 
     with open(sys.argv[1]) as f:
-        plot_components(json.load(f), sys.argv[2])
+        records = json.load(f)
+    pairs_path = os.path.join(os.path.dirname(sys.argv[1]), "test_pairs.pt")
+    pairs = None
+    if os.path.exists(pairs_path):
+        saved = torch.load(pairs_path, weights_only=False)
+        shape = tuple(saved["shape"])
+        pairs = dict(real=saved["real"].view(-1, *shape).numpy(), recon=saved["recon"].view(-1, *shape).numpy(),
+                     tokens=saved["tokens"])
+    plot_components(records, sys.argv[2], pairs)

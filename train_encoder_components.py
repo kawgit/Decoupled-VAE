@@ -36,7 +36,8 @@ without training; from the first difference on each network trains, starting fro
 What the run keeps in its folder (artifacts/<job>/ by default), which the prior and decoder read instead of a
 dump: models/dDDD_sSS.pt (every network trained; step 0's also holds the depth's start, so a code replays from the
 models alone), tree/<split>/dDDD.pt (for train, val and test, each depth's chosen split: every node's r, m and b,
-each image's side and next node, each next node's parent, side and key), records.json (every network's and depth's numbers; "kept" the depths in the tree) and the plot run.png. Each
+each image's side and next node, each next node's parent, side and key), records.json (every network's and depth's numbers; "kept" the depths in the tree) and the plot run.png (with
+test_pairs.pt, its sample test images and their reconstructions so far). Each
 network logs a line (epochs, its start, train and val mse, gains, seconds split into training, val and the
 rest), each depth a summary line with train, val and test mse and the GPU's utilization.
 
@@ -160,6 +161,7 @@ def main():
                    help="save the groups' state (state.pt: every split's remainders, nodes and windowed history "
                         "tables) every this many depths and at the end, so a rerun with --init (or --resume) that "
                         "would replay all of it starts from it at once instead (needs --history-window > 0)")
+    p.add_argument("--plot-pairs", type=int, default=12, help="test images run.png shows beside their reconstructions")
     p.add_argument("--tf32", action="store_true")
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--fp16", action="store_true",
@@ -498,6 +500,9 @@ def main():
         chosen_steps.append(best_n)
         prev_depth = states
         now = dict(train=mse_now(train), val=mse_now(val), test=mse_now(test))
+        k = args.plot_pairs  # (run.png's sample test images beside their reconstructions so far)
+        atomic_save(dict(real=data["test"][:k].cpu(), recon=(data["test"][:k] - test.R[:k]).float().cpu(), shape=shape,
+                         tokens=d + 1), os.path.join(out, "test_pairs.pt"))
         # (a depth replayed whole counts as the init run measured it, as its steps do)
         replayed = exact and d in old_depths and old is not None
         depth_gains.append(old["root"]["val"] - old_depths[d]["val"] if replayed and old is not None
