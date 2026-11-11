@@ -139,7 +139,10 @@ def main():
     p.add_argument("--dropout", type=float, default=0.0, help="dropout in each network's blocks while training")
     p.add_argument("--side-m-history", action="store_true", help="history tokens also read each step's side and m")
     p.add_argument("--batch", type=int, default=1024, help="training images per optimizer step")
-    p.add_argument("--max-nodes", type=int, default=512, help="nodes per forward pass while training")
+    p.add_argument("--max-nodes", type=int, default=0,
+                   help="nodes per forward pass while training (0: 512 * 3072 / the data's numbers per image, at least "
+                        "512: 512 for CIFAR-10 pixels, 3072 for 512-number latents; fewer, larger passes keep a GPU "
+                        "busier when the data is small)")
     p.add_argument("--node-batch", type=int, default=1024, help="nodes per forward pass when measuring")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
@@ -230,6 +233,7 @@ def main():
     groups = {s: root_group(s, X, mean, args.history_window) for s, X in data.items()}
     train, val, test = groups["train"], groups["val"], groups["test"]
     N, D = train.R.shape
+    max_nodes = args.max_nodes or max(512, 512 * 3072 // D)
     total_memory = torch.cuda.get_device_properties(device).total_memory if device.type == "cuda" else 0
     budget = args.gpu_tables * total_memory
     shape = tuple(lat["shape"]) if lat is not None else SHAPES[args.dataset]
@@ -370,7 +374,7 @@ def main():
         while True:
             t0 = time.time()
             model.train()
-            for pieces, B in epoch_batches(train, stream.take(epoch_steps * args.batch), args.batch, args.max_nodes):
+            for pieces, B in epoch_batches(train, stream.take(epoch_steps * args.batch), args.batch, max_nodes):
                 opt.zero_grad(set_to_none=True)
                 for nodes, w in pieces:
                     loss = (node_loss(model, train, s_tr, nodes, *hyper_tr) * w).sum() / (B * D)
