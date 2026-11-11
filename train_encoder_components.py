@@ -11,7 +11,9 @@ maximizing (val mse gain after n) - threshold * n, giving up once n passes the b
   --images-per-epoch training images (one val measurement after each), taken from one endless stream of shuffles
   of the training set that every network reads in turn, so it means the same however big the dataset is;
 - Lloyd steps, per depth (--lloyd-threshold, --lloyd-patience): the val mse before the depth less after n steps'
-  split;
+  split. A depth tries at most as many steps as the most any of the last --lloyd-lookback (10) depths chose, one
+  more on a --lloyd-explore (20%) share of depths (drawn from the seed and the depth, so a replay draws the same),
+  so the cap can grow again: deep down, where one step is chosen, the steps past it are rarely trained at all;
 - depths (--depth-threshold, --depth-patience): the val mse at the root less after n depths.
 
 So each threshold is in val mse per pixel per epoch, per step and per depth. By default the depth threshold is 0:
@@ -47,6 +49,7 @@ import copy
 import json
 import math
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -101,6 +104,10 @@ def main():
     p.add_argument("--depth-patience", type=int, default=20,
                    help="depths tried past the best before stopping (one depth's val gain is noisy deep down)")
     p.add_argument("--lloyd-patience", type=int, default=2, help="steps tried past a depth's best before moving on")
+    p.add_argument("--lloyd-lookback", type=int, default=10,
+                   help="a depth tries at most the most steps any of this many depths before it chose (0: no cap)")
+    p.add_argument("--lloyd-explore", type=float, default=0.2,
+                   help="the share of depths that may try one step more than the cap, so it can grow")
     p.add_argument("--epoch-patience", type=int, default=2, help="epochs trained past a network's best")
     p.add_argument("--init-patience", type=int, default=1,
                    help="epochs trained past the best for a network that starts from the init run's (already trained "
@@ -367,7 +374,13 @@ def main():
         best_split: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None = None
         first_trained = None
         exact_step = exact
-        for t in range(args.max_steps):
+        cap = args.max_steps
+        if args.lloyd_lookback > 0 and len(chosen_steps) >= args.lloyd_lookback:
+            cap = max(chosen_steps[-args.lloyd_lookback:])
+            if random.Random(args.seed * 1_000_003 + d).random() < args.lloyd_explore:  # (the same draw on a replay)
+                cap += 1
+            cap = min(cap, args.max_steps)
+        for t in range(cap):
             timing = dict(train=0.0, val=0.0, other=0.0)
             t_other = time.time()
             mine = model_path(out, d, t)
