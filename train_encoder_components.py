@@ -7,11 +7,11 @@ network above it frozen) and is then frozen itself. Three counts are each chosen
 maximizing (val mse gain after n) * (1 - discount) ** n - threshold * n, giving up once n passes the best by a
 patience (so one more must buy the threshold, and that share of what the n before it bought):
 
-- epochs, per network (--epoch-discount 1%, --epoch-patience): the gain is the val mse after the step's split,
+- epochs, per network (--epoch-discount 0.5%, --epoch-patience): the gain is the val mse after the step's split,
   under the network at its start less under it after n epochs; the network kept is the best epoch's. An epoch is
   --images-per-epoch training images (one val measurement after each), taken from one endless stream of shuffles
   of the training set that every network reads in turn, so it means the same however big the dataset is;
-- Lloyd steps, per depth (--lloyd-discount 10%, --lloyd-patience): the val mse before the depth less after n steps'
+- Lloyd steps, per depth (--lloyd-discount 5%, --lloyd-patience): the val mse before the depth less after n steps'
   split. A depth tries at most as many steps as the most any of the last --lloyd-lookback (100) depths chose, one
   more on a --lloyd-explore (20%) share of depths (drawn from the seed and the depth, so a replay draws the same),
   so the cap can grow again: deep down, where one step is chosen, the steps past it are rarely trained at all;
@@ -102,10 +102,10 @@ def main():
                    help="val mse per pixel a depth must buy (0: grow until val mse stops improving)")
     p.add_argument("--lloyd-threshold", type=float, default=0.0, help="val mse per pixel a Lloyd step must buy")
     p.add_argument("--epoch-threshold", type=float, default=0.0, help="val mse per pixel an epoch must buy")
-    p.add_argument("--lloyd-discount", type=float, default=0.1,
+    p.add_argument("--lloyd-discount", type=float, default=0.05,
                    help="a depth keeps the n steps maximizing its gain * (1 - this) ** n: one more must add this "
                         "share of the gain so far (1 / (1 - this) - 1 of it)")
-    p.add_argument("--epoch-discount", type=float, default=0.01,
+    p.add_argument("--epoch-discount", type=float, default=0.005,
                    help="a network keeps the epoch e maximizing its gain * (1 - this) ** e")
     p.add_argument("--depth-patience", type=int, default=20,
                    help="depths tried past the best before stopping (one depth's val gain is noisy deep down)")
