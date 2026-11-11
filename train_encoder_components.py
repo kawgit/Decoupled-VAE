@@ -246,7 +246,7 @@ def main():
     exact = old is not None  # every network so far is the init run's, reused as it is
     chosen_steps: list[int] = []
     depth_gains: list[float] = []  # val mse at the root less after each depth
-    offset = 0.0  # (--resume: the old run's seconds for the depths replayed)
+    offset = 0.0  # (the init run's seconds for the depths reused from it: a run's clock counts its whole lineage)
     gen = torch.Generator().manual_seed(args.seed)
     stream = ImageStream(N, gen)  # (every network's epochs, in turn)
     epoch_steps = max(1, round(args.images_per_epoch / args.batch))
@@ -485,7 +485,7 @@ def main():
                            else root_val - now["val"])
         k_best = best_count(depth_gains, args.depth_threshold)
         timing_depth["other"] += time.time() - t_other
-        if args.resume and exact and d in old_depths:  # (replayed: the old run's clock)
+        if replayed:  # (reused whole: the init run's clock, so hours count every depth's training, not its replay)
             offset = old_depths[d]["seconds"] - (time.time() - began)
         elapsed = time.time() - began + offset
         busy = util.mean(depth_began)
