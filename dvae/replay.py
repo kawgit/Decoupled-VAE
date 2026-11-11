@@ -73,8 +73,23 @@ class TreeReplay:
         """For inputs X [B, D]: each depth's children offsets [B, K, 2, D] (half precision; the common side's
         -m r, then the rare side's r) and the tokens taken [B, K] (1: the rare side): tokens [B, K] if given (the
         run's own codes, which the replay then follows), else the replay's own."""
+        offsets = torch.empty(len(X), self.K, 2, self.D, dtype=torch.half, device=self.device)
+        taken = self._replay(X, tokens, offsets)
+        return offsets, taken
+
+    @torch.no_grad()
+    def to_host(self, X: Tensor, tokens: Tensor | None = None) -> Tensor:
+        """As __call__'s offsets, but written depth by depth into host memory (pinned on CUDA), so a big chunk of
+        images (what keeps the GPU busy: the replay costs about the same per batch however many images it holds)
+        never needs all its offsets on the GPU at once."""
+        offsets = torch.empty(len(X), self.K, 2, self.D, dtype=torch.half,
+                              pin_memory=self.device.type == "cuda")
+        self._replay(X, tokens, offsets)
+        return offsets
+
+    def _replay(self, X: Tensor, tokens: Tensor | None, out: Tensor) -> Tensor:
         g = root_group("replay", X.to(self.device).float(), self.mean, self.window)
-        offsets, taken = [], []
+        taken = []
         follow = tokens.to(self.device).bool() if tokens is not None else None
         budget = float("inf")
         for d in range(self.K):
@@ -85,7 +100,9 @@ class TreeReplay:
                 if t + 1 < self.steps[d]:
                     hyper = next_hyperplane(r, m)
             rn, mn = r[g.node], m[g.node]
-            offsets.append(torch.stack([-mn[:, None] * rn, rn], 1).half())
+            out[:, d].copy_(torch.stack([-mn[:, None] * rn, rn], 1).half(), non_blocking=True)
             kept = descend(g, *hyper, r, m, budget, self.bits, None if follow is None else follow[:, d])
             taken.append(kept["side"].long())
-        return torch.stack(offsets, 1), torch.stack(taken, 1).to(self.device)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)  # (the copies into host memory are done)
+        return torch.stack(taken, 1).to(self.device)

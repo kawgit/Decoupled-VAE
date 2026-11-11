@@ -75,6 +75,9 @@ def main():
                         "instead of reading r from tree/ (automatic when the run kept none)")
     p.add_argument("--depths", type=int, default=None, help="tokens per code (default: the run's kept depths)")
     p.add_argument("--node-batch", type=int, default=4096, help="nodes per forward pass of the replay")
+    p.add_argument("--replay-chunk", type=int, default=512,
+                   help="images replayed at once into host memory, then trained on a batch at a time (the replay "
+                        "costs about the same per call however many images it holds; rounded to whole batches)")
     p.add_argument("--data-root", default="data")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--tf32", action="store_true")
@@ -118,8 +121,23 @@ def main():
         constant = -freq.clamp_min(1e-6).log2().gather(1, codes.tokens.T).T
         return own_bits(codes).mean(0), constant.mean(0)
 
+    chunk = max(1, args.replay_chunk // args.batch) * args.batch
+
+    @torch.no_grad()
     def cost(model, codes: TreeCodes, split: str, rows=None):
-        return code_token_bits(model, offsets_of(codes, split, rows), codes.tokens, device, args.batch).mean(0)
+        if rp is None:
+            return code_token_bits(model, offsets_of(codes, split, rows), codes.tokens, device, args.batch).mean(0)
+        model.eval()  # (as code_token_bits, a chunk replayed at a time)
+        X = inputs[split] if rows is None else inputs[split][rows]
+        bits = []
+        for c in range(0, len(X), chunk):
+            host = rp.to_host(X[c:c + chunk], codes.tokens[c:c + chunk])
+            for i in range(0, len(host), args.batch):
+                tb = codes.tokens[c + i:c + i + args.batch].to(device)
+                logits = model(host[i:i + args.batch].to(device, non_blocking=True).float(), tb)
+                bits.append(F.cross_entropy(logits.flatten(0, 1).float(), tb.flatten(), reduction="none")
+                            .view(tb.shape).cpu() / LN2)
+        return torch.cat(bits).mean(0)
 
     own, constant = baselines(val)
     log(f"val baselines: the encoder's implied shares {describe(own)}")
@@ -163,7 +181,10 @@ def main():
             idx = order[i:i + args.batch]
             tokens = train.tokens[idx].to(device, non_blocking=True)
             if rp is not None:
-                offsets, _ = rp(inputs["train"][idx], train.tokens[idx])
+                if i % chunk == 0:  # (the next chunk of this epoch's order, replayed at once)
+                    cidx = order[i:i + chunk]
+                    host = rp.to_host(inputs["train"][cidx], train.tokens[cidx])
+                offsets = host[i % chunk:i % chunk + args.batch].to(device, non_blocking=True)
             else:
                 offsets = train.offsets[idx].to(device, non_blocking=True)
             logits = prior(offsets.float(), tokens)
