@@ -463,7 +463,8 @@ def main():
             records["models"] = [r for r in records["models"] if (r["d"], r["t"]) != (d, t)]
             records["models"].append(dict(d=d, t=t, lineage=lineage, start=start_label, epochs=epochs,
                                           kept_epoch=kept_epoch, val_start=v0, val=after["val"],
-                                          train=after["train"], gain=gains[-1], seconds=timing, reused=reused))
+                                          train=after["train"], gain=gains[-1], reused=reused,
+                                          seconds=prior_rec["seconds"] if reused and prior_rec is not None else timing))
             step_gain = gains[-1] - (gains[-2] if t > 0 else 0.0)
             how = "reused" if reused else (f"{epochs} epochs (kept {kept_epoch}), from {start_label} "
                                            f"(val {v0:.6f})")
@@ -514,10 +515,12 @@ def main():
         elapsed = time.time() - began + offset
         busy = util.mean(depth_began)
         records["depths"] = [r for r in records["depths"] if r["d"] != d]
+        cost = dict(wall=time.time() - depth_began, timing=timing_depth, util=busy)
+        if replayed and old is not None:  # (reused whole: what training it took, not its replay)
+            cost = {k: old_depths[d].get(k, v) for k, v in cost.items()}
         records["depths"].append(dict(d=d, steps=best_n, tried=len(gains), gains=gains, val=now["val"],
                                       train=now["train"], test=now["test"], gain=depth_gains[-1] - (
-                                          depth_gains[-2] if d > 0 else 0.0), nodes=nodes, seconds=elapsed,
-                                      wall=time.time() - depth_began, timing=timing_depth, util=busy))
+                                          depth_gains[-2] if d > 0 else 0.0), nodes=nodes, seconds=elapsed, **cost))
         records["kept"] = k_best
         save_records()
         plot()
