@@ -1,16 +1,16 @@
-"""A second stage for a delta tree: a prior over its codes, p(token k is rare | tokens before it).
+"""A second stage for a delta tree: a prior over its codes, p(token k | tokens before it).
 
 The tree (stage 1) stays frozen, so every image has a fixed code, and at every node on its path the tree's
-split has fixed answers: the rare side's mean delta r and the ratio m. The prior reads a code's splits in order,
-one token per depth: that depth's split (r's direction and log length, and m) plus the side taken at the depth
-before (none at the root). Causal attention lets token k see its own split and everything earlier, but not its
-own side, which its head predicts as a logit. So one pass over a code trains every depth, the same as asking a
-network with a side head at each node in turn.
+split has fixed children: each child's centroid, an offset from the node's predicted mean (r for the rare side,
+-m r for the common one). The prior reads a code's nodes in order, one token per depth: that node's children plus
+the token taken at the depth before (none at the root). Causal attention lets token k see its own node's children
+and everything earlier, but not its own token, which its head predicts as V logits. So one pass over a code
+trains every depth, the same as asking a network with a head at each node in turn.
 
-With images=True, each token also shows the two means it chooses between, as pictures: the node's predicted mean
-(the training mean plus the deltas before it) plus r (the rare side's) and minus m r (the common side's), as one
-two-channel 28x28 image read by a small convolutional net. That adds no information (both follow from the code
-so far) but puts it in a form where strokes are local, as a person comparing the two would see them.
+With images=True, each token also shows the children's centroids it chooses between, as pictures: the node's
+predicted mean (the training mean plus the offsets of the children taken before it) plus each child's offset, as
+one V-channel image read by a small convolutional net. That adds no information (they follow from the code so
+far) but puts it in a form where strokes are local, as a person comparing them would see them.
 """
 
 import math
@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from dvae.codes import LazyRows
 from dvae.deltatree import EPS, Block
 
 
@@ -27,54 +28,19 @@ class SideMeans(nn.Module):
     """Features [..., W] of the count side means [..., count, D] (two by default), read as a count-channel 28x28
     image."""
 
-    def __init__(self, width, channels=32, count=2):
+    def __init__(self, width, channels=32, count=2, shape=(1, 28, 28)):
         super().__init__()
         c = channels
-        self.count = count
-        self.net = nn.Sequential(nn.Conv2d(count, c, 3, stride=2, padding=1), nn.GELU(),  # 14 x 14
-                                 nn.Conv2d(c, 2 * c, 3, stride=2, padding=1), nn.GELU(),  # 7 x 7
+        self.count, self.shape = count, tuple(shape)
+        C, H, W = self.shape
+        self.net = nn.Sequential(nn.Conv2d(count * C, c, 3, stride=2, padding=1), nn.GELU(),  # H / 2
+                                 nn.Conv2d(c, 2 * c, 3, stride=2, padding=1), nn.GELU(),  # H / 4
                                  nn.Conv2d(2 * c, 2 * c, 3, padding=1), nn.GELU(),
-                                 nn.Flatten(), nn.Linear(2 * c * 49, width))
+                                 nn.Flatten(), nn.Linear(2 * c * ((H + 3) // 4) * ((W + 3) // 4), width))
 
     def forward(self, images):
         lead = images.shape[:-2]
-        return self.net(images.reshape(-1, self.count, 28, 28)).reshape(*lead, -1)
-
-
-class SidePrior(nn.Module):
-    mean: Tensor  # [D] the tree's training mean, with images
-
-    def __init__(self, depths, width=256, layers=4, heads=4, dropout=0.0, D=784, images=False):
-        super().__init__()
-        self.config = dict(depths=depths, width=width, layers=layers, heads=heads, dropout=dropout, D=D,
-                           images=images)
-        self.split_in = nn.Linear(D + 2, width)
-        self.means_in = SideMeans(width) if images else None
-        if images:
-            self.register_buffer("mean", torch.zeros(D))
-        self.side_in = nn.Embedding(3, width)  # the side before: common, rare, or none (the root)
-        self.position = nn.Parameter(torch.randn(depths, width) * 0.02)
-        self.drop = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList(Block(width, heads, dropout) for _ in range(layers))
-        self.out_norm = nn.LayerNorm(width)
-        self.head = nn.Linear(width, 1)
-
-    def forward(self, r: Tensor, m: Tensor, rare: Tensor) -> Tensor:
-        """Logits [B, k] that each token is rare, for codes' splits r [B, k, D], m [B, k] and sides rare [B, k]
-        (bool; only those before each token are read, so the last may be anything)."""
-        B, k = m.shape
-        length = r.norm(dim=-1, keepdim=True).clamp_min(EPS)
-        before = torch.cat([rare.new_full((B, 1), 2, dtype=torch.long), rare[:, :-1].long()], 1)
-        h = self.split_in(torch.cat([r / length, length.log(), m[..., None]], -1)) + self.side_in(before)
-        if self.means_in is not None:
-            common = -m[..., None] * r
-            delta = torch.where(rare[..., None], r, common)  # dvae/codes.py's deltas
-            mu = self.mean + torch.cumsum(delta, 1) - delta  # each node's predicted mean, from the deltas before it
-            h = h + self.means_in(torch.stack([mu + r, mu + common], 2))
-        h = self.drop(h + self.position[:k])
-        for blk in self.blocks:
-            h, _ = blk(h, causal=True)
-        return self.head(self.out_norm(h))[..., 0]
+        return self.net(images.reshape(-1, self.count * self.shape[0], *self.shape[1:])).reshape(*lead, -1)
 
 
 def band_edges(depths, bands):
@@ -82,56 +48,10 @@ def band_edges(depths, bands):
     return [round(depths * i / bands) for i in range(bands + 1)]
 
 
-class BandedPrior(nn.Module):
-    """Several snapshots of one SidePrior, each answering for its own band of depths (edges [bands + 1]) and
-    snapshot[i] being band i's. Being causal, a band's snapshot only reads the codes up to the band's end."""
-
-    def __init__(self, priors: list[SidePrior], edges: list[int]):
-        super().__init__()
-        self.priors, self.edges = nn.ModuleList(priors), edges
-        self.config = priors[0].config
-
-    def forward(self, r: Tensor, m: Tensor, rare: Tensor) -> Tensor:
-        k = m.shape[1]
-        logits = m.new_zeros(m.shape)
-        for prior, lo, hi in zip(self.priors, self.edges, self.edges[1:]):
-            if lo < k:
-                hi = min(hi, k)
-                logits[:, lo:hi] = prior(r[:, :hi], m[:, :hi], rare[:, :hi])[:, lo:hi]
-        return logits
-
-
-def load_prior(ckpt, device):
-    """A trained prior from its checkpoint (train_prior.py's), in eval mode: a SidePrior, or with per-band early
-    stopping a BandedPrior of each band's kept snapshot."""
-    def snapshot(state):
-        prior = SidePrior(**ckpt["config"]).to(device)
-        prior.load_state_dict(state)
-        return prior
-
-    if "bands" not in ckpt:
-        return snapshot(ckpt["state_dict"]).eval()
-    priors = [snapshot(ckpt["states"][epoch]) for epoch in ckpt["band_epochs"]]
-    return BandedPrior(priors, ckpt["bands"]).eval()
-
-
-@torch.no_grad()
-def token_bits(prior: SidePrior | BandedPrior, rare: Tensor, m: Tensor, r: Tensor, device, batch=256) -> Tensor:
-    """The bits [N, K] each token of N codes (rare [N, K], m [N, K], r [N, K, D], on any device) costs under
-    the prior, on the CPU."""
-    prior.eval()
-    out = []
-    for i in range(0, len(rare), batch):
-        rb = rare[i:i + batch].to(device)
-        logits = prior(r[i:i + batch].to(device).float(), m[i:i + batch].to(device).float(), rb)
-        out.append(F.binary_cross_entropy_with_logits(logits, rb.float(), reduction="none").cpu() / math.log(2))
-    return torch.cat(out)
-
-
 class TokenPrior(nn.Module):
-    """A prior over a refining tree's codes (dvae/refine.py, dvae/codes.py's TokenCodes): p(token k | tokens
-    before it), V-way. Each token reads its node's V children (each centroid offset's direction and log length
-    plus a slot embedding, summed over the children) and the token before (none at the root); causal attention
+    """A prior over a tree's codes (dvae/codes.py's TreeCodes): p(token k | tokens before it), V-way. Each token
+    reads its node's V children (each centroid offset's direction and log length plus a slot embedding, summed
+    over the children) and the token before (none at the root); causal attention
     lets it see everything earlier but not its own token. It does not read the encoder's implied shares (they are
     train_prior.py's baseline); its head starts at zero, so an untrained prior is uniform. With images=True, each
     token also shows its children's centroids as images (the node's predicted mean plus each offset), one
@@ -139,13 +59,16 @@ class TokenPrior(nn.Module):
 
     mean: Tensor  # [D] the tree's training mean, with images
 
-    def __init__(self, depths, V=2, width=256, layers=4, heads=4, dropout=0.0, D=784, images=False):
+    def __init__(self, depths, V=2, width=256, layers=4, heads=4, dropout=0.0, D=784, images=False,
+                 shape=(1, 28, 28)):
         super().__init__()
+        shape = tuple(shape)
+        assert D == shape[0] * shape[1] * shape[2], (D, shape)
         self.config = dict(depths=depths, V=V, width=width, layers=layers, heads=heads, dropout=dropout, D=D,
-                           images=images)
+                           images=images, shape=shape)
         self.child_in = nn.Linear(D + 1, width)
         self.slot = nn.Parameter(torch.randn(V, width) * 0.02)
-        self.means_in = SideMeans(width, count=V) if images else None
+        self.means_in = SideMeans(width, count=V, shape=shape) if images else None
         if images:
             self.register_buffer("mean", torch.zeros(D))
         self.token_in = nn.Embedding(V + 1, width)  # the token before, or none (V, the root)
@@ -177,7 +100,8 @@ class TokenPrior(nn.Module):
 
 
 class BandedTokenPrior(nn.Module):
-    """BandedPrior for TokenPriors: snapshot i answers for band i's depths (edges [bands + 1])."""
+    """Several snapshots of one TokenPrior, each answering for its own band of depths (edges [bands + 1]) and
+    snapshot[i] being band i's. Being causal, a band's snapshot only reads the codes up to the band's end."""
 
     def __init__(self, priors: list[TokenPrior], edges: list[int]):
         super().__init__()
@@ -209,7 +133,7 @@ def load_token_prior(ckpt, device):
 
 
 @torch.no_grad()
-def code_token_bits(prior: TokenPrior | BandedTokenPrior, offsets: Tensor, tokens: Tensor, device,
+def code_token_bits(prior: TokenPrior | BandedTokenPrior, offsets: "Tensor | LazyRows", tokens: Tensor, device,
                     batch=256) -> Tensor:
     """The bits [N, K] each token of N codes costs under the prior (inputs as TokenPrior's, on any device), on
     the CPU."""

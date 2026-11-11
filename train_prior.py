@@ -1,8 +1,8 @@
-"""Stage 3: train the prior (dvae/prior.py's TokenPrior), a causal transformer over the encoder's codes that
-predicts each token (one of V children), on the codes dump_encoder.py wrote.
+"""Stage 2: train the prior (dvae/prior.py's TokenPrior), a causal transformer over the encoder's codes that
+predicts each token (one of V children), on the codes a train_encoder_components.py run keeps in its tree/ folder.
 
-The prior reads each node's children (their centroids) and the tokens before, not the shares the encoder's
-centroids imply (dvae/refine.py), and starts uniform; it is trained on cross-entropy alone. Each step takes a batch of
+The prior reads each node's children (their centroids) and the tokens before, not the shares the encoder implies
+(dvae/codes.py's TreeCodes), and starts uniform; it is trained on cross-entropy alone. Each step takes a batch of
 training codes and minimizes the cross-entropy of every token, all depths at once. Every epoch logs, in bits, the
 train codes' cost (a fixed subset, scored as val is) and the val codes' cost per image and per range of depths,
 beside two baselines the prior has to beat: the encoder's implied shares and the best constant share of each token
@@ -10,12 +10,12 @@ per depth (fit on the train codes). Early stopping watches the val cost separate
 --bands bands of depths (equal widths), since depths need different amounts of training: each band keeps the
 weights of the epoch with its lowest val cost, stops once it goes a --patience-frac share of the run's epochs (at least --patience) without
 a better one (dvae/stopping.py; the model still trains on every depth), and the run ends when every band has stopped. The kept prior answers each depth
-with its band's weights (dvae/prior.py's BandedPrior; --bands 1 is one early stop for all), and at the end it is
+with its band's weights (dvae/prior.py's BandedTokenPrior; --bands 1 is one early stop for all), and at the end it is
 scored on the test codes against the same baselines. The progress plot (dvae/plots.py's plot_prior) is redrawn
 every epoch.
 
-Run from the repo: python train_prior.py --codes artifacts/<dump job> --images
-Next: qa_prior.py samples from it; train_decoder.py can price its codes with it.
+Run from the repo: python train_prior.py --tree artifacts/<encoder job> --images
+Next: train_decoder.py --tree artifacts/<encoder job> --prior artifacts/<prior job>/prior.pt prices its codes with it.
 """
 
 import argparse
@@ -27,8 +27,8 @@ import torch
 import torch.nn.functional as F
 
 from dvae.artifacts import artifact
-from dvae.codes import TokenCodes, load_token_codes, own_bits
-from dvae.data import get_device
+from dvae.codes import TreeCodes, own_bits
+from dvae.data import SHAPES, get_device
 from dvae.logs import RunLog
 from dvae.plots import plot_prior
 from dvae.prior import TokenPrior, band_edges, code_token_bits, load_token_prior
@@ -49,7 +49,8 @@ def describe(per_token):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--codes", required=True, help="folder with dump_encoder.py's train.pt, val.pt and test.pt")
+    p.add_argument("--tree", required=True,
+                   help="a train_encoder_components.py run's folder, whose tree/ holds the codes")
     p.add_argument("--width", type=int, default=256)
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--heads", type=int, default=4)
@@ -80,25 +81,28 @@ def main():
     log(f"=== train_prior.py {vars(args)}")
 
     began = time.time()
-    train, val, test = (load_token_codes(os.path.join(args.codes, f"{s}.pt")) for s in ("train", "val", "test"))
+    train, val, test = (TreeCodes(args.tree, s) for s in ("train", "val", "test"))
     N, K, V = len(train), train.depths, train.V
     log(f"codes: {N} train, {len(val)} val, {len(test)} test, {K} tokens of {V} children, from {train.ckpt} "
         f"({time.time() - began:.0f}s to load)")
 
     freq = torch.zeros(K, V).scatter_add_(1, train.tokens.T, torch.ones(K, N)) / N  # each token's share per depth
 
-    def baselines(codes: TokenCodes):
+    def baselines(codes: TreeCodes):
         constant = -freq.clamp_min(1e-6).log2().gather(1, codes.tokens.T).T
         return own_bits(codes).mean(0), constant.mean(0)
 
-    def cost(model, codes: TokenCodes):
+    def cost(model, codes: TreeCodes):
         return code_token_bits(model, codes.offsets, codes.tokens, device, args.batch).mean(0)
 
     own, constant = baselines(val)
     log(f"val baselines: the encoder's implied shares {describe(own)}")
     log(f"val baselines: constant share per depth {describe(constant)}")
 
-    prior = TokenPrior(K, V, args.width, args.layers, args.heads, args.dropout, images=args.images).to(device)
+    D = int(train.mean.numel())
+    shape = next((sh for sh in SHAPES.values() if sh[0] * sh[1] * sh[2] == D), (1, 28, 28))
+    prior = TokenPrior(K, V, args.width, args.layers, args.heads, args.dropout, D=D, images=args.images,
+                       shape=shape).to(device)
     if args.images:  # the children's centroids are offsets from the predicted means, which start from the training mean
         prior.mean.copy_(train.mean.to(device))
     decay = [q for q in prior.parameters() if q.dim() >= 2]
@@ -153,7 +157,7 @@ def main():
             kept = [e for _, e in best]
             states = {e: w for e, w in states.items() if e in kept}
             torch.save(dict(config=prior.config, bands=edges, band_epochs=kept, states=states, args=vars(args),
-                            codes=args.codes, encoder=train.ckpt, epoch=epoch, history=history), args.out)
+                            codes=args.tree, encoder=train.ckpt, epoch=epoch, history=history), args.out)
         stopped = [done or stagnant(epoch, e, args) for done, (_, e) in zip(stopped, best)]
         plot_prior(history, edges, [e for _, e in best], args.plot)
         bands_now = ", ".join(f"{n}@{e}" + (" stopped" if done else "")

@@ -1,70 +1,69 @@
-"""The encoder's codes as dump_encoder.py writes them, and what the later stages read off them."""
+"""The encoder's codes as train_encoder_components.py keeps them, and what the later stages read off them."""
 
-from dataclasses import dataclass
+import copy
 
 import torch
 from torch import Tensor
 
 
-@dataclass
-class Codes:
-    """One split's codes: each image's sides rare [N, K] (bool), the encoder's m [N, K] and r [N, K, D] at
-    each node on its path (half precision), the digit labels [N], the training mean [D] (a node's predicted
-    mean is it plus the deltas so far) and the encoder checkpoint that made them."""
-    rare: Tensor
-    m: Tensor
-    r: Tensor
-    labels: Tensor
-    mean: Tensor
-    ckpt: str
+def take(values: Tensor, tokens: Tensor) -> Tensor:
+    """values [..., K, V, *rest] at tokens [..., K]: [..., K, *rest]."""
+    idx = tokens.reshape(*tokens.shape, 1, *([1] * (values.dim() - tokens.dim() - 1)))
+    return values.gather(tokens.dim(), idx.expand(*tokens.shape, 1, *values.shape[tokens.dim() + 1:])) \
+        .squeeze(tokens.dim())
+
+
+def own_bits(codes: "TreeCodes") -> Tensor:
+    """The bits [N, K] each token costs under the encoder's own shares."""
+    return -codes.taken_shares().float().clamp_min(1e-12).log2()
+
+
+class LazyRows:
+    """Rows computed on demand: rows[idx] (an index tensor or a slice) is fn(the image indices) [len, ...]."""
+
+    def __init__(self, n, fn):
+        self.n, self.fn = n, fn
 
     def __len__(self):
-        return len(self.rare)
+        return self.n
 
-    @property
-    def depths(self):
-        return self.rare.shape[1]
-
-    def subset(self, idx):
-        return Codes(self.rare[idx], self.m[idx], self.r[idx], self.labels[idx], self.mean, self.ckpt)
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            idx = torch.arange(self.n)[idx]
+        return self.fn(torch.as_tensor(idx))
 
 
-def load_codes(path) -> Codes:
-    c = torch.load(path, weights_only=False)
-    mean = c.get("mean")
-    if mean is None:  # dumps from before the mean was kept: the encoder's own
-        mean = torch.load(c["ckpt"], map_location="cpu", weights_only=False)["mean"]
-    return Codes(c["rare"], c["m"], c["r"], c["labels"], mean, c["ckpt"])
+class TreeCodes:
+    """One split's codes as train_encoder_components.py keeps them (tree/<split>/dDDD.pt in its folder):
+    tokens [N, K] (1: the rare side), the shares the encoder implies [N, K, 2] (common, rare), the children's
+    offsets rows offsets[idx] [b, K, 2, D] (half precision, gathered on demand from each depth's per-node r, so
+    no [N, K, 2, D] table is ever held), the training mean and the folder. K: the run's kept depths
+    (records.json's "kept") unless given."""
 
+    def __init__(self, folder, split, depths=None):
+        import json
+        import os
 
-def deltas(r: Tensor, m: Tensor, rare: Tensor) -> Tensor:
-    """Each token's delta [..., K, D]: r on the rare side, -m r on the common one."""
-    return torch.where(rare[..., None], r, -m[..., None] * r)
-
-
-def bits_of(p: Tensor, rare: Tensor) -> Tensor:
-    """The bits [...] each token costs when it is rare with probability p [...]."""
-    return -torch.where(rare, p, 1 - p).clamp_min(1e-12).log2()
-
-
-def own_shares(m: Tensor) -> Tensor:
-    """The encoder's own probability that a token is rare, p = m / (1 + m)."""
-    return m / (1 + m)
-
-
-@dataclass
-class TokenCodes:
-    """One split's codes from a refining tree (dvae/refine.py, dump_encoder.py): each image's tokens [N, K]
-    (long), the shares of every child at each node on its path [N, K, V] and those children's centroids as
-    offsets from the node's predicted mean [N, K, V, D] (half precision), the digit labels [N], the training mean
-    [D] (a node's predicted mean is it plus the offsets of the children taken so far) and the encoder checkpoint
-    that made them."""
-    tokens: Tensor
-    shares: Tensor
-    offsets: Tensor
-    labels: Tensor
-    mean: Tensor
-    ckpt: str
+        with open(os.path.join(folder, "records.json")) as f:
+            records = json.load(f)
+        K = depths or records["kept"]
+        self.folder, self.split, self.ckpt = folder, split, folder
+        self.mean = torch.tensor(records["mean"])
+        # (read whole, sequentially: rows gathered at random from a network file system would crawl)
+        files = [torch.load(os.path.join(folder, "tree", split, f"d{j:03d}.pt"), map_location="cpu",
+                            weights_only=False) for j in range(K)]
+        assert all(f["r"] is not None for f in files), f"{folder} kept no r for {split} (--no-store-train-r)"
+        N = len(files[0]["side"])
+        node, nodes, sides = torch.zeros(N, dtype=torch.long), [], []
+        for f in files:
+            nodes.append(node)
+            sides.append(f["side"].long())
+            node = f["node"].long()
+        self.node, self.tokens = torch.stack(nodes, 1), torch.stack(sides, 1)
+        self.r, self.m = [f["r"] for f in files], [f["m"].float() for f in files]
+        m = torch.stack([self.m[j][self.node[:, j]] for j in range(K)], 1)
+        self.shares = torch.stack([1 / (1 + m), m / (1 + m)], -1)
+        self.offsets = LazyRows(len(self.tokens), self._offsets)
 
     def __len__(self):
         return len(self.tokens)
@@ -75,34 +74,30 @@ class TokenCodes:
 
     @property
     def V(self):
-        return self.shares.shape[2]
+        return 2
+
+    def _offsets(self, idx):
+        out = []
+        for j in range(self.depths):
+            at = self.node[idx, j]
+            r, m = self.r[j][at].float(), self.m[j][at]
+            out.append(torch.stack([-m[:, None] * r, r], 1))
+        return torch.stack(out, 1).half()
+
+    def deltas(self, idx, k=None) -> Tensor:
+        """Each token's delta [b, k, D] (half precision): r on the rare side, -m r on the common one."""
+        out = []
+        for j in range(k or self.depths):
+            at = self.node[idx, j]
+            r, m = self.r[j][at].float(), self.m[j][at]
+            out.append(torch.where(self.tokens[idx, j, None].bool(), r, -m[:, None] * r))
+        return torch.stack(out, 1).half()
 
     def subset(self, idx):
-        return TokenCodes(self.tokens[idx], self.shares[idx], self.offsets[idx], self.labels[idx], self.mean,
-                          self.ckpt)
-
-    def taken(self, chunk=4096) -> Tensor:
-        """Each token's delta [N, K, D] (half precision): the offset of the child it took."""
-        return torch.cat([take(self.offsets[i:i + chunk], self.tokens[i:i + chunk])
-                          for i in range(0, len(self), chunk)])
+        sub = copy.copy(self)
+        sub.node, sub.tokens, sub.shares = self.node[idx], self.tokens[idx], self.shares[idx]
+        sub.offsets = LazyRows(len(sub.tokens), sub._offsets)
+        return sub
 
     def taken_shares(self) -> Tensor:
-        """Each token's share [N, K]."""
         return take(self.shares, self.tokens)
-
-
-def take(values: Tensor, tokens: Tensor) -> Tensor:
-    """values [..., K, V, *rest] at tokens [..., K]: [..., K, *rest]."""
-    idx = tokens.reshape(*tokens.shape, 1, *([1] * (values.dim() - tokens.dim() - 1)))
-    return values.gather(tokens.dim(), idx.expand(*tokens.shape, 1, *values.shape[tokens.dim() + 1:])) \
-        .squeeze(tokens.dim())
-
-
-def load_token_codes(path) -> TokenCodes:
-    c = torch.load(path, weights_only=False)
-    return TokenCodes(c["tokens"], c["shares"], c["offsets"], c["labels"], c["mean"], c["ckpt"])
-
-
-def own_bits(codes: TokenCodes) -> Tensor:
-    """The bits [N, K] each token costs under the encoder's own shares."""
-    return -codes.taken_shares().float().clamp_min(1e-12).log2()
