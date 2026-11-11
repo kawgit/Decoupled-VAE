@@ -1,5 +1,6 @@
 """Training progress plots: the inner encoder's (redrawn every depth) and the prior's (every epoch)."""
 
+import math
 import os
 
 import matplotlib
@@ -105,24 +106,24 @@ def plot_components(records, path, pairs=None):
         if K > kept:
             by_depth.plot(range(kept, K + 1), ys[kept:], color=color, linewidth=1.2, linestyle="--", marker="o",
                           markersize=2.5, alpha=0.6)
-    px = "val_px" in depths[0]  # (an inner run on an outer run's latents: also its pixel mse, decoded)
-    if px:
-        for split in ("val", "test"):
-            ys = [root[f"{split}_px"]] + [h[f"{split}_px"] for h in depths]
-            by_depth.plot(range(0, K + 1), ys, color=COMPONENT_COLORS[split], linewidth=1.2, linestyle=":",
-                          label=f"{split}, decoded to pixels")
+    px = [split for split in COMPONENT_COLORS if f"{split}_px" in depths[0]]  # (on an outer run's latents: decoded)
+    for split in px:
+        ys = [root.get(f"{split}_px", math.nan)] + [h[f"{split}_px"] for h in depths]
+        by_depth.plot(range(0, K + 1), ys, color=COMPONENT_COLORS[split], linewidth=1.4, linestyle=":",
+                      label=f"{split}, decoded to pixels")
     by_depth.xaxis.set_major_locator(MaxNLocator(integer=True))
     _log_y(by_depth)
     by_depth.legend(frameon=False, labelcolor=INK)
     best = depths[kept - 1] if kept else depths[-1]
-    _style(by_depth, f"Mse by code length ({kept} kept: val {best['val']:.5f}, test {best['test']:.5f}"
-           + (f"; pixels {best['val_px']:.5f}, {best['test_px']:.5f})" if px else ")"), "tokens", "mse")
+    _style(by_depth, f"Mse by code length ({kept} kept: val {best['val']:.5f}"
+           + (f", in pixels {best['val_px']:.5f})" if "val_px" in best else f", test {best['test']:.5f})"), "tokens", "mse")
 
     hours = [h["seconds"] / 3600 for h in depths]
-    by_hour.plot(hours, [h["val"] for h in depths], color=COMPONENT_COLORS["val"], linewidth=1.6, marker="o",
-                 markersize=3, label="this run, val")
-    by_hour.plot(hours, [h["train"] for h in depths], color=COMPONENT_COLORS["train"], linewidth=1.2, marker="o",
-                 markersize=2.5, label="this run, train")
+    for split, color in COMPONENT_COLORS.items():
+        by_hour.plot(hours, [h[split] for h in depths], color=color, linewidth=1.6, label=split)
+    for split in px:
+        by_hour.plot(hours, [h[f"{split}_px"] for h in depths], color=COMPONENT_COLORS[split], linewidth=1.4,
+                     linestyle=":", label=f"{split}, decoded to pixels")
     by_hour.xaxis.set_major_locator(MaxNLocator(5))
     _log_y(by_hour)
     by_hour.legend(frameon=False, labelcolor=INK, fontsize=8)

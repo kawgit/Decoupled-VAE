@@ -173,7 +173,7 @@ def main():
                    help="a train_outer.py run: code its latents (latents.pt) instead of pixels; each depth also logs the "
                         "pixel mse of its reconstructions decoded by RUN's outer decoder")
     p.add_argument("--px-images", type=int, default=2000,
-                   help="with --outer: the val and test images whose decoded pixel mse each depth logs")
+                   help="with --outer: the train, val and test images whose decoded pixel mse each depth logs")
     p.add_argument("--flip", action="store_true",
                    help="train on the training images and their horizontal mirror images (val and test as they are)")
     p.add_argument("--limit-train", type=int, default=None)
@@ -241,7 +241,7 @@ def main():
 
     # (with --outer: the val and test images, and their reconstructions decoded to pixels, for pixel mse)
     images_px = {s: pixels(load_images(args.dataset, s, args.data_root)[:min(len(data[s]), args.px_images)]).to(device)
-                 for s in ("val", "test")} if lat is not None else {}  # (the first images the latents are of)
+                 for s in ("train", "val", "test")} if lat is not None else {}  # (the first images the latents are of)
 
     def as_pixels(s, R):
         """Split s's reconstructions (the data less its remainders R), as images."""
@@ -560,7 +560,8 @@ def main():
         wall = time.time() - depth_began
         log(f"depth {d}: {best_n} of {len(gains)} Lloyd steps; mse val {now['val']:.6f} (gain "
             f"{records['depths'][-1]['gain']:.2e}; best {k_best} depths), train {now['train']:.6f}, test "
-            f"{now['test']:.6f}" + (f" (pixels: val {now['val_px']:.6f}, test {now['test_px']:.6f})" if lat is not None
+            f"{now['test']:.6f}" + (f" (pixels: train {now['train_px']:.6f}, val {now['val_px']:.6f}, test "
+                                     f"{now['test_px']:.6f})" if lat is not None
                                      else "") + f"; nodes {nodes['train']} train, {nodes['val']} val; {wall:.0f}s: "
             f"{timing_depth['train']:.0f} train, {timing_depth['val']:.0f} val, {timing_depth['other']:.0f} other"
             + (f"; GPU {busy:.0f}% busy" if busy is not None else "") + f"; {elapsed / 3600:.2f} h in all")
