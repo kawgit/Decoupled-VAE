@@ -85,7 +85,7 @@ def plot_components(records, path, pairs=None):
         return
     args, kept, root = records["args"], records["kept"], records["root"]
     fig = plt.figure(figsize=(19, 12.5 if pairs is not None else 10))
-    grid = fig.add_gridspec(3 if pairs is not None else 2, 3, width_ratios=[3, 2, 3],
+    grid = fig.add_gridspec(3 if pairs is not None else 2, 3, width_ratios=[1, 1, 1],
                             height_ratios=[1, 1, 0.42] if pairs is not None else [1, 1])
     by_depth, by_hour, by_step = (fig.add_subplot(grid[0, i]) for i in range(3))
     gain_ax, steps_ax, time_ax = (fig.add_subplot(grid[1, i]) for i in range(3))
