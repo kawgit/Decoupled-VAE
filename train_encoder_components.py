@@ -12,7 +12,7 @@ patience (so one more must buy the threshold, and that share of what the n befor
   --images-per-epoch training images (one val measurement after each), taken from one endless stream of shuffles
   of the training set that every network reads in turn, so it means the same however big the dataset is;
 - Lloyd steps, per depth (--lloyd-discount 10%, --lloyd-patience): the val mse before the depth less after n steps'
-  split. A depth tries at most as many steps as the most any of the last --lloyd-lookback (10) depths chose, one
+  split. A depth tries at most as many steps as the most any of the last --lloyd-lookback (100) depths chose, one
   more on a --lloyd-explore (20%) share of depths (drawn from the seed and the depth, so a replay draws the same),
   so the cap can grow again: deep down, where one step is chosen, the steps past it are rarely trained at all;
 - depths (--depth-threshold 0, --depth-patience): the val mse at the root less after n depths.
@@ -109,7 +109,7 @@ def main():
     p.add_argument("--depth-patience", type=int, default=20,
                    help="depths tried past the best before stopping (one depth's val gain is noisy deep down)")
     p.add_argument("--lloyd-patience", type=int, default=2, help="steps tried past a depth's best before moving on")
-    p.add_argument("--lloyd-lookback", type=int, default=10,
+    p.add_argument("--lloyd-lookback", type=int, default=100,
                    help="a depth tries at most the most steps any of this many depths before it chose (0: no cap)")
     p.add_argument("--lloyd-explore", type=float, default=0.2,
                    help="the share of depths that may try one step more than the cap, so it can grow")
