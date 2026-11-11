@@ -60,15 +60,15 @@ def _bars(ax, xs, ys, color, label, bottom=None, log=False):
     ax.fill_between(xs, lo, [a + b for a, b in zip(lo, ys)], step="mid", color=color, linewidth=0, label=label)
 
 
-def _pair_grid(real, recon, per_row=6, gap=2, between=8):
-    """[n, C, H, W] images and their reconstructions as rows of per_row (real, reconstruction) pairs, [H', W', C]."""
+def _pair_grid(real, recon, gap=2, between=6):
+    """[n, C, H, W] images over their reconstructions: originals in the top row, each one's reconstruction under
+    it, [2H + gap, W', C]."""
     n, C, H, W = real.shape
-    rows, pair_w = -(-n // per_row), 2 * W + gap
-    grid = np.ones((rows * H + (rows - 1) * between, per_row * pair_w + (per_row - 1) * between, C))
+    grid = np.ones((2 * H + gap, n * W + (n - 1) * between, C))
     for i in range(n):
-        y, x = (i // per_row) * (H + between), (i % per_row) * (pair_w + between)
-        grid[y:y + H, x:x + W] = real[i].transpose(1, 2, 0)
-        grid[y:y + H, x + W + gap:x + pair_w] = recon[i].transpose(1, 2, 0)
+        x = i * (W + between)
+        grid[:H, x:x + W] = real[i].transpose(1, 2, 0)
+        grid[H + gap:, x:x + W] = recon[i].transpose(1, 2, 0)
     return grid.clip(0, 1)
 
 
@@ -84,9 +84,9 @@ def plot_components(records, path, pairs=None):
     if not depths:
         return
     args, kept, root = records["args"], records["kept"], records["root"]
-    fig = plt.figure(figsize=(19, 14.5 if pairs is not None else 10))
+    fig = plt.figure(figsize=(19, 12.5 if pairs is not None else 10))
     grid = fig.add_gridspec(3 if pairs is not None else 2, 3, width_ratios=[3, 2, 3],
-                            height_ratios=[1, 1, 0.9] if pairs is not None else [1, 1])
+                            height_ratios=[1, 1, 0.42] if pairs is not None else [1, 1])
     by_depth, by_hour, by_step = (fig.add_subplot(grid[0, i]) for i in range(3))
     gain_ax, steps_ax, time_ax = (fig.add_subplot(grid[1, i]) for i in range(3))
     if pairs is not None:
@@ -95,7 +95,7 @@ def plot_components(records, path, pairs=None):
         pair_ax.imshow(shown[..., 0] if shown.shape[-1] == 1 else shown, cmap="gray", vmin=0, vmax=1,
                        interpolation="nearest")
         pair_ax.set_axis_off()
-        pair_ax.set_title(f"Test images, each beside its reconstruction after {pairs['tokens']} tokens", loc="left",
+        pair_ax.set_title(f"Test images (top) and their reconstructions after {pairs['tokens']} tokens (bottom)", loc="left",
                           fontsize=11, color=INK)
     K = len(depths)
     for split, color in COMPONENT_COLORS.items():
