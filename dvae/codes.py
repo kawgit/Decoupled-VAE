@@ -40,7 +40,7 @@ class TreeCodes:
     no [N, K, 2, D] table is ever held), the training mean and the folder. K: the run's kept depths
     (records.json's "kept") unless given."""
 
-    def __init__(self, folder, split, depths=None):
+    def __init__(self, folder, split, depths=None, need_r=True):
         import json
         import os
 
@@ -52,7 +52,8 @@ class TreeCodes:
         # (read whole, sequentially: rows gathered at random from a network file system would crawl)
         files = [torch.load(os.path.join(folder, "tree", split, f"d{j:03d}.pt"), map_location="cpu",
                             weights_only=False) for j in range(K)]
-        assert all(f["r"] is not None for f in files), f"{folder} kept no r for {split} (--no-store-train-r)"
+        has_r = all(f["r"] is not None for f in files)
+        assert has_r or not need_r, f"{folder} kept no r for {split} (--no-store-train-r): use train_prior.py --replay"
         N = len(files[0]["side"])
         node, nodes, sides = torch.zeros(N, dtype=torch.long), [], []
         for f in files:
@@ -60,7 +61,7 @@ class TreeCodes:
             sides.append(f["side"].long())
             node = f["node"].long()
         self.node, self.tokens = torch.stack(nodes, 1), torch.stack(sides, 1)
-        self.r, self.m = [f["r"] for f in files], [f["m"].float() for f in files]
+        self.r, self.m = [f["r"] if has_r else None for f in files], [f["m"].float() for f in files]
         m = torch.stack([self.m[j][self.node[:, j]] for j in range(K)], 1)
         self.shares = torch.stack([1 / (1 + m), m / (1 + m)], -1)
         self.offsets = LazyRows(len(self.tokens), self._offsets)
@@ -79,8 +80,9 @@ class TreeCodes:
     def _offsets(self, idx):
         out = []
         for j in range(self.depths):
-            at = self.node[idx, j]
-            r, m = self.r[j][at].float(), self.m[j][at]
+            at, rj = self.node[idx, j], self.r[j]
+            assert rj is not None, "this tree kept no r: replay it (dvae/replay.py)"
+            r, m = rj[at].float(), self.m[j][at]
             out.append(torch.stack([-m[:, None] * r, r], 1))
         return torch.stack(out, 1).half()
 
@@ -88,8 +90,9 @@ class TreeCodes:
         """Each token's delta [b, k, D] (half precision): r on the rare side, -m r on the common one."""
         out = []
         for j in range(k or self.depths):
-            at = self.node[idx, j]
-            r, m = self.r[j][at].float(), self.m[j][at]
+            at, rj = self.node[idx, j], self.r[j]
+            assert rj is not None, "this tree kept no r: replay it (dvae/replay.py)"
+            r, m = rj[at].float(), self.m[j][at]
             out.append(torch.where(self.tokens[idx, j, None].bool(), r, -m[:, None] * r))
         return torch.stack(out, 1).half()
 

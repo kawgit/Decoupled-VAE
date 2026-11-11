@@ -14,6 +14,9 @@ with its band's weights (dvae/prior.py's BandedTokenPrior; --bands 1 is one earl
 scored on the test codes against the same baselines. The progress plot (dvae/plots.py's plot_prior) is redrawn
 every epoch.
 
+With --replay (automatic when the run kept no r), each batch's children offsets are computed by replaying the
+run's inner networks on its images (dvae/replay.py) instead of read from tree/, so a deep tree needs no stored r.
+
 Run from the repo: python train_prior.py --tree artifacts/<encoder job> --images
 """
 
@@ -31,13 +34,16 @@ from dvae.data import SHAPES, get_device
 from dvae.logs import RunLog
 from dvae.plots import plot_prior
 from dvae.prior import TokenPrior, band_edges, code_token_bits, load_token_prior
+from dvae.codes import LazyRows
+from dvae.replay import TreeReplay
 from dvae.stopping import add_patience_args, patience, stagnant
 
 LN2 = math.log(2)
 
 
 def bands(K):
-    return [(lo, min(hi, K)) for lo, hi in ((1, 8), (9, 16), (17, 32), (33, 64), (65, 128), (129, 256)) if lo <= K]
+    spans = [(1, 8)] + [(2 ** i + 1, 2 ** (i + 1)) for i in range(3, 20)]
+    return [(lo, min(hi, K)) for lo, hi in spans if lo <= K]
 
 
 def describe(per_token):
@@ -64,6 +70,12 @@ def main():
     add_patience_args(p)
     p.add_argument("--bands", type=int, default=8, help="bands of depths, each early-stopped on its own")
     p.add_argument("--train-eval", type=int, default=5000, help="train codes scored each epoch, beside val")
+    p.add_argument("--replay", action="store_true",
+                   help="compute each batch's children offsets by replaying the run's networks (dvae/replay.py) "
+                        "instead of reading r from tree/ (automatic when the run kept none)")
+    p.add_argument("--depths", type=int, default=None, help="tokens per code (default: the run's kept depths)")
+    p.add_argument("--node-batch", type=int, default=4096, help="nodes per forward pass of the replay")
+    p.add_argument("--data-root", default="data")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--tf32", action="store_true")
     p.add_argument("--device", default=None)
@@ -80,7 +92,22 @@ def main():
     log(f"=== train_prior.py {vars(args)}")
 
     began = time.time()
-    train, val, test = (TreeCodes(args.tree, s) for s in ("train", "val", "test"))
+    import json
+    with open(os.path.join(args.tree, "records.json")) as f:
+        run_args = json.load(f)["args"]
+    replay = args.replay or not run_args.get("store_train_r", True) or not run_args.get("store_eval_r", True)
+    train, val, test = (TreeCodes(args.tree, s, args.depths, need_r=not replay) for s in ("train", "val", "test"))
+    rp = TreeReplay(args.tree, device, train.depths, args.node_batch) if replay else None
+    inputs = {s: rp.inputs(s, args.data_root) for s in ("train", "val", "test")} if rp is not None else {}
+    if rp is not None:
+        log(f"replaying {args.tree}'s {train.depths} depths ({sum(rp.steps)} networks) for every batch")
+
+    def offsets_of(codes: TreeCodes, split: str, rows=None):
+        """codes' children offsets, read from tree/ or replayed (rows: which of split's inputs codes holds)."""
+        if rp is None:
+            return codes.offsets
+        X, replayer = (inputs[split] if rows is None else inputs[split][rows]), rp
+        return LazyRows(len(X), lambda idx: replayer(X[idx])[0])
     N, K, V = len(train), train.depths, train.V
     log(f"codes: {N} train, {len(val)} val, {len(test)} test, {K} tokens of {V} children, from {train.ckpt} "
         f"({time.time() - began:.0f}s to load)")
@@ -91,8 +118,8 @@ def main():
         constant = -freq.clamp_min(1e-6).log2().gather(1, codes.tokens.T).T
         return own_bits(codes).mean(0), constant.mean(0)
 
-    def cost(model, codes: TreeCodes):
-        return code_token_bits(model, codes.offsets, codes.tokens, device, args.batch).mean(0)
+    def cost(model, codes: TreeCodes, split: str, rows=None):
+        return code_token_bits(model, offsets_of(codes, split, rows), codes.tokens, device, args.batch).mean(0)
 
     own, constant = baselines(val)
     log(f"val baselines: the encoder's implied shares {describe(own)}")
@@ -100,6 +127,7 @@ def main():
 
     D = int(train.mean.numel())
     shape = next((sh for sh in SHAPES.values() if sh[0] * sh[1] * sh[2] == D), (1, 28, 28))
+    torch.manual_seed(args.seed)  # (the same start with or without a replay, whose networks drew from the generator)
     prior = TokenPrior(K, V, args.width, args.layers, args.heads, args.dropout, D=D, images=args.images,
                        shape=shape).to(device)
     if args.images:  # the children's centroids are offsets from the predicted means, which start from the training mean
@@ -114,6 +142,10 @@ def main():
     gen = torch.Generator().manual_seed(args.seed)
     seen = torch.randperm(N, generator=gen)[:args.train_eval]
     train_seen = train.subset(seen)
+    if rp is not None:  # (the replay gives the run's own codes: check, on a batch)
+        got = rp(inputs["train"][seen[:args.batch]])[1].cpu()
+        log(f"replayed codes match tree/'s: {(got == train_seen.tokens[:args.batch]).float().mean().item():.4%} of "
+            f"{got.numel()} tokens")
     edges = band_edges(K, args.bands)
     spans = list(zip(edges, edges[1:]))
     names = [f"{lo + 1}-{hi}" for lo, hi in spans]
@@ -130,7 +162,11 @@ def main():
         for i in range(0, N, args.batch):
             idx = order[i:i + args.batch]
             tokens = train.tokens[idx].to(device, non_blocking=True)
-            logits = prior(train.offsets[idx].to(device, non_blocking=True).float(), tokens)
+            if rp is not None:
+                offsets, _ = rp(inputs["train"][idx])
+            else:
+                offsets = train.offsets[idx].to(device, non_blocking=True)
+            logits = prior(offsets.float(), tokens)
             loss = F.cross_entropy(logits.flatten(0, 1), tokens.flatten())
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -142,7 +178,7 @@ def main():
             if step % 100 == 0:
                 log.detail(f"  step {step}: loss {loss.item() / LN2:.4f} bits/token")
         trained = time.time() - began
-        tr, va = cost(prior, train_seen), cost(prior, val)
+        tr, va = cost(prior, train_seen, "train", seen), cost(prior, val, "val")
         history.append(dict(epoch=epoch, train_loss=running / N / LN2, train=tr.tolist(), val=va.tolist(),
                             seconds=time.time() - began))
         improved = []
@@ -172,7 +208,7 @@ def main():
 
     kept = load_token_prior(torch.load(args.out, map_location=device, weights_only=False), device)
     own, constant = baselines(test)
-    te = cost(kept, test)
+    te = cost(kept, test, "test")
     log(f"kept epochs per band {', '.join(f'{n}@{e}' for n, (_, e) in zip(names, best))} (val "
         f"{sum(c for c, _ in best):.3f} bits/image), saved {args.out}")
     log(f"test: prior {describe(te)}")
