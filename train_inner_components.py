@@ -172,6 +172,8 @@ def main():
     p.add_argument("--outer", default=None, metavar="RUN",
                    help="a train_outer.py run: code its latents (latents.pt) instead of pixels; each depth also logs the "
                         "pixel mse of its reconstructions decoded by RUN's outer decoder")
+    p.add_argument("--px-images", type=int, default=2000,
+                   help="with --outer: the val and test images whose decoded pixel mse each depth logs")
     p.add_argument("--flip", action="store_true",
                    help="train on the training images and their horizontal mirror images (val and test as they are)")
     p.add_argument("--limit-train", type=int, default=None)
@@ -238,8 +240,8 @@ def main():
                               enabled=args.bf16 or args.fp16)
 
     # (with --outer: the val and test images, and their reconstructions decoded to pixels, for pixel mse)
-    images_px = {s: pixels(load_images(args.dataset, s, args.data_root)[:len(data[s])]).to(device)
-                 for s in ("val", "test")} if lat is not None else {}  # (the images the latents are of)
+    images_px = {s: pixels(load_images(args.dataset, s, args.data_root)[:min(len(data[s]), args.px_images)]).to(device)
+                 for s in ("val", "test")} if lat is not None else {}  # (the first images the latents are of)
 
     def as_pixels(s, R):
         """Split s's reconstructions (the data less its remainders R), as images."""
@@ -248,7 +250,7 @@ def main():
         return decode_latents(outer, lat, data[s][:len(R)] - R, amp)
 
     def pixel_mse():
-        return {f"{s}_px": (as_pixels(s, groups[s].R) - x).square().mean().item() for s, x in images_px.items()}
+        return {f"{s}_px": (as_pixels(s, groups[s].R[:len(x)]) - x).square().mean().item() for s, x in images_px.items()}
 
     def new_net():
         net = StepNet(args.width, args.layers, args.heads, not args.side_m_history, shape, args.dropout).to(device)

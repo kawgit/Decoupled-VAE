@@ -1,11 +1,12 @@
-"""MNIST (and CIFAR-10) as in-memory uint8 tensors, with a fixed train/val split."""
+"""MNIST, CIFAR-10 and ImageNet at 128 x 128 as in-memory uint8 tensors, with fixed train/val splits."""
 
 import os
 
 import torch
 from torchvision.datasets import CIFAR10, MNIST
 
-SHAPES = {"mnist": (1, 28, 28), "cifar10": (3, 32, 32)}  # each dataset's images: channels, height, width
+# each dataset's images: channels, height, width
+SHAPES = {"mnist": (1, 28, 28), "cifar10": (3, 32, 32), "imagenet128": (3, 128, 128)}
 NUM_VAL = 5000
 SPLIT_SEED = 0  # fixed so every stage sees the same train/val split
 
@@ -44,9 +45,14 @@ def _load_cifar(split, root):
 
 
 def load_images(dataset, split, root="data", device: str | torch.device = "cpu"):
-    """uint8 images of dataset ("mnist": [N, 28, 28]; "cifar10": [N, 3, 32, 32], channels first) for split in
-    {"train", "val", "test"} (val: a fixed 5000 of the training set)."""
+    """uint8 images of dataset ("mnist": [N, 28, 28]; "cifar10": [N, 3, 32, 32] and "imagenet128": [N, 3, 128, 128],
+    channels first) for split in {"train", "val", "test"} (val: a fixed 5000 of the training set; for imagenet128,
+    prepare_imagenet128.py's cache: 100k of ImageNet's training set, 10k of its validation set, 10k of its test set)."""
     if dataset == "mnist":
         return _load(split, root)[0].to(device)
+    if dataset == "imagenet128":
+        path = os.path.join(root, "imagenet128", f"{split}.pt")
+        assert os.path.exists(path), f"{path} missing: run prepare_imagenet128.py"
+        return torch.load(path, weights_only=False)["images"].to(device)
     assert dataset == "cifar10", dataset
     return _load_cifar(split, root)[0].to(device)

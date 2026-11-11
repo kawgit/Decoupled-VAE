@@ -1,6 +1,6 @@
 # Decoupled VAE: delta trees
 
-A compressor and generative model for images (CIFAR-10, and MNIST) whose code is a path down a binary tree. Each
+A compressor and generative model for images (CIFAR-10, MNIST, and ImageNet at 128 x 128) whose code is a path down a binary tree. Each
 token answers one yes/no question about the image: which side of a hyperplane it lies on. Every prefix of a code is
 a node, and a node decodes to a predicted mean image, so a code can be cut after any token and still decode.
 
@@ -151,10 +151,11 @@ So the two predictions serve different purposes:
 
 ### Stage 1: the outer encoder and decoder
 
-`train_outer.py` trains a convolutional autoencoder from images to a C x 8 x 8 latent (for CIFAR-10's 32 x 32), one
-per latent size in `--channels`, smallest first, on pixel mse with early stopping on val, and keeps the first whose
-val mse meets `--target-mse` (1e-4 by default): the most compact latent that is good enough. Its latents of every
-image go to `latents.pt`, standardized per channel and scaled to about a pixel's spread, so the inner encoder's
+`train_outer.py` trains a convolutional autoencoder from images to a C x h x w latent (`--downsample` 4: 8 x 8 for
+CIFAR-10's 32 x 32; 8: 16 x 16 for ImageNet's 128 x 128), one per latent size in `--channels`, smallest first, on
+pixel mse with early stopping on val, until each target in `--target-mse` (1e-4 by default; several, comma-separated)
+has the first, most compact size whose val mse meets it. Each target's latents of every image go to
+`latents_<target>.pt` (the first target's also to `latents.pt`), standardized per channel and scaled to about a pixel's spread, so the inner encoder's
 settings carry over. `train_inner_components.py --outer artifacts/<outer job>` then codes those latents, and logs
 each depth's pixel mse too, its reconstructions decoded by the outer decoder.
 
@@ -267,6 +268,7 @@ files go to `artifacts/<job>/`, named by `$DVAE_JOB` or else by the script and t
 
 ```bash
 python train_outer.py --dataset cifar10 --tf32 --bf16     # (optional)
+python prepare_imagenet128.py   # (for --dataset imagenet128: data/imagenet128/raw/download.sh's parquet files -> caches)
 python train_inner_components.py --dataset cifar10 --tf32 --bf16 --layers 4 --history-window 16 [--outer artifacts/<outer job>]
 python qa_inner_components.py --run artifacts/<inner job>
 python train_prior.py --tree artifacts/<inner job> --images --tf32
