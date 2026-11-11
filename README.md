@@ -191,11 +191,12 @@ an earlier run's network at the same (depth, step).
 maximizing (val mse gain after $n$) $\cdot (1 - \text{discount})^n - \text{threshold} \cdot n$, giving up once $n$
 passes the best by a patience (`--epoch-*`, `--lloyd-*`, `--depth-*`). By default steps and epochs are discounted
 (10% and 1%: one more step must raise the depth's gain by over 11%, one more epoch the network's by over 1%) and
-depths are not, with threshold 0, so the tree grows until val mse has gone 20 depths without a new low. A depth tries at most as many
-steps as the most any of the last 10 depths chose (one more on 20% of depths, so the cap can grow), so deep
-down, where one step is chosen, the steps past it are rarely trained. An epoch is `--images-per-epoch` training images (22,528 by default, with a val measurement
-after each), taken from one endless stream of shuffles of the training set that every network reads in turn, so
-an epoch means the same however big the dataset is (`--flip` doubles it with mirror images).
+depths are not, with threshold 0, so the tree grows until val mse has gone 20 depths without a new low. A depth
+tries at most as many steps as the most any of the last 10 depths chose (one more on 20% of depths, so the cap can
+grow), so deep down, where one step is chosen, the steps past it are rarely trained. An epoch is
+`--images-per-epoch` training images (22,528 by default, with a val measurement after each), taken from one endless
+stream of shuffles of the training set that every network reads in turn, so an epoch means the same however big the
+dataset is (`--flip` doubles it with mirror images).
 
 **Speed.** A node's history is its last `--history-window` deltas plus one token for the sum of those before, so
 a network's cost and the history tables stop growing with depth; the tables are 8-bit and stay on the GPU. An
