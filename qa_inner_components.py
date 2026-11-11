@@ -1,4 +1,4 @@
-"""QA for a train_encoder_components.py run: its saved networks replayed down the tree it kept, on every val image
+"""QA for a train_inner_components.py run: its saved networks replayed down the tree it kept, on every val image
 and on some train and test images, plus codes sampled with the encoder's own shares (each side rare with
 probability m / (1 + m)). Each depth asks about the start its step-0 network's checkpoint holds; for a depth whose
 checkpoint has none (runs from before starts were saved), the start is recomputed as the run found it, the top
@@ -12,7 +12,7 @@ codes after the same spread of lengths. mse.png: the replay's val mse (all val i
 beside the run's records, which the val replay matches exactly on the run's GPU type and precision (train too, for
 the depths replayed on every training image).
 
-Run from the repo: python qa_components.py --run artifacts/<job>   (pictures go to artifacts/<qa job>/)
+Run from the repo: python qa_inner_components.py --run artifacts/<job>   (pictures go to artifacts/<qa job>/)
 """
 
 import argparse
@@ -67,6 +67,7 @@ def main():
     with open(os.path.join(args.run, "records.json")) as f:
         rec = json.load(f)
     a = rec["args"]
+    assert not a.get("outer"), "qa_inner_components.py replays pixel runs only; --outer runs are not supported yet"
     K = args.depths or rec["kept"]
     steps = {r["d"]: r["steps"] for r in rec["depths"]}
     step_train = {(r["d"], r["t"]): r["train"] for r in rec["models"]}  # (each network's train mse after its split)

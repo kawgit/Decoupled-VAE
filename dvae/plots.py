@@ -1,4 +1,4 @@
-"""Training progress plots: the encoder's (redrawn every depth), the prior's and the decoder's (every epoch)."""
+"""Training progress plots: the inner encoder's (redrawn every depth) and the prior's (every epoch)."""
 
 import os
 
@@ -73,7 +73,7 @@ def _pair_grid(real, recon, gap=2, between=6):
 
 
 def plot_components(records, path, pairs=None):
-    """Save a train_encoder_components.py run's progress (its records.json): the train, val and test mse after
+    """Save a train_inner_components.py run's progress (its records.json): the train, val and test mse after
     every code length (the depths past the kept ones, tried for the depth patience, dashed); the val and train mse
     after the tree so far against hours; the
     cumulative val mse gain by Lloyd step at every depth (darker is deeper), each depth's chosen steps ringed;
@@ -105,12 +105,18 @@ def plot_components(records, path, pairs=None):
         if K > kept:
             by_depth.plot(range(kept, K + 1), ys[kept:], color=color, linewidth=1.2, linestyle="--", marker="o",
                           markersize=2.5, alpha=0.6)
+    px = "val_px" in depths[0]  # (an inner run on an outer run's latents: also its pixel mse, decoded)
+    if px:
+        for split in ("val", "test"):
+            ys = [root[f"{split}_px"]] + [h[f"{split}_px"] for h in depths]
+            by_depth.plot(range(0, K + 1), ys, color=COMPONENT_COLORS[split], linewidth=1.2, linestyle=":",
+                          label=f"{split}, decoded to pixels")
     by_depth.xaxis.set_major_locator(MaxNLocator(integer=True))
     _log_y(by_depth)
     by_depth.legend(frameon=False, labelcolor=INK)
     best = depths[kept - 1] if kept else depths[-1]
-    _style(by_depth, f"Mse by code length ({kept} kept: val {best['val']:.5f}, test {best['test']:.5f})",
-           "tokens", "mse")
+    _style(by_depth, f"Mse by code length ({kept} kept: val {best['val']:.5f}, test {best['test']:.5f}"
+           + (f"; pixels {best['val_px']:.5f}, {best['test_px']:.5f})" if px else ")"), "tokens", "mse")
 
     hours = [h["seconds"] / 3600 for h in depths]
     by_hour.plot(hours, [h["val"] for h in depths], color=COMPONENT_COLORS["val"], linewidth=1.6, marker="o",
@@ -204,26 +210,6 @@ def plot_prior(history, edges, kept, path):
         _style(ax, f"{split} codes: bits per token by band (dots: each band's kept epoch)", "epoch",
                "bits per token, mean over the band")
     axes[0].legend(frameon=False, fontsize=8, ncol=2, loc="lower left")
-    _save(fig, path)
-
-
-def plot_decoder(history, path):
-    """Save a decoder run's progress (train_decoder.py): the val and train pixel bits per
-    dimension by epoch, the best val marked. history holds dicts with "epoch", "val" and "train"."""
-    if not history:
-        return
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    epochs = [h["epoch"] for h in history]
-    for split, color in (("val", "#2a78d6"), ("train", "#86b6ef")):
-        ax.plot(epochs, [h[split] for h in history], color=color, linewidth=1.6, marker="o", markersize=3,
-                label=split)
-    val = [h["val"] for h in history]
-    best = min(range(len(val)), key=val.__getitem__)
-    ax.annotate(f"best val {val[best]:.4f}", (epochs[best], val[best]), textcoords="offset points", xytext=(0, 10),
-                ha="center", fontsize=9, color=INK)
-    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-    ax.legend(frameon=False)
-    _style(ax, "Pixel bits per dimension given the code", "epoch", "bits per dimension")
     _save(fig, path)
 
 

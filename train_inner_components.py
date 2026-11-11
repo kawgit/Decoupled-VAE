@@ -1,4 +1,5 @@
-"""Stage 1: train the encoder as frozen components, one network per (depth, Lloyd step) (dvae/components.py).
+"""Stage 2: train the inner encoder as frozen components, one network per (depth, Lloyd step) (dvae/components.py),
+on the pixels or, with --outer, on an outer run's latents (train_outer.py).
 
 The tree grows one depth at a time and each depth one Lloyd step at a time. Step 0 of a depth asks about the
 depth's start (the top principal direction of the training remainders there, through each node's predicted
@@ -41,8 +42,8 @@ test_pairs.pt, its sample test images and their reconstructions so far). Each
 network logs a line (epochs, its start, train and val mse, gains, seconds split into training, val and the
 rest), each depth a summary line with train, val and test mse and the GPU's utilization.
 
-Run from the repo: python train_encoder_components.py --dataset cifar10 --tf32 --bf16
-Next: train_prior.py and train_decoder.py on --tree artifacts/<job>.
+Run from the repo: python train_inner_components.py --dataset cifar10 --tf32 --bf16
+Next: train_prior.py --tree artifacts/<job>.
 """
 
 import argparse
@@ -67,6 +68,7 @@ from dvae.components import (ImageStream, StepNet, Utilization, answers, best_co
 from dvae.data import SHAPES, get_device, load_images  # noqa: E402
 from dvae.deltatree import pixels  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
+from dvae.outer import decode_latents, load_outer  # noqa: E402
 
 
 def atomic_save(obj, path):
@@ -167,6 +169,9 @@ def main():
     p.add_argument("--fp16", action="store_true",
                    help="float16 autocast with a gradient scaler (for V100s, which have fp16 tensor cores but no bf16)")
     p.add_argument("--hours", type=float, default=0.0, help="stop after this many hours (0: no limit)")
+    p.add_argument("--outer", default=None, metavar="RUN",
+                   help="a train_outer.py run: code its latents (latents.pt) instead of pixels; each depth also logs the "
+                        "pixel mse of its reconstructions decoded by RUN's outer decoder")
     p.add_argument("--flip", action="store_true",
                    help="train on the training images and their horizontal mirror images (val and test as they are)")
     p.add_argument("--limit-train", type=int, default=None)
@@ -189,7 +194,7 @@ def main():
     torch.backends.cudnn.allow_tf32 = args.tf32
     log = RunLog(os.path.join(out, "run.log"), device)
     util = Utilization(device)
-    log(f"=== train_encoder_components.py {time.strftime('%Y-%m-%d')} {vars(args)}")
+    log(f"=== train_inner_components.py {time.strftime('%Y-%m-%d')} {vars(args)}")
     began = time.time()
 
     old = None
@@ -199,7 +204,7 @@ def main():
         log(f"reusing {init}: {len(old['models'])} networks, {len(old['depths'])} depths")
     # (a network is reused as it is only if it would see exactly what it was trained on)
     same = ("dataset", "width", "layers", "heads", "side_m_history", "table_bits", "history_window", "limit_train",
-            "limit_val", "seed", "flip")
+            "limit_val", "seed", "flip", "outer")
     if old is not None:
         differ = [k for k in same if old["args"].get(k, parser_defaults.get(k)) != getattr(args, k)]
         if differ:
@@ -208,19 +213,42 @@ def main():
     old_models = {(r["d"], r["t"]): r for r in old["models"]} if old else {}
     old_depths = {r["d"]: r for r in old["depths"]} if old else {}
 
-    images = {s: load_images(args.dataset, s, args.data_root)[:lim]
-              for s, lim in (("train", args.limit_train), ("val", args.limit_val), ("test", args.limit_test))}
-    if args.flip:  # (the training images and their mirror images: twice the data for every network)
-        images["train"] = torch.cat([images["train"], images["train"].flip(-1)])
-    data = {s: pixels(x).to(device) for s, x in images.items()}
+    limits = (("train", args.limit_train), ("val", args.limit_val), ("test", args.limit_test))
+    outer, lat = load_outer(args.outer, device) if args.outer else (None, None)
+    if lat is not None:  # (the outer encoder's latents of the outer run's images, in their order)
+        assert not args.flip, "--flip with --outer: the latents are of the images as they are"
+        args.dataset = lat["dataset"]
+        data = {s: lat[s][:lim].float().flatten(1).to(device) for s, lim in limits}
+    else:
+        images = {s: load_images(args.dataset, s, args.data_root)[:lim] for s, lim in limits}
+        if args.flip:  # (the training images and their mirror images: twice the data for every network)
+            images["train"] = torch.cat([images["train"], images["train"].flip(-1)])
+        data = {s: pixels(x).to(device) for s, x in images.items()}
     mean = data["train"].mean(0)
     groups = {s: root_group(s, X, mean, args.history_window) for s, X in data.items()}
     train, val, test = groups["train"], groups["val"], groups["test"]
     N, D = train.R.shape
     total_memory = torch.cuda.get_device_properties(device).total_memory if device.type == "cuda" else 0
     budget = args.gpu_tables * total_memory
-    shape = SHAPES[args.dataset]
+    shape = tuple(lat["shape"]) if lat is not None else SHAPES[args.dataset]
     torch.manual_seed(args.seed)
+
+    def amp():
+        return torch.autocast(device.type, dtype=torch.bfloat16 if args.bf16 else torch.float16,
+                              enabled=args.bf16 or args.fp16)
+
+    # (with --outer: the val and test images, and their reconstructions decoded to pixels, for pixel mse)
+    images_px = {s: pixels(load_images(args.dataset, s, args.data_root)[:len(data[s])]).to(device)
+                 for s in ("val", "test")} if lat is not None else {}  # (the images the latents are of)
+
+    def as_pixels(s, R):
+        """Split s's reconstructions (the data less its remainders R), as images."""
+        if outer is None or lat is None:
+            return data[s][:len(R)] - R
+        return decode_latents(outer, lat, data[s][:len(R)] - R, amp)
+
+    def pixel_mse():
+        return {f"{s}_px": (as_pixels(s, groups[s].R) - x).square().mean().item() for s, x in images_px.items()}
 
     def new_net():
         net = StepNet(args.width, args.layers, args.heads, not args.side_m_history, shape, args.dropout).to(device)
@@ -233,7 +261,10 @@ def main():
         f"{budget / 2 ** 30:.1f} GB")
     root_val = mse_now(val)
     records: dict = dict(args=vars(args), mean=mean.cpu().tolist(), models=[], depths=[], kept=0,
-                         root=dict(train=mse_now(train), val=root_val, test=mse_now(test)))
+                         root=dict(train=mse_now(train), val=root_val, test=mse_now(test), **pixel_mse()))
+    if lat is not None:
+        log(f"coding {args.outer}'s latents {shape}; at the root (each latent the training mean) pixel mse "
+            f"val {records['root']['val_px']:.6f}, test {records['root']['test_px']:.6f}")
     def save_records():
         atomic_json(records, os.path.join(out, "records.json"))
 
@@ -500,10 +531,11 @@ def main():
         exact = exact and (first_trained is None or first_trained >= best_n)
         chosen_steps.append(best_n)
         prev_depth = states
-        now = dict(train=mse_now(train), val=mse_now(val), test=mse_now(test))
+        now = dict(train=mse_now(train), val=mse_now(val), test=mse_now(test), **pixel_mse())
         k = args.plot_pairs  # (run.png's sample test images beside their reconstructions so far)
-        atomic_save(dict(real=data["test"][:k].cpu(), recon=(data["test"][:k] - test.R[:k]).float().cpu(), shape=shape,
-                         tokens=d + 1), os.path.join(out, "test_pairs.pt"))
+        real = images_px["test"][:k] if lat is not None else data["test"][:k]
+        atomic_save(dict(real=real.cpu(), recon=as_pixels("test", test.R[:k]).float().cpu(),
+                         shape=SHAPES[args.dataset], tokens=d + 1), os.path.join(out, "test_pairs.pt"))
         # (a depth replayed whole counts as the init run measured it, as its steps do)
         replayed = exact and d in old_depths and old is not None
         depth_gains.append(old["root"]["val"] - old_depths[d]["val"] if replayed and old is not None
@@ -518,8 +550,7 @@ def main():
         cost = dict(wall=time.time() - depth_began, timing=timing_depth, util=busy)
         if replayed and old is not None:  # (reused whole: what training it took, not its replay)
             cost = {k: old_depths[d].get(k, v) for k, v in cost.items()}
-        records["depths"].append(dict(d=d, steps=best_n, tried=len(gains), gains=gains, val=now["val"],
-                                      train=now["train"], test=now["test"], gain=depth_gains[-1] - (
+        records["depths"].append(dict(d=d, steps=best_n, tried=len(gains), gains=gains, **now, gain=depth_gains[-1] - (
                                           depth_gains[-2] if d > 0 else 0.0), nodes=nodes, seconds=elapsed, **cost))
         records["kept"] = k_best
         save_records()
@@ -527,7 +558,8 @@ def main():
         wall = time.time() - depth_began
         log(f"depth {d}: {best_n} of {len(gains)} Lloyd steps; mse val {now['val']:.6f} (gain "
             f"{records['depths'][-1]['gain']:.2e}; best {k_best} depths), train {now['train']:.6f}, test "
-            f"{now['test']:.6f}; nodes {nodes['train']} train, {nodes['val']} val; {wall:.0f}s: "
+            f"{now['test']:.6f}" + (f" (pixels: val {now['val_px']:.6f}, test {now['test_px']:.6f})" if lat is not None
+                                     else "") + f"; nodes {nodes['train']} train, {nodes['val']} val; {wall:.0f}s: "
             f"{timing_depth['train']:.0f} train, {timing_depth['val']:.0f} val, {timing_depth['other']:.0f} other"
             + (f"; GPU {busy:.0f}% busy" if busy is not None else "") + f"; {elapsed / 3600:.2f} h in all")
         d_done = d
@@ -542,8 +574,9 @@ def main():
     if d_done >= first_d and (args.snapshot_every <= 0 or (d_done + 1) % args.snapshot_every != 0):
         save_state(d_done)
     plot(final=True)
-    log(f"the tree keeps {records['kept']} depths: val mse {records['depths'][records['kept'] - 1]['val']:.6f}, "
-        f"test {records['depths'][records['kept'] - 1]['test']:.6f}; {out}")
+    best = records["depths"][records["kept"] - 1]
+    log(f"the tree keeps {records['kept']} depths: val mse {best['val']:.6f}, test {best['test']:.6f}"
+        + (f" (pixels: val {best['val_px']:.6f}, test {best['test_px']:.6f})" if lat is not None else "") + f"; {out}")
 
 
 if __name__ == "__main__":

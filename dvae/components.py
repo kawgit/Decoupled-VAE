@@ -1,4 +1,4 @@
-"""A delta tree built from frozen components: one network per (depth, Lloyd step), train_encoder_components.py's.
+"""A delta tree built from frozen components: one network per (depth, Lloyd step), train_inner_components.py's.
 
 Once the networks above a step are frozen, everything the step sees is fixed: each image's node, each node's
 history and the hyperplane the step is asked about. So a step's network trains on a fixed set of nodes, each

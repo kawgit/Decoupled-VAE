@@ -1,5 +1,5 @@
 """Stage 2: train the prior (dvae/prior.py's TokenPrior), a causal transformer over the encoder's codes that
-predicts each token (one of V children), on the codes a train_encoder_components.py run keeps in its tree/ folder.
+predicts each token (one of V children), on the codes a train_inner_components.py run keeps in its tree/ folder.
 
 The prior reads each node's children (their centroids) and the tokens before, not the shares the encoder implies
 (dvae/codes.py's TreeCodes), and starts uniform; it is trained on cross-entropy alone. Each step takes a batch of
@@ -15,7 +15,6 @@ scored on the test codes against the same baselines. The progress plot (dvae/plo
 every epoch.
 
 Run from the repo: python train_prior.py --tree artifacts/<encoder job> --images
-Next: train_decoder.py --tree artifacts/<encoder job> --prior artifacts/<prior job>/prior.pt prices its codes with it.
 """
 
 import argparse
@@ -50,7 +49,7 @@ def describe(per_token):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--tree", required=True,
-                   help="a train_encoder_components.py run's folder, whose tree/ holds the codes")
+                   help="a train_inner_components.py run's folder, whose tree/ holds the codes")
     p.add_argument("--width", type=int, default=256)
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--heads", type=int, default=4)

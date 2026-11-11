@@ -4,14 +4,18 @@ A compressor and generative model for images (CIFAR-10, and MNIST) whose code is
 token answers one yes/no question about the image: which side of a hyperplane it lies on. Every prefix of a code is
 a node, and a node decodes to a predicted mean image, so a code can be cut after any token and still decode.
 
-The model is built in three stages, each a script that trains on the stage before's output and redraws a progress
-plot as it goes:
+The model is built in stages, each a script that trains on the stage before's output and redraws a progress plot
+as it goes. There are two layers of encoder and decoder. The **outer** encoder and decoder are a plain autoencoder
+that squeezes pixels into a compact continuous latent, not necessarily easy to model. The **inner** encoder turns
+that latent (or the pixels themselves, without an outer stage) into a discrete code that is easy to model with a
+prior; its node means are the inner decoding.
 
 | Stage | Script | What it learns |
 |---|---|---|
-| 1 | `train_encoder_components.py` (QA: `qa_components.py`) | the tree: where each node splits, and each node's mean image; it writes every image's code and the splits along it to its `tree/` folder |
-| 2 | `train_prior.py --tree` | which codes are valid: p(each token's side given the ones before) |
-| 3 | `train_decoder.py --tree` | p(image given its code), 256 levels per pixel value |
+| 1 (optional) | `train_outer.py` | the outer encoder and decoder: the most compact latent whose reconstructions meet a val mse target |
+| 2 | `train_inner_components.py` (QA: `qa_inner_components.py`) | the inner encoder as frozen components: where each node splits, and each node's mean; it writes every image's code and the splits along it to its `tree/` folder |
+| 3 (not built yet) | `train_inner.py` | one inner encoder distilled from the components |
+| 4 | `train_prior.py --tree` | which codes are valid: p(each token's side given the ones before) |
 
 ## Motivation
 
@@ -43,12 +47,13 @@ every time. If tokens are decided one at a time, a fixed order is the simplest c
 
 ![Generation, compression and decompression pipelines](docs/pipelines.png)
 
-- **Generation:** the prior samples every token, and the decoder draws an image from the code.
+- **Generation:** the prior samples every token, and the code's node mean (through the outer decoder, with one)
+  is the image.
 - **Compression:** the encoder writes the image's tokens, and the first $k$ are kept. With an entropy coder, each
   token costs about its bits under the prior.
-- **Decompression:** the prior fills in the dropped tokens given the first $k$, and the decoder draws an image
-  consistent with all of them. (`qa_components.py` decodes a $k$-token prefix as its node's predicted mean
-  instead.)
+- **Decompression:** the prior fills in the dropped tokens given the first $k$, and the full code decodes to an
+  image consistent with all of them. (`qa_inner_components.py` decodes a $k$-token prefix as its node's predicted
+  mean instead.)
 
 ### The encoder's objective: decompression loss
 
@@ -142,24 +147,18 @@ So the two predictions serve different purposes:
 - **The prior's is to learn which codes in that space are valid,** correcting the encoder's shares where they
   are wrong.
 
-### Why a separate decoder
-
-For a code, the encoder outputs a single image: its node's predicted mean. That is the best single guess under
-squared error. But a node still holds many images, so the mean is a blur of them, and a point estimate gives no
-likelihood to score.
-
-The decoder models $p(x \mid \text{code})$: a distribution over each pixel's 256 grey levels, given the code and
-its mean image.
-- **Likelihoods:** the whole model can then report bits per dimension.
-- **Sharp samples:** samples, or each pixel's most likely level, have sharp strokes where the mean is blurry.
-
-Keeping it separate leaves the codes alone. The encoder chooses its splits for the decompression loss, and the
-decoder is fit afterwards to the frozen codes, without pulling them toward whatever is easiest to model one pixel
-at a time. It does treat pixels as independent given the code, which is why its single draws look speckled.
-
 ## How it works
 
-### Stage 1: the encoder, as frozen components
+### Stage 1: the outer encoder and decoder
+
+`train_outer.py` trains a convolutional autoencoder from images to a C x 8 x 8 latent (for CIFAR-10's 32 x 32), one
+per latent size in `--channels`, smallest first, on pixel mse with early stopping on val, and keeps the first whose
+val mse meets `--target-mse` (1e-4 by default): the most compact latent that is good enough. Its latents of every
+image go to `latents.pt`, standardized per channel and scaled to about a pixel's spread, so the inner encoder's
+settings carry over. `train_inner_components.py --outer artifacts/<outer job>` then codes those latents, and logs
+each depth's pixel mse too, its reconstructions decoded by the outer decoder.
+
+### Stage 2: the inner encoder, as frozen components
 
 **Nodes and remainders.** Pixel values are their levels' bin centres, (level + 0.5) / 256. The root's predicted
 mean is the training mean; each token adds a delta, so a node's predicted mean is the training mean plus its
@@ -214,17 +213,17 @@ depth (recomputing the starts from replayed training images instead drifted 10% 
 **What a run keeps** (in `artifacts/<job>/`): `models/dDDD_sSS.pt` (every network trained; step 0's
 also holds the depth's start), `tree/<split>/dDDD.pt`
 (for train, val and test, each depth's chosen split: every node's $r$, $m$ and $b$, each image's side and next
-node, each next node's parent, side and key: what the prior and decoder read), `records.json` (every network's
+node, each next node's parent, side and key: what the prior reads), `records.json` (every network's
 and depth's numbers; `kept` is the depths in the tree), `run.log` and the plot `run.png`.
 
-`qa_components.py --run artifacts/<job>` replays the kept tree from the models alone (step 0's checkpoint holds
+`qa_inner_components.py --run artifacts/<job>` replays the kept tree from the models alone (step 0's checkpoint holds
 its depth's start) on every val image and some train and test images, and writes `compress_{train,val,test}.png`
 (images, then their reconstructions after a spread of code lengths), `samples.png` and `samples_by_depth.png`
 (codes sampled with the encoder's own shares), `real.png`, and `mse.png` (the replay's mse by depth beside the
 run's records, which the val replay matches exactly on the same GPU type). For a run from before starts were
 saved, it recomputes the missing ones from every training image once and writes them into the checkpoints.
 
-### Stage 2: the prior
+### Stage 4: the prior
 
 `train_prior.py --tree` trains a causal transformer that reads a code's splits in order, one token per depth,
 and predicts each token's side. Token $k$ sees its own split ($r$'s direction and length, and $m$), the side
@@ -235,13 +234,6 @@ Causal attention lets token $k$ see everything before it but not its own side, s
 every depth. Depths need different amounts of training, so early stopping runs separately in `--bands` bands of
 depths: each band keeps the weights of its own best val epoch, and the kept prior answers each depth with its
 band's weights.
-
-### Stage 3: the decoder
-
-`train_decoder.py --tree` trains $p(x \mid \text{code})$: 256 logits per pixel value from the code's history and
-its node's predicted mean image. It adds what the encoder's mean leaves out, each value's spread around it. Test
-images are then scored as $-\log_2 p(\text{code}) - \log_2 p(x \mid \text{code})$, the one-code upper bound on
-$-\log_2 p(x)$, with the code priced by the prior (`--prior`) or else by the encoder's own shares.
 
 ## Results so far (CIFAR-10)
 
@@ -261,7 +253,6 @@ The encoder, by the val mse of a code cut after its last kept token (test is wit
   depth: worth it per token, not per GPU hour.
 - **The prior** cannot yet beat the best constant share per depth on these codes (119.971 bits against 119.966 for
   120 tokens), so the codes look close to incompressible as they are.
-- **The decoder** on 520's 120-token codes scores 6.60 bits per dimension on the test set.
 
 Earlier results on MNIST, with the shared-network encoder, are in `git show 7de2210:README.md`.
 
@@ -275,10 +266,10 @@ The device is picked automatically (CUDA, then Apple's MPS, then the CPU); `--de
 files go to `artifacts/<job>/`, named by `$DVAE_JOB` or else by the script and the time.
 
 ```bash
-python train_encoder_components.py --dataset cifar10 --tf32 --bf16 --layers 4 --history-window 16
-python qa_components.py --run artifacts/<encoder job>
-python train_prior.py --tree artifacts/<encoder job> --images --tf32
-python train_decoder.py --tree artifacts/<encoder job> --prior artifacts/<prior job>/prior.pt --tf32
+python train_outer.py --dataset cifar10 --tf32 --bf16     # (optional)
+python train_inner_components.py --dataset cifar10 --tf32 --bf16 --layers 4 --history-window 16 [--outer artifacts/<outer job>]
+python qa_inner_components.py --run artifacts/<inner job>
+python train_prior.py --tree artifacts/<inner job> --images --tf32
 ```
 
 Type checking (pyright's basic mode) must end with 0 errors and 0 warnings:
@@ -312,7 +303,7 @@ GPUs there are exclusive-process: a holder runs one experiment at a time.
 | `dvae/deltatree.py` | the history-reading network the encoder's components build on, pixel values, node keys |
 | `dvae/codes.py` | reading an encoder run's `tree/` as codes, and their bits under the encoder's own shares |
 | `dvae/prior.py` | the prior's network, banded priors, and code costs under a prior |
-| `dvae/refine.py`, `dvae/decoder.py` | the decoder's network, its data, code and pixel bits |
+| `dvae/outer.py` | the outer encoder and decoder, and decoding latents to images |
 | `dvae/plots.py` | each stage's progress plot |
 | `dvae/stopping.py`, `dvae/data.py`, `dvae/artifacts.py`, `dvae/logs.py`, `dvae/viz.py` | early stopping, data, output folders, logs, image grids |
 | `scc/` | holders, the queue and helpers for BU's SCC |

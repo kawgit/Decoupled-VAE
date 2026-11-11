@@ -26,61 +26,19 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import torch  # noqa: E402
-import torch.nn as nn  # noqa: E402
 
 from dvae.artifacts import artifact  # noqa: E402
 from dvae.data import SHAPES, get_device, load_images  # noqa: E402
 from dvae.deltatree import pixels  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
+from dvae.outer import Outer  # noqa: E402
 from dvae.viz import save_grid  # noqa: E402
-
-
-class ResBlock(nn.Module):
-    def __init__(self, c):
-        super().__init__()
-        self.body = nn.Sequential(nn.GroupNorm(8, c), nn.GELU(), nn.Conv2d(c, c, 3, padding=1),
-                                  nn.GroupNorm(8, c), nn.GELU(), nn.Conv2d(c, c, 3, padding=1))
-
-    def forward(self, x):
-        return x + self.body(x)
-
-
-class Outer(nn.Module):
-    """The outer encoder (images [B, C_in, H, W] in [0, 1] -> latents [B, channels, H / 4, W / 4]) and decoder."""
-
-    def __init__(self, channels, width=64, image_channels=3):
-        super().__init__()
-        w = width
-        self.config = dict(channels=channels, width=width, image_channels=image_channels)
-        self.encoder = nn.Sequential(
-            nn.Conv2d(image_channels, w, 3, padding=1), ResBlock(w),
-            nn.Conv2d(w, 2 * w, 4, 2, 1), ResBlock(2 * w),  # (H / 2)
-            nn.Conv2d(2 * w, 4 * w, 4, 2, 1), ResBlock(4 * w), ResBlock(4 * w),  # (H / 4)
-            nn.GroupNorm(8, 4 * w), nn.GELU(), nn.Conv2d(4 * w, channels, 1))
-        self.decoder = nn.Sequential(
-            nn.Conv2d(channels, 4 * w, 3, padding=1), ResBlock(4 * w), ResBlock(4 * w),
-            nn.ConvTranspose2d(4 * w, 2 * w, 4, 2, 1), ResBlock(2 * w),
-            nn.ConvTranspose2d(2 * w, w, 4, 2, 1), ResBlock(w),
-            nn.GroupNorm(8, w), nn.GELU(), nn.Conv2d(w, image_channels, 3, padding=1))
-
-    def forward(self, x):
-        return self.decoder(self.encoder(x))
-
-
-def load_outer(folder, device):
-    """A train_outer.py run's chosen autoencoder and its latents.pt (latents and the scaling that undoes them)."""
-    lat = torch.load(os.path.join(folder, "latents.pt"), map_location="cpu", weights_only=False)
-    saved = torch.load(os.path.join(folder, f"outer_c{lat['channels']}.pt"), map_location=device, weights_only=False)
-    model = Outer(**saved["config"]).to(device)
-    model.load_state_dict(saved["state_dict"])
-    model.eval()
-    return model, lat
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--channels", default="1,2,4,8,16", help="latent channels to try, smallest first")
-    p.add_argument("--target-mse", type=float, default=1e-3, help="val pixel mse the chosen size must reach")
+    p.add_argument("--channels", default="4,8,12,16,24,32,48", help="latent channels to try, smallest first")
+    p.add_argument("--target-mse", type=float, default=1e-4, help="val pixel mse the chosen size must reach")
     p.add_argument("--width", type=int, default=64)
     p.add_argument("--batch", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)

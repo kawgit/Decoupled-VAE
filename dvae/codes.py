@@ -1,4 +1,4 @@
-"""The encoder's codes as train_encoder_components.py keeps them, and what the later stages read off them."""
+"""The encoder's codes as train_inner_components.py keeps them, and what the later stages read off them."""
 
 import copy
 
@@ -34,7 +34,7 @@ class LazyRows:
 
 
 class TreeCodes:
-    """One split's codes as train_encoder_components.py keeps them (tree/<split>/dDDD.pt in its folder):
+    """One split's codes as train_inner_components.py keeps them (tree/<split>/dDDD.pt in its folder):
     tokens [N, K] (1: the rare side), the shares the encoder implies [N, K, 2] (common, rare), the children's
     offsets rows offsets[idx] [b, K, 2, D] (half precision, gathered on demand from each depth's per-node r, so
     no [N, K, 2, D] table is ever held), the training mean and the folder. K: the run's kept depths
