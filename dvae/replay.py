@@ -2,8 +2,11 @@
 the codes (each depth's children offsets r and -m r, and the token taken), computed as needed instead of stored,
 since storing r for every training image at every depth of a deep tree would take hundreds of GB.
 
-Every kept step network is loaded once, onto the device; each depth's start is the one its step-0 checkpoint
-holds. On the run's own GPU type and precision the replay is exact (the codes match its tree files).
+Every kept step network is loaded once, onto the device (its weights in bfloat16 when the run computed in it, as
+its matrix products did anyway: half the memory); each depth's start is the one its step-0 checkpoint holds. A batch
+computes in other shapes than the run's passes over all its images, and in low precision that moves the last bits,
+enough to send an image near a split to the other side; given the run's own tokens, the replay follows them
+instead, so the codes are the run's and only the offsets are recomputed.
 """
 
 import json
@@ -41,6 +44,8 @@ class TreeReplay:
                 net = StepNet(**saved["config"]).to(device)
                 net.load_state_dict(saved["state_dict"])
                 net.bf16, net.fp16 = bf16, fp16
+                if bf16:  # (autocast multiplies in bfloat16 anyway)
+                    net.to(torch.bfloat16)
                 net.eval()
                 row.append(net)
             self.nets.append(row)
@@ -64,11 +69,13 @@ class TreeReplay:
         return SHAPES[self.args["dataset"]]
 
     @torch.no_grad()
-    def __call__(self, X: Tensor) -> tuple[Tensor, Tensor]:
+    def __call__(self, X: Tensor, tokens: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """For inputs X [B, D]: each depth's children offsets [B, K, 2, D] (half precision; the common side's
-        -m r, then the rare side's r) and the tokens taken [B, K] (1: the rare side)."""
+        -m r, then the rare side's r) and the tokens taken [B, K] (1: the rare side): tokens [B, K] if given (the
+        run's own codes, which the replay then follows), else the replay's own."""
         g = root_group("replay", X.to(self.device).float(), self.mean, self.window)
-        offsets, tokens = [], []
+        offsets, taken = [], []
+        follow = tokens.to(self.device).bool() if tokens is not None else None
         budget = float("inf")
         for d in range(self.K):
             hyper = (self.starts[d].expand(g.nodes, -1), g.R.new_zeros(g.nodes))
@@ -79,6 +86,6 @@ class TreeReplay:
                     hyper = next_hyperplane(r, m)
             rn, mn = r[g.node], m[g.node]
             offsets.append(torch.stack([-mn[:, None] * rn, rn], 1).half())
-            kept = descend(g, *hyper, r, m, budget, self.bits)
-            tokens.append(kept["side"].long())
-        return torch.stack(offsets, 1), torch.stack(tokens, 1).to(self.device)
+            kept = descend(g, *hyper, r, m, budget, self.bits, None if follow is None else follow[:, d])
+            taken.append(kept["side"].long())
+        return torch.stack(offsets, 1), torch.stack(taken, 1).to(self.device)

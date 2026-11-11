@@ -107,7 +107,7 @@ def main():
         if rp is None:
             return codes.offsets
         X, replayer = (inputs[split] if rows is None else inputs[split][rows]), rp
-        return LazyRows(len(X), lambda idx: replayer(X[idx])[0])
+        return LazyRows(len(X), lambda idx: replayer(X[idx], codes.tokens[idx])[0])  # (along the run's own codes)
     N, K, V = len(train), train.depths, train.V
     log(f"codes: {N} train, {len(val)} val, {len(test)} test, {K} tokens of {V} children, from {train.ckpt} "
         f"({time.time() - began:.0f}s to load)")
@@ -144,8 +144,8 @@ def main():
     train_seen = train.subset(seen)
     if rp is not None:  # (the replay gives the run's own codes: check, on a batch)
         got = rp(inputs["train"][seen[:args.batch]])[1].cpu()
-        log(f"replayed codes match tree/'s: {(got == train_seen.tokens[:args.batch]).float().mean().item():.4%} of "
-            f"{got.numel()} tokens")
+        log(f"replayed codes, left to themselves, match tree/'s on {(got == train_seen.tokens[:args.batch]).float().mean().item():.4%}"
+            f" of {got.numel()} tokens (low-precision rounding in other batch shapes); the replay follows tree/'s")
     edges = band_edges(K, args.bands)
     spans = list(zip(edges, edges[1:]))
     names = [f"{lo + 1}-{hi}" for lo, hi in spans]
@@ -163,7 +163,7 @@ def main():
             idx = order[i:i + args.batch]
             tokens = train.tokens[idx].to(device, non_blocking=True)
             if rp is not None:
-                offsets, _ = rp(inputs["train"][idx])
+                offsets, _ = rp(inputs["train"][idx], train.tokens[idx])
             else:
                 offsets = train.offsets[idx].to(device, non_blocking=True)
             logits = prior(offsets.float(), tokens)
