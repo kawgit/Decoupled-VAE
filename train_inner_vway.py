@@ -157,7 +157,7 @@ def main():
     def as_pixels(s, R):
         if outer is None or lat is None:
             return data[s][:len(R)] - R
-        return decode_latents(outer, lat, data[s][:len(R)] - R, amp)
+        return decode_latents(outer, lat, data[s][:len(R)] - R, amp, batch=250)  # (128 x 128 images: 1000 is 4 GB)
 
     def pixel_mse():
         return {f"{s}_px": (as_pixels(s, groups[s].R[:len(x)]) - x).square().mean().item() for s, x in images_px.items()}
@@ -310,6 +310,9 @@ def main():
                 break
             query = dict(train=c_tr, val=c_va)
         assert best_split is not None
+        empty_best = empty_share(best_split["train"][3])
+        # (the steps' [nodes, V, D] tensors that the split doesn't use: on ImageNet each is gigabytes)
+        del query, st_tr, st_va, c_tr, c_va, p_tr, p_va
         t_other = time.time()
         q_te = start.to(cdtype).expand(test.nodes, -1, -1).contiguous()
         c_te = p_te = q_te
@@ -327,6 +330,7 @@ def main():
             kept = vdescend(g, cells, c, pr, budget, args.table_bits)
             atomic_save(dict(V=V, c=c.half().cpu() if args.store_centroids else None, start=start.cpu(), **kept),
                         os.path.join(out, "tree", s, f"d{d:03d}.pt"))
+        del splits, best_split, q, c, pr, cells, q_te, c_te, p_te
         chosen_steps.append(best_n)
         prev_depth = states
         now = dict(train=mse_now(train), val=mse_now(val), test=mse_now(test), **pixel_mse())
@@ -341,7 +345,7 @@ def main():
         busy = util.mean(depth_began)
         records["depths"].append(dict(d=d, steps=best_n, tried=len(gains), gains=gains, **now,
                                       gain=depth_gains[-1] - (depth_gains[-2] if d > 0 else 0.0), nodes=nodes,
-                                      bits=(d + 1) * math.log2(V), empty=empty_share(best_split["train"][3]),
+                                      bits=(d + 1) * math.log2(V), empty=empty_best,
                                       empty_after=empty_after, seconds=elapsed, wall=time.time() - depth_began,
                                       timing=timing_depth, util=busy))
         records["kept"] = k_best
