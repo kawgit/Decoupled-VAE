@@ -96,6 +96,9 @@ def main():
     p.add_argument("--history-window", type=int, default=16)
     p.add_argument("--table-bits", type=int, choices=(8, 16), default=8)
     p.add_argument("--gpu-tables", type=float, default=0.75)
+    p.add_argument("--centroid-dtype", choices=("float32", "bfloat16"), default="float32",
+                   help="the dtype of every node's V centroids (the steps' queries and answers, [nodes, V, D] each): "
+                        "bfloat16 halves them, for large D (the split codes the rounded centroids)")
     p.add_argument("--save-models", action="store_true", help="keep every network in models/")
     p.add_argument("--store-centroids", action="store_true", help="keep every node's predicted means in tree/")
     p.add_argument("--plot-pairs", type=int, default=12)
@@ -141,6 +144,7 @@ def main():
     total_memory = torch.cuda.get_device_properties(device).total_memory if device.type == "cuda" else 0
     budget = args.gpu_tables * total_memory
     shape = tuple(lat["shape"]) if lat is not None else SHAPES[args.dataset]
+    cdtype = getattr(torch, args.centroid_dtype)
     torch.manual_seed(args.seed)
 
     def amp():
@@ -243,7 +247,7 @@ def main():
         start = pca_start(train.R, V)
         before = dict(train=mse_now(train), val=mse_now(val))
         lineage = ",".join(map(str, chosen_steps))
-        query = {s: start.expand(groups[s].nodes, -1, -1).contiguous() for s in ("train", "val")}
+        query = {s: start.to(cdtype).expand(groups[s].nodes, -1, -1).contiguous() for s in ("train", "val")}
         timing_depth["other"] += time.time() - t_other
         gains: list[float] = []
         states: dict[int, dict] = {}
@@ -307,7 +311,7 @@ def main():
             query = dict(train=c_tr, val=c_va)
         assert best_split is not None
         t_other = time.time()
-        q_te = start.expand(test.nodes, -1, -1).contiguous()
+        q_te = start.to(cdtype).expand(test.nodes, -1, -1).contiguous()
         c_te = p_te = q_te
         for t in range(best_n):
             net.load_state_dict(states[t])

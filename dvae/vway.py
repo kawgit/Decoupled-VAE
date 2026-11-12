@@ -56,6 +56,7 @@ class VStepNet(HistoryReader):
     def query(self, mems, q: Tensor) -> tuple[Tensor, Tensor]:
         """For V centroids q [B, V, D] at each of B nodes with memory mems: the cells' predicted means c [B, V, D]
         (their share-weighted mean 0) and shares p [B, V]."""
+        q = q.float()  # (the run may keep its centroids in bfloat16)
         length = q.norm(dim=-1, keepdim=True).clamp_min(EPS)
         with self.amp():
             h = self.centroid_in(torch.cat([q / length, length.log()], -1)) + self.slot
@@ -69,10 +70,13 @@ class VStepNet(HistoryReader):
 
 
 def cells_of(g: Group, q: Tensor, chunk=8192) -> Tensor:
-    """Each image's cell [N] (long): its nearest of its node's centroids q [Nn, V, D]."""
-    qq = q.square().sum(-1)
-    return torch.cat([(qq[g.node[i:i + chunk]] - 2 * torch.einsum("nd,nvd->nv", g.R[i:i + chunk], q[g.node[i:i + chunk]]))
-                      .argmin(-1) for i in range(0, len(g.R), chunk)])
+    """Each image's cell [N] (long): its nearest of its node's centroids q [Nn, V, D] (a chunk of images at a time,
+    so nothing of q's size is made)."""
+    cells = []
+    for i in range(0, len(g.R), chunk):
+        qi = q[g.node[i:i + chunk]].float()
+        cells.append((qi.square().sum(-1) - 2 * torch.einsum("nd,nvd->nv", g.R[i:i + chunk], qi)).argmin(-1))
+    return torch.cat(cells)
 
 
 def cell_stats(g: Group, q: Tensor, chunk=8192) -> tuple[Tensor, Tensor]:
@@ -100,22 +104,27 @@ def attraction_sse(c: Tensor, n: Tensor, total: Tensor) -> Tensor:
     return (n[:, None] * c.square().sum(-1) - 2 * (c * total[:, None]).sum(-1)).sum(-1)
 
 
-def vsplit_mse(g: Group, count: Tensor, total: Tensor, c: Tensor) -> float:
+def vsplit_mse(g: Group, count: Tensor, total: Tensor, c: Tensor, chunk=8192) -> float:
     """The mse per number after splitting g's nodes into the cells (count, total) with predicted means c, exactly:
-    each node's sum of squared remainders less sum over cells of (2 c . sum - n |c|^2)."""
+    each node's sum of squared remainders less sum over cells of (2 c . sum - n |c|^2) (a chunk of nodes at a time)."""
     assert g.stats is not None
-    sse = g.stats.sq.sum() - (2 * (c * total).sum(-1) - count * c.square().sum(-1)).sum()
+    sse = g.stats.sq.sum()
+    for i in range(0, len(c), chunk):
+        ci = c[i:i + chunk].float()
+        sse = sse - (2 * (ci * total[i:i + chunk]).sum(-1) - count[i:i + chunk] * ci.square().sum(-1)).sum()
     return sse.item() / (len(g.R) * g.R.shape[1])
 
 
 @torch.no_grad()
 def vanswers(net: VStepNet, g: Group, q: Tensor, batch=1024) -> tuple[Tensor, Tensor]:
-    """The network's predicted means c [Nn, V, D] and shares p [Nn, V] at every node of g, asked about q."""
+    """The network's predicted means c [Nn, V, D] (in q's dtype) and shares p [Nn, V] at every node of g, asked
+    about q."""
     net.eval()
-    c, p = torch.empty_like(q), q.new_empty(q.shape[:2])
+    c, p = torch.empty_like(q), torch.empty(q.shape[:2], device=q.device)
     for i in range(0, g.nodes, batch):
         nodes = torch.arange(i, min(i + batch, g.nodes), device=g.R.device)
-        c[nodes], p[nodes] = net.query(net.memory(*g.history(nodes)), q[nodes])
+        cn, p[nodes] = net.query(net.memory(*g.history(nodes)), q[nodes])
+        c[nodes] = cn.to(c.dtype)
     return c, p
 
 
@@ -145,7 +154,7 @@ def vdescend(g: Group, cells: Tensor, c: Tensor, p: Tensor, gpu_budget: float, t
     V = c.shape[1]
     children, node = torch.unique(g.node * V + cells, return_inverse=True)
     parent, token = children // V, children % V
-    delta = c[parent, token]
+    delta = c[parent, token].float()
     g.R = g.R - delta[node]
     device = g.R.device
     if table_bits == 8:
