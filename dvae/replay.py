@@ -69,35 +69,12 @@ class TreeReplay:
         return SHAPES[self.args["dataset"]]
 
     @torch.no_grad()
-    def __call__(self, X: Tensor, tokens: Tensor | None = None) -> tuple[Tensor, Tensor]:
-        """For inputs X [B, D]: each depth's children offsets [B, K, 2, D] (half precision; the common side's
-        -m r, then the rare side's r) and the tokens taken [B, K] (1: the rare side): tokens [B, K] if given (the
-        run's own codes, which the replay then follows), else the replay's own."""
-        offsets = torch.empty(len(X), self.K, 2, self.D, dtype=torch.half, device=self.device)
-        taken = self._replay(X, tokens, offsets)
-        return offsets, taken
-
-    @torch.no_grad()
-    def to_host(self, X: Tensor, tokens: Tensor | None = None) -> Tensor:
-        """As __call__'s offsets, but written depth by depth into host memory (pinned on CUDA), so a big chunk of
-        images (what keeps the GPU busy: the replay costs about the same per batch however many images it holds)
-        never needs all its offsets on the GPU at once."""
-        offsets = torch.empty(len(X), self.K, 2, self.D, dtype=torch.half,
-                              pin_memory=self.device.type == "cuda")
-        self._replay(X, tokens, offsets)
-        return offsets
-
-    @torch.no_grad()
     def into_store(self, X: Tensor, tokens: Tensor, store: "CompactStore", rows: Tensor):
-        """Replay X [B, D] along tokens [B, K], writing each depth's r (8-bit, a scale per row) and m into store's
-        rows [B] (host memory): what OffsetStore.offsets rebuilds the children offsets from."""
-        self._replay(X, tokens, None, (store, rows))
-
-    def _replay(self, X: Tensor, tokens: Tensor | None, out: Tensor | None, compact=None) -> Tensor:
+        """Replay X [B, D] along its tokens [B, K] (the run's own codes: at each depth every image goes to the side
+        its token says), writing each depth's r (8-bit, a scale per row) and m into store's rows [B] (host
+        memory), from which CompactStore.offsets rebuilds the children offsets."""
         g = root_group("replay", X.to(self.device).float(), self.mean, self.window)
-        taken = []
-        follow = tokens.to(self.device).bool() if tokens is not None else None
-        budget = float("inf")
+        follow = tokens.to(self.device).bool()
         for d in range(self.K):
             hyper = (self.starts[d].expand(g.nodes, -1), g.R.new_zeros(g.nodes))
             r = m = g.R.new_zeros(0)
@@ -106,19 +83,11 @@ class TreeReplay:
                 if t + 1 < self.steps[d]:
                     hyper = next_hyperplane(r, m)
             rn, mn = r[g.node], m[g.node]
-            if compact is not None:
-                store, rows = compact
-                scale = rn.abs().amax(-1).clamp_min(1e-12) / 127
-                store.r[rows, d] = (rn / scale[:, None]).round().to(torch.int8).cpu()
-                store.scale[rows, d] = scale.half().cpu()
-                store.m[rows, d] = mn.half().cpu()
-            elif out is not None:
-                out[:, d].copy_(torch.stack([-mn[:, None] * rn, rn], 1).half(), non_blocking=True)
-            kept = descend(g, *hyper, r, m, budget, self.bits, None if follow is None else follow[:, d])
-            taken.append(kept["side"].long())
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)  # (the copies into host memory are done)
-        return torch.stack(taken, 1).to(self.device)
+            scale = rn.abs().amax(-1).clamp_min(1e-12) / 127
+            store.r[rows, d] = (rn / scale[:, None]).round().to(torch.int8).cpu()
+            store.scale[rows, d] = scale.half().cpu()
+            store.m[rows, d] = mn.half().cpu()
+            descend(g, *hyper, r, m, float("inf"), self.bits, follow[:, d])
 
     @torch.no_grad()
     def sample(self, n: int, prior=None, generator: torch.Generator | None = None) -> tuple[Tensor, Tensor]:

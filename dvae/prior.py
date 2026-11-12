@@ -13,14 +13,11 @@ one V-channel image read by a small convolutional net. That adds no information 
 far) but puts it in a form where strokes are local, as a person comparing them would see them.
 """
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from dvae.codes import LazyRows
 from dvae.deltatree import EPS, Block
 
 
@@ -41,11 +38,6 @@ class SideMeans(nn.Module):
     def forward(self, images):
         lead = images.shape[:-2]
         return self.net(images.reshape(-1, self.count * self.shape[0], *self.shape[1:])).reshape(*lead, -1)
-
-
-def band_edges(depths, bands):
-    """bands + 1 depth indices cutting 0..depths into bands of (nearly) equal width."""
-    return [round(depths * i / bands) for i in range(bands + 1)]
 
 
 class TokenPrior(nn.Module):
@@ -99,49 +91,9 @@ class TokenPrior(nn.Module):
         return self.head(self.out_norm(h))
 
 
-class BandedTokenPrior(nn.Module):
-    """Several snapshots of one TokenPrior, each answering for its own band of depths (edges [bands + 1]) and
-    snapshot[i] being band i's. Being causal, a band's snapshot only reads the codes up to the band's end."""
-
-    def __init__(self, priors: list[TokenPrior], edges: list[int]):
-        super().__init__()
-        self.priors, self.edges = nn.ModuleList(priors), edges
-        self.config = priors[0].config
-
-    def forward(self, offsets: Tensor, tokens: Tensor) -> Tensor:
-        k = tokens.shape[1]
-        logits = offsets.new_zeros(offsets.shape[:3])
-        for prior, lo, hi in zip(self.priors, self.edges, self.edges[1:]):
-            if lo < k:
-                hi = min(hi, k)
-                logits[:, lo:hi] = prior(offsets[:, :hi], tokens[:, :hi])[:, lo:hi]
-        return logits
-
-
-def load_token_prior(ckpt, device):
-    """train_prior.py's checkpoint as a TokenPrior, or with per-band early stopping a BandedTokenPrior of each
-    band's kept snapshot, in eval mode."""
-    def snapshot(state):
-        prior = TokenPrior(**ckpt["config"]).to(device)
-        prior.load_state_dict(state)
-        return prior
-
-    if "bands" not in ckpt:
-        return snapshot(ckpt["state_dict"]).eval()
-    priors = [snapshot(ckpt["states"][epoch]) for epoch in ckpt["band_epochs"]]
-    return BandedTokenPrior(priors, ckpt["bands"]).eval()
-
-
-@torch.no_grad()
-def code_token_bits(prior: TokenPrior | BandedTokenPrior, offsets: "Tensor | LazyRows", tokens: Tensor, device,
-                    batch=256) -> Tensor:
-    """The bits [N, K] each token of N codes costs under the prior (inputs as TokenPrior's, on any device), on
-    the CPU."""
-    prior.eval()
-    out = []
-    for i in range(0, len(tokens), batch):
-        tb = tokens[i:i + batch].to(device)
-        logits = prior(offsets[i:i + batch].to(device).float(), tb)
-        out.append(F.cross_entropy(logits.flatten(0, 1).float(), tb.flatten(), reduction="none")
-                   .view(tb.shape).cpu() / math.log(2))
-    return torch.cat(out)
+def load_token_prior(ckpt, device) -> "TokenPrior":
+    """train_prior.py's checkpoint as a TokenPrior, in eval mode (an old checkpoint with one snapshot per band of
+    depths: its latest)."""
+    prior = TokenPrior(**ckpt["config"]).to(device)
+    prior.load_state_dict(ckpt["state_dict"] if "state_dict" in ckpt else ckpt["states"][max(ckpt["states"])])
+    return prior.eval()
