@@ -240,14 +240,27 @@ def main():
         big = count.sum(-1) >= 2 * V
         return (count[big] == 0).float().mean().item() if big.any() else 0.0
 
+    parts: dict[str, float] = {}  # (what a depth's "other" seconds went to, logged with it)
+
+    def part(name, t0):
+        """Add the seconds since t0 (after the GPU's queued work) to parts[name]; returns now."""
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t1 = time.time()
+        parts[name] = parts.get(name, 0.0) + t1 - t0
+        return t1
+
     for d in range(args.max_depths):
         depth_began = time.time()
         timing_depth = dict(train=0.0, val=0.0, other=0.0)
+        parts.clear()
         t_other = time.time()
         start = pca_start(train.R, V)
+        tp = part("start", t_other)
         before = dict(train=mse_now(train), val=mse_now(val))
         lineage = ",".join(map(str, chosen_steps))
         query = {s: start.to(cdtype).expand(groups[s].nodes, -1, -1).contiguous() for s in ("train", "val")}
+        part("start", tp)
         timing_depth["other"] += time.time() - t_other
         gains: list[float] = []
         states: dict[int, dict] = {}
@@ -263,6 +276,7 @@ def main():
             timing = dict(train=0.0, val=0.0, other=0.0)
             t_other = time.time()
             st_tr, st_va = cell_stats(train, query["train"]), cell_stats(val, query["val"])
+            part("cells", t_other)
             candidates = [(label, s) for label, s in (("most recent", recent), (f"d{d - 1}s{t}", prev_depth.get(t)))
                           if s is not None]
             timing["other"] += time.time() - t_other
@@ -281,6 +295,7 @@ def main():
             t_other = time.time()
             c_tr, p_tr = vanswers(net, train, query["train"], args.node_batch)
             c_va, p_va = vanswers(net, val, query["val"], args.node_batch)
+            tp = part("answers", t_other)
             after = dict(train=vsplit_mse(train, *st_tr, c_tr), val=vsplit_mse(val, *st_va, c_va))
             gains.append(before["val"] - after["val"])
             n_best = best_count(gains, args.lloyd_threshold, args.lloyd_discount)
@@ -294,6 +309,7 @@ def main():
                 atomic_save(dict(config=net.config, state_dict={k: v.cpu() for k, v in state.items()}, d=d, t=t,
                                  **(dict(start=start.cpu()) if t == 0 else {})),
                             os.path.join(out, "models", f"d{d:03d}_s{t:02d}.pt"))
+            part("step mse", tp)
             timing["other"] += time.time() - t_other
             seconds = sum(timing.values())
             for k in timing:
@@ -321,8 +337,10 @@ def main():
             c_te, p_te = vanswers(net, test, q_te, args.node_batch)
             if t + 1 < best_n:
                 q_te = c_te
+        tp = part("test answers", t_other)
         splits = dict(train=best_split["train"][:3], val=best_split["val"], test=(q_te, c_te, p_te))
         nodes, empty_after = {}, empty_share(cell_stats(train, best_split["train"][1])[0])
+        tp = part("cells", tp)
         for s, (q, c, pr) in splits.items():
             g = groups[s]
             nodes[s] = g.nodes
@@ -331,13 +349,17 @@ def main():
             atomic_save(dict(V=V, c=c.half().cpu() if args.store_centroids else None, start=start.cpu(), **kept),
                         os.path.join(out, "tree", s, f"d{d:03d}.pt"))
         del splits, best_split, q, c, pr, cells, q_te, c_te, p_te
+        tp = part("split", tp)
         chosen_steps.append(best_n)
         prev_depth = states
-        now = dict(train=mse_now(train), val=mse_now(val), test=mse_now(test), **pixel_mse())
+        now = dict(train=mse_now(train), val=mse_now(val), test=mse_now(test))
+        tp = part("depth mse", tp)
+        now.update(pixel_mse())
         k = args.plot_pairs
         real = images_px["test"][:k] if lat is not None else data["test"][:k]
         atomic_save(dict(real=real.cpu(), recon=as_pixels("test", test.R[:k]).float().cpu(),
                          shape=SHAPES[args.dataset], tokens=d + 1), os.path.join(out, "test_pairs.pt"))
+        part("pixels", tp)
         depth_gains.append(root_val - now["val"])
         k_best = best_count(depth_gains, args.depth_threshold)
         timing_depth["other"] += time.time() - t_other
@@ -347,7 +369,7 @@ def main():
                                       gain=depth_gains[-1] - (depth_gains[-2] if d > 0 else 0.0), nodes=nodes,
                                       bits=(d + 1) * math.log2(V), empty=empty_best,
                                       empty_after=empty_after, seconds=elapsed, wall=time.time() - depth_began,
-                                      timing=timing_depth, util=busy))
+                                      timing=timing_depth, other=dict(parts), util=busy))
         records["kept"] = k_best
         atomic_json(records, os.path.join(out, "records.json"))
         plot()
@@ -359,7 +381,8 @@ def main():
                if lat is not None else "")
             + f"; empty cells {records['depths'][-1]['empty']:.1%} (after: {empty_after:.1%}); nodes "
             f"{nodes['train']} train, {nodes['val']} val; {wall:.0f}s: {timing_depth['train']:.0f} train, "
-            f"{timing_depth['val']:.0f} val, {timing_depth['other']:.0f} other"
+            f"{timing_depth['val']:.0f} val, {timing_depth['other']:.0f} other ("
+            + ", ".join(f"{k} {v:.1f}" for k, v in parts.items()) + ")"
             + (f"; GPU {busy:.0f}% busy" if busy is not None else "") + f"; {elapsed / 3600:.2f} h in all")
         if d + 1 - k_best >= args.depth_patience:
             log(f"no depth past {k_best} paid {args.depth_threshold:.1e} for {args.depth_patience} depths: done")
