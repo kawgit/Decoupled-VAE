@@ -244,7 +244,7 @@ def plot_prior(records, path, samples=None):
     by_hour.legend(frameon=False, labelcolor=INK, fontsize=8)
     _style(by_hour, f"Bits per image (kept: val {sum(best['val']):.2f}; {K} tokens)", "hours", "bits per image")
 
-    recent = [h for h in history[-6:] if isinstance(h.get("by_age"), dict)]
+    recent = [h for h in history if isinstance(h.get("by_age"), dict)][-6:]
     for i, h in enumerate(recent):
         x, y = np.asarray(h["by_age"]["x"]), np.asarray(h["by_age"]["y"])
         trend = _smooth(y, max(3, len(y) // 20))
@@ -262,7 +262,7 @@ def plot_prior(records, path, samples=None):
         lo, hi = min(lo, sum(last["val"]), sum(last["incoming"])), max(hi, sum(last["val"]), sum(last["incoming"]))
         by_age.set_ylim(lo - 0.05 * (hi - lo + 1e-9), hi + 0.05 * (hi - lo + 1e-9))
     by_age.legend(frameon=False, labelcolor=INK, fontsize=8)
-    _style(by_age, f"Bits per image by age in the buffer (gap {last['gap']:+.2f}; faint: earlier epochs)",
+    _style(by_age, f"Bits per image by age in the buffer (gap {last['gap']:+.2f}; faint: earlier probes)",
            "images in the buffer, oldest first", "bits per image")
 
     epochs = [h["epoch"] for h in history]

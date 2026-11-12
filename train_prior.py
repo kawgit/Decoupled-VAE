@@ -7,7 +7,8 @@ children offsets are not stored (r for every image at every depth of a deep tree
 come from replaying the run's networks along each image's code (dvae/replay.py), into a rolling buffer of --buffer
 training images kept in host memory (8-bit r and m), beside val's, replayed once.
 
-Each epoch: --probe images of the buffer (evenly spread by age) and its oldest are scored; the next --rotate training images (cycling through all
+Each epoch: the buffer's oldest images are scored (and every --probe-every epochs, --probe images of it evenly
+spread by age, for the plot); the next --rotate training images (cycling through all
 of them, so those out of the buffer longest) are replayed into the oldest ones' places and scored before any
 training on them. The gap between the incoming and the replaced images says how much the prior has fit the buffer
 itself: above --gap-tol bits per image the next swap doubles, under half of it it halves. Then one pass over the
@@ -81,6 +82,7 @@ def main():
     p.add_argument("--probe", type=int, default=1000,
                    help="buffer images scored each epoch (evenly spread by age), and the most of the oldest and of "
                         "the incoming ones scored for the gap")
+    p.add_argument("--probe-every", type=int, default=10, help="epochs between probes of the buffer by age")
     p.add_argument("--rotate-min", type=int, default=128)
     p.add_argument("--rotate-max", type=int, default=5000)
     p.add_argument("--gap-tol", type=float, default=0.5,
@@ -197,8 +199,10 @@ def main():
         # out of it longest, replayed into the oldest ones' places and scored before any training on them)
         t0 = time.time()
         by_age = age.argsort()
-        ranks = torch.linspace(0, B - 1, min(args.probe, B)).round().long()
-        probe_bits = bits_of(store, by_age[ranks]).sum(1)
+        probed = None
+        if epoch % args.probe_every == 0:
+            ranks = torch.linspace(0, B - 1, min(args.probe, B)).round().long()
+            probed = dict(x=ranks.tolist(), y=bits_of(store, by_age[ranks]).sum(1).tolist())
         k = min(rotate, args.probe)
         old_bits = bits_of(store, by_age[:k])
         slots = by_age[:rotate]
@@ -273,10 +277,10 @@ def main():
             timing["samples"] += time.time() - t0
         records["history"].append(dict(
             epoch=epoch, train_loss=running / seen / LN2, val=va.tolist(), oldest=old_bits.mean(0).tolist(),
-            incoming=new_bits.mean(0).tolist(), by_age=dict(x=ranks.tolist(), y=probe_bits.tolist()), gap=gap, swapped=swapped,
+            incoming=new_bits.mean(0).tolist(), by_age=probed, gap=gap, swapped=swapped,
             seconds=time.time() - run_began, wall=time.time() - began, timing=timing, util=util.mean(began)))
         plot_prior(records, args.plot, samples)
-        log(f"epoch {epoch}: val {describe(va)}; buffer {probe_bits.mean():.3f} (oldest "
+        log(f"epoch {epoch}: val {describe(va)}; buffer{f' {sum(probed["y"]) / len(probed["y"]):.3f}' if probed else ''} (oldest "
             f"{old_bits.sum(1).mean():.3f}, incoming {new_bits.sum(1).mean():.3f}: gap {gap:+.3f}; swapped {swapped}, "
             f"next {rotate}); training loss {running / seen / LN2:.4f} bits/token; baselines: constant "
             f"{constant.sum():.3f}, encoder's shares {own.sum():.3f}; best {best[0]:.3f} at epoch {best[1]}"
