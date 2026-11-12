@@ -10,8 +10,10 @@ training images kept in host memory (8-bit r and m), beside val's, replayed once
 Each epoch: the buffer's oldest images are scored (and every --probe-every epochs, --probe images of it evenly
 spread by age, for the plot); the next --rotate training images (cycling through all
 of them, so those out of the buffer longest) are replayed into the oldest ones' places and scored before any
-training on them. The gap between the incoming and the replaced images says how much the prior has fit the buffer
-itself: above --gap-tol bits per image the next swap doubles, under half of it it halves. Then one pass over the
+training on them. The gap between the incoming images and the buffer's oldest (--probe of each at most) says how
+much the prior has fit the buffer itself: its running average (--gap-smooth: one image's bits vary by several, so a
+swap of a hundred images gives a gap a bit off either way) above --gap-tol bits per image doubles the next swap,
+under half of it halves it. Then one pass over the
 buffer, and val. The incoming images are replayed in a thread (on a CUDA stream of its own) while that pass trains
 on the rest of the buffer: the images they replace are not trained on again, and the replay's launches, many small
 ones, fill the gaps in the training's. Every epoch logs, in bits, val beside two baselines the prior has to beat: the encoder's implied
@@ -83,6 +85,7 @@ def main():
                    help="buffer images scored each epoch (evenly spread by age), and the most of the oldest and of "
                         "the incoming ones scored for the gap")
     p.add_argument("--probe-every", type=int, default=10, help="epochs between probes of the buffer by age")
+    p.add_argument("--gap-smooth", type=float, default=0.3, help="weight of each epoch's gap in its running average")
     p.add_argument("--rotate-min", type=int, default=128)
     p.add_argument("--rotate-max", type=int, default=5000)
     p.add_argument("--gap-tol", type=float, default=0.5,
@@ -192,6 +195,7 @@ def main():
         own_samples = rp.sample(args.samples, None, torch.Generator(device=device).manual_seed(args.seed))[1].cpu()
     side = torch.cuda.Stream(device) if device.type == "cuda" else None
     run_began, step, best = time.time(), 0, (math.inf, -1)
+    smooth: float | None = None  # (the gap's running average)
     for epoch in range(args.epochs):
         began = time.time()
         timing = dict(train=0.0, replay=0.0, eval=0.0, samples=0.0)
@@ -204,7 +208,7 @@ def main():
             ranks = torch.linspace(0, B - 1, min(args.probe, B)).round().long()
             probed = dict(x=ranks.tolist(), y=bits_of(store, by_age[ranks]).sum(1).tolist())
         k = min(rotate, args.probe)
-        old_bits = bits_of(store, by_age[:k])
+        old_bits = bits_of(store, by_age[:min(args.probe, B)])
         slots = by_age[:rotate]
         ids = cycle[(cursor + torch.arange(rotate)) % N]
         timing["eval"] += time.time() - t0
@@ -252,6 +256,8 @@ def main():
         t0 = time.time()
         new_bits = bits_of(store, slots[:k])
         gap = new_bits.sum(1).mean().item() - old_bits.sum(1).mean().item()
+        if epoch > 0:  # (the first swap's oldest images had been trained on no more than the rest)
+            smooth = gap if smooth is None else (1 - args.gap_smooth) * smooth + args.gap_smooth * gap
         age[slots] = inserted + torch.arange(rotate)
         inserted, cursor, swapped = inserted + rotate, (cursor + rotate) % N, rotate
         timing["eval"] += time.time() - t0
@@ -259,9 +265,9 @@ def main():
         t0 = time.time()
         va = bits_of(val_store, torch.arange(len(val))).mean(0)
         timing["eval"] += time.time() - t0
-        if epoch > 0:  # (the first swap's oldest images had been trained on no more than the rest)
-            rotate = min(rotate * 2, args.rotate_max, B) if gap > args.gap_tol else \
-                max(rotate // 2, args.rotate_min) if gap < args.gap_tol / 2 else rotate
+        if smooth is not None:
+            rotate = min(rotate * 2, args.rotate_max, B) if smooth > args.gap_tol else \
+                max(rotate // 2, args.rotate_min) if smooth < args.gap_tol / 2 else rotate
         improved = va.sum().item() < best[0]
         if improved:
             best = (va.sum().item(), epoch)
@@ -278,11 +284,11 @@ def main():
             timing["samples"] += time.time() - t0
         records["history"].append(dict(
             epoch=epoch, train_loss=train_loss, val=va.tolist(), oldest=old_bits.mean(0).tolist(),
-            incoming=new_bits.mean(0).tolist(), by_age=probed, gap=gap, swapped=swapped,
+            incoming=new_bits.mean(0).tolist(), by_age=probed, gap=gap, gap_smooth=smooth, swapped=swapped,
             seconds=time.time() - run_began, wall=time.time() - began, timing=timing, util=util.mean(began)))
         plot_prior(records, args.plot, samples)
         log(f"epoch {epoch}: val {describe(va)}; buffer{f' {sum(probed["y"]) / len(probed["y"]):.3f}' if probed else ''} (oldest "
-            f"{old_bits.sum(1).mean():.3f}, incoming {new_bits.sum(1).mean():.3f}: gap {gap:+.3f}; swapped {swapped}, "
+            f"{old_bits.sum(1).mean():.3f}, incoming {new_bits.sum(1).mean():.3f}: gap {gap:+.3f}, averaged {smooth if smooth is not None else gap:+.3f}; swapped {swapped}, "
             f"next {rotate}); training loss {train_loss:.4f} bits/token; baselines: constant "
             f"{constant.sum():.3f}, encoder's shares {own.sum():.3f}; best {best[0]:.3f} at epoch {best[1]}"
             f"{' (this one)' if improved else ''}; {time.time() - began:.0f}s: "
