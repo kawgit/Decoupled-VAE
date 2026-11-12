@@ -71,8 +71,8 @@ class TreeReplay:
 
     def into_store(self, X: Tensor, tokens: Tensor, store: "CompactStore", rows: Tensor):
         """Replay X [B, D] along its tokens [B, K] (the run's own codes: at each depth every image goes to the side
-        its token says), writing each depth's r (8-bit, a scale per row) and m into store's rows [B] (host
-        memory), from which CompactStore.batches rebuilds them."""
+        its token says), writing each depth's r and m into store's rows [B] (host memory, CompactStore.put),
+        from which CompactStore.batches rebuilds them."""
         for _ in self.into_store_steps(X, tokens, store, rows):
             pass
 
@@ -96,10 +96,7 @@ class TreeReplay:
                     if t + 1 < self.steps[d]:
                         hyper = next_hyperplane(r, m)
                 rn, mn = r[g.node], m[g.node]
-                scale = rn.abs().amax(-1).clamp_min(1e-12) / 127
-                store.r[rows, d] = (rn / scale[:, None]).round().to(torch.int8).cpu()
-                store.scale[rows, d] = scale.half().cpu()
-                store.m[rows, d] = mn.half().cpu()
+                store.put(rows, d, rn, mn)
                 descend(g, *hyper, r, m, float("inf"), self.bits, follow[:, d])
             yield
 
@@ -152,15 +149,40 @@ class TreeReplay:
 
 
 class CompactStore:
-    """Children offsets of n images at K depths, kept in host memory as each depth's r in 8 bits with a scale per
-    row, and m: K * (D + 4) bytes per image (the offsets in half precision would be 4 * K * D). Filled by
+    """Children offsets of n images at K depths, kept in host memory as each depth's r in 4 bits (-7..7 times a
+    scale per row, two to a byte) and m: K * (D / 2 + 4) bytes per image, plus the tokens (the offsets in half
+    precision would be 4 * K * D). Each row's scale is whichever of its largest entry and a few multiples of its
+    rms rounds it closest. The prior reads r through a linear map of its direction and its length: 4 bits keep the
+    direction to a cosine of about 0.99 (0.95 for very heavy tails), and a buffer twice the size of 8 bits'. Filled by
     TreeReplay.into_store; batches(...) rebuilds r and m on a device."""
 
+    LEVELS = 7  # (r / scale in -7..7, stored plus 8: 1..15)
+
     def __init__(self, n: int, K: int, D: int):
-        self.r = torch.empty(n, K, D, dtype=torch.int8)
+        assert D % 2 == 0, D
+        self.r = torch.empty(n, K, D // 2, dtype=torch.uint8)
         self.scale = torch.empty(n, K, dtype=torch.half)
         self.m = torch.empty(n, K, dtype=torch.half)
         self.tokens = torch.zeros(n, K, dtype=torch.long)
+
+    def put(self, rows: Tensor, d: int, r: Tensor, m: Tensor):
+        """Store r [b, D] and m [b] (on any device) as rows' depth d."""
+        r = r.float()
+        rms = r.pow(2).mean(-1).sqrt()
+        scales = torch.stack([r.abs().amax(-1)] + [rms * a for a in (2.0, 2.5, 3.0, 4.0, 5.0)]).clamp_min(1e-12) \
+            / self.LEVELS  # (each row's scale: whichever of these rounds it closest, outliers clipped or not)
+        steps = lambda c: (r / c[:, None]).round().clamp(-self.LEVELS, self.LEVELS)  # noqa: E731
+        error = torch.stack([(steps(c) * c[:, None] - r).pow(2).sum(-1) for c in scales])
+        scale = scales.gather(0, error.argmin(0)[None])[0]
+        q = (steps(scale) + 8).to(torch.uint8)
+        self.r[rows, d] = (q[:, 0::2] | (q[:, 1::2] << 4)).cpu()
+        self.scale[rows, d] = scale.half().cpu()
+        self.m[rows, d] = m.half().cpu()
+
+    @staticmethod
+    def unpack(packed: Tensor, dtype) -> Tensor:
+        """r / scale [..., D] in dtype from its packed bytes [..., D / 2]."""
+        return torch.stack([packed & 15, packed >> 4], -1).flatten(-2).to(dtype) - 8
 
     def __len__(self):
         return len(self.r)
@@ -168,7 +190,7 @@ class CompactStore:
     def batches(self, row_batches: list[Tensor], device, dtype=torch.float32, workers: int = 4):
         """For each rows in row_batches: (r [b, K, D] in dtype, m [b, K], tokens [b, K]) on device.
         A thread gathers the next batches' rows into reused pinned buffers while the device works on this one,
-        so copying from host memory (~K * D bytes an image) overlaps the computing; r's rows, nearly all the
+        so copying from host memory (~K * D / 2 bytes an image) overlaps the computing; r's rows, nearly all the
         bytes, are gathered by workers threads at once (one copies only so fast)."""
         import queue
         import threading
@@ -206,8 +228,8 @@ class CompactStore:
                 staged[-1] = torch.cuda.Event()
                 staged[-1].record()
             free.put(staged)
-            yield r8.to(dtype) * scale.to(dtype)[..., None], m.float(), tokens
+            yield self.unpack(r8, dtype) * scale.to(dtype)[..., None], m.float(), tokens
 
     @staticmethod
     def gb(n: int, K: int, D: int) -> float:
-        return n * K * (D + 12) / 2 ** 30
+        return n * K * (D // 2 + 12) / 2 ** 30
