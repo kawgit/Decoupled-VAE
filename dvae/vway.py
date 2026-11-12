@@ -31,16 +31,20 @@ from dvae.deltatree import EPS, Block, HistoryReader, ImageHead, splitmix64
 class VStepNet(HistoryReader):
     """One (depth, Lloyd step)'s network for V-way splits (see the module's docstring)."""
 
-    def __init__(self, V=4, width=128, layers=4, heads=4, plain_history=True, shape=(1, 28, 28), dropout=0.0):
+    def __init__(self, V=4, width=128, layers=4, heads=4, plain_history=True, shape=(1, 28, 28), dropout=0.0,
+                 head="token"):
         shape = tuple(shape)
         super().__init__(POSITIONS, width, layers, heads, False, plain_history, shape[0] * shape[1] * shape[2])
+        assert head in ("token", "shared"), head
         self.config = dict(V=V, width=width, layers=layers, heads=heads, plain_history=plain_history, shape=shape,
-                           dropout=dropout)
-        self.V = V
+                           dropout=dropout, head=head)
+        self.V, self.shared = V, head == "shared"
         self.centroid_in = nn.Linear(self.D + 1, width)
         self.slot = nn.Parameter(torch.randn(V, width) * 0.02)
         self.out_norm = nn.LayerNorm(width)
-        self.c_head = ImageHead(width, 1, shape=shape)
+        # (token: each centroid's mean from its own token, V calls of the image head, which on small images costs
+        # more than the blocks; shared: one call reading all V tokens' features, V channels out)
+        self.c_head = ImageHead(width * V, V, shape=shape) if self.shared else ImageHead(width, 1, shape=shape)
         self.p_head = nn.Linear(width, 1)
         if dropout > 0:  # (as StepNet: attention weights, both branches' outputs)
             for blk in self.blocks:
@@ -57,7 +61,8 @@ class VStepNet(HistoryReader):
             for blk, mem in zip(self.blocks, mems):
                 h, _ = blk(h, mem)
             f = self.out_norm(h)
-            o, logits = self.c_head(f)[:, :, 0].float(), self.p_head(f)[..., 0].float()
+            o = self.c_head(f.flatten(1)) if self.shared else self.c_head(f)[:, :, 0]
+            o, logits = o.float(), self.p_head(f)[..., 0].float()
         p = logits.softmax(-1)
         return o - (p[..., None] * o).sum(1, keepdim=True), p
 

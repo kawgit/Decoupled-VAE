@@ -82,6 +82,8 @@ def main():
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--heads", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--head", choices=("token", "shared"), default="token",
+                   help="the predicted means' image head: one call per centroid token, or one per node (V channels)")
     p.add_argument("--side-m-history", action="store_true", help="history tokens also read each step's token and share")
     p.add_argument("--batch", type=int, default=1024)
     p.add_argument("--max-nodes", type=int, default=0, help="nodes per forward pass while training (0: as "
@@ -155,7 +157,8 @@ def main():
     def pixel_mse():
         return {f"{s}_px": (as_pixels(s, groups[s].R[:len(x)]) - x).square().mean().item() for s, x in images_px.items()}
 
-    net = VStepNet(V, args.width, args.layers, args.heads, not args.side_m_history, shape, args.dropout).to(device)
+    net = VStepNet(V, args.width, args.layers, args.heads, not args.side_m_history, shape, args.dropout,
+                   args.head).to(device)
     net.bf16, net.fp16 = args.bf16, args.fp16
     log(f"{N} train, {len(val.R)} val, {len(test.R)} test images of {D} numbers; V = {V} ({math.log2(V):.2f} bits a "
         f"token); each network {sum(q.numel() for q in net.parameters()) / 1e6:.2f}M parameters")
