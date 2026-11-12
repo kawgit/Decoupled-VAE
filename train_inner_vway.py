@@ -10,8 +10,8 @@ giving up once n passes the best by a patience; a depth tries at most as many st
 recently trained network and the previous depth's at the same step has the lower val mse. Not here: --init and
 --resume, state snapshots.
 
-Each depth logs the share of its nodes' cells (train) that hold no image under the centroids the chosen split was
-asked about, and of those its predicted means would make; --attraction pulls every predicted mean toward all of its
+Each depth logs the share of its nodes' cells (train, nodes of at least 2 V images) that hold no image under the
+centroids the chosen split was asked about, and under those its predicted means would make; --attraction pulls every predicted mean toward all of its
 node's images, so an empty cell's centroid still moves.
 
 What the run keeps (artifacts/<job>/): records.json (the plot's, as train_inner_components.py's, plus each depth's
@@ -227,7 +227,10 @@ def main():
         return e, best[1]
 
     def empty_share(count):
-        return (count == 0).float().mean().item()
+        """The share of empty cells among the nodes holding at least 2 V images (a node with fewer has some
+        anyway): centroids that win nothing."""
+        big = count.sum(-1) >= 2 * V
+        return (count[big] == 0).float().mean().item() if big.any() else 0.0
 
     for d in range(args.max_depths):
         depth_began = time.time()
