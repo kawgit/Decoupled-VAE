@@ -75,6 +75,9 @@ def main():
     p.add_argument("--wd", type=float, default=0.05, help="AdamW weight decay (on weight matrices only)")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--warmup", type=int, default=500, help="steps of linear learning-rate warmup")
+    p.add_argument("--lr-patience", type=int, default=3,
+                   help="epochs without a lower val cost after which the learning rate halves (again every this many)")
+    p.add_argument("--lr-min", type=float, default=1e-5)
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--epochs", type=int, default=100000)
     add_patience_args(p)
@@ -148,7 +151,8 @@ def main():
     rest = [q for q in prior.parameters() if q.dim() < 2]
     opt = torch.optim.AdamW([dict(params=decay, weight_decay=args.wd), dict(params=rest, weight_decay=0.0)],
                             lr=args.lr)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / args.warmup))
+    lr_factor = [1.0]  # (the learning rate's factor: halved each time val goes --lr-patience epochs without a new low)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / args.warmup) * lr_factor[0])
     log(f"prior: {sum(q.numel() for q in prior.parameters()) / 1e6:.2f}M parameters")
     dtype = torch.bfloat16 if args.bf16 else torch.float32
 
@@ -290,6 +294,9 @@ def main():
             rotate = min(rotate * 2, args.rotate_max, B) if smooth > args.gap_tol else \
                 max(rotate // 2, args.rotate_min) if smooth < args.gap_tol / 2 else rotate
         improved = va.sum().item() < best[0]
+        since = epoch - (epoch if improved else best[1])
+        if since > 0 and since % args.lr_patience == 0 and args.lr * lr_factor[0] / 2 >= args.lr_min:
+            lr_factor[0] /= 2
         if improved:
             best = (va.sum().item(), epoch)
             records["best_epoch"] = epoch
@@ -310,7 +317,7 @@ def main():
         plot()
         log(f"epoch {epoch}: val {describe(va)}; buffer{f' {sum(probed["y"]) / len(probed["y"]):.3f}' if probed else ''} (oldest "
             f"{old_bits.sum(1).mean():.3f}, incoming {new_bits.sum(1).mean():.3f}: gap {gap:+.3f}, averaged {smooth if smooth is not None else gap:+.3f}; swapped {swapped}, "
-            f"next {rotate}); training loss {train_loss:.4f} bits/token; baselines: constant "
+            f"next {rotate}); training loss {train_loss:.4f} bits/token; lr {args.lr * lr_factor[0]:.1e}; baselines: constant "
             f"{constant.sum():.3f}, encoder's shares {own.sum():.3f}; best {best[0]:.3f} at epoch {best[1]}"
             f"{' (this one)' if improved else ''}; {time.time() - began:.0f}s: "
             + ", ".join(f"{k} {v:.0f}" for k, v in timing.items())
