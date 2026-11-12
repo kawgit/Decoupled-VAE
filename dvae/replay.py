@@ -137,7 +137,7 @@ class TreeReplay:
 class CompactStore:
     """Children offsets of n images at K depths, kept in host memory as each depth's r in 8 bits with a scale per
     row, and m: K * (D + 4) bytes per image (the offsets in half precision would be 4 * K * D). Filled by
-    TreeReplay.into_store; offsets(rows) rebuilds [b, K, 2, D] (-m r, then r) on a device."""
+    TreeReplay.into_store; batches(...) rebuilds [b, K, 2, D] (-m r, then r) on a device."""
 
     def __init__(self, n: int, K: int, D: int):
         self.r = torch.empty(n, K, D, dtype=torch.int8)
@@ -148,10 +148,41 @@ class CompactStore:
     def __len__(self):
         return len(self.r)
 
-    def offsets(self, rows: Tensor, device) -> Tensor:
-        r = self.r[rows].to(device, non_blocking=True).float() * self.scale[rows].to(device).float()[..., None]
-        m = self.m[rows].to(device).float()[..., None]
-        return torch.stack([-m * r, r], 2)
+    def batches(self, row_batches: list[Tensor], device):
+        """For each rows in row_batches: (children offsets [b, K, 2, D] (-m r, then r), tokens [b, K]) on device.
+        A thread gathers the next batches' rows into reused pinned buffers while the device works on this one,
+        so copying from host memory (~K * D bytes an image) overlaps the computing."""
+        import queue
+        import threading
+
+        cuda = torch.device(device).type == "cuda"
+        most = max((len(r) for r in row_batches), default=0)
+        free: queue.Queue = queue.Queue()
+        ready: queue.Queue = queue.Queue()
+        for _ in range(3 if cuda else 1):  # (each: pinned buffers for a batch, and the event its last copy recorded)
+            free.put([torch.empty((most,) + t.shape[1:], dtype=t.dtype, pin_memory=cuda)
+                      for t in (self.r, self.scale, self.m, self.tokens)] + [None])
+
+        def gather():
+            for rows in row_batches:
+                staged = free.get()
+                if staged[-1] is not None:
+                    staged[-1].synchronize()  # (its last copy to the device is done)
+                for src, dst in zip((self.r, self.scale, self.m, self.tokens), staged[:4]):
+                    torch.index_select(src, 0, rows, out=dst[:len(rows)])
+                ready.put((staged, len(rows)))
+
+        threading.Thread(target=gather, daemon=True).start()
+        for _ in row_batches:
+            staged, n = ready.get()
+            r8, scale, m, tokens = (t[:n].to(device, non_blocking=True) for t in staged[:4])
+            if cuda:
+                staged[-1] = torch.cuda.Event()
+                staged[-1].record()
+            free.put(staged)
+            r = r8.float() * scale.float()[..., None]
+            m = m.float()[..., None]
+            yield torch.stack([-m * r, r], 2), tokens
 
     @staticmethod
     def gb(n: int, K: int, D: int) -> float:

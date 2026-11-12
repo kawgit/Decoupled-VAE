@@ -244,16 +244,23 @@ def plot_prior(records, path, samples=None):
     by_hour.legend(frameon=False, labelcolor=INK, fontsize=8)
     _style(by_hour, f"Bits per image (kept: val {sum(best['val']):.2f}; {K} tokens)", "hours", "bits per image")
 
-    recent = history[-6:]
+    recent = [h for h in history[-6:] if isinstance(h.get("by_age"), dict)]
     for i, h in enumerate(recent):
-        ys = h["by_age"]
-        latest = i == len(recent) - 1
-        by_age.plot((np.arange(len(ys)) + 0.5) * B / len(ys), ys, color=COMPONENT_COLORS["train"],
-                    linewidth=1.8 if latest else 1.0, alpha=1.0 if latest else 0.25 + 0.12 * i,
-                    label=f"epoch {h['epoch']}" if latest else None)
+        x, y = np.asarray(h["by_age"]["x"]), np.asarray(h["by_age"]["y"])
+        trend = _smooth(y, max(3, len(y) // 20))
+        if i == len(recent) - 1:  # (the latest epoch: each probed image, and the trend through them)
+            by_age.scatter(x, y, s=6, color=COMPONENT_COLORS["train"], alpha=0.35, linewidths=0)
+            by_age.plot(x, trend, color=COMPONENT_COLORS["train"], linewidth=2.2, label=f"epoch {h['epoch']}")
+        else:
+            by_age.plot(x, trend, color=COMPONENT_COLORS["train"], linewidth=1.0, alpha=0.2 + 0.1 * i)
     last = history[-1]
     by_age.axhline(sum(last["val"]), color=COMPONENT_COLORS["val"], linewidth=1.2, linestyle="--", label="val")
-    by_age.plot([B], [sum(last["incoming"])], "o", color=PRIOR, markersize=7, label=f"incoming ({last['swapped']})")
+    by_age.plot([B], [sum(last["incoming"])], "o", color=PRIOR, markersize=8, label=f"incoming ({last['swapped']})")
+    if recent:  # (the middle 96% of the latest dots, the val and incoming marks inside)
+        y = np.asarray(recent[-1]["by_age"]["y"])
+        lo, hi = np.percentile(y, [2, 98])
+        lo, hi = min(lo, sum(last["val"]), sum(last["incoming"])), max(hi, sum(last["val"]), sum(last["incoming"]))
+        by_age.set_ylim(lo - 0.05 * (hi - lo + 1e-9), hi + 0.05 * (hi - lo + 1e-9))
     by_age.legend(frameon=False, labelcolor=INK, fontsize=8)
     _style(by_age, f"Bits per image by age in the buffer (gap {last['gap']:+.2f}; faint: earlier epochs)",
            "images in the buffer, oldest first", "bits per image")

@@ -7,7 +7,7 @@ children offsets are not stored (r for every image at every depth of a deep tree
 come from replaying the run's networks along each image's code (dvae/replay.py), into a rolling buffer of --buffer
 training images kept in host memory (8-bit r and m), beside val's, replayed once.
 
-Each epoch: the whole buffer is scored, oldest images first; the next --rotate training images (cycling through all
+Each epoch: --probe images of the buffer (evenly spread by age) and its oldest are scored; the next --rotate training images (cycling through all
 of them, so those out of the buffer longest) are replayed into the oldest ones' places and scored before any
 training on them. The gap between the incoming and the replaced images says how much the prior has fit the buffer
 itself: above --gap-tol bits per image the next swap doubles, under half of it it halves. Then one pass over the
@@ -55,12 +55,6 @@ def describe(per_token):
         f"{lo}-{hi}: {per_token[lo - 1:hi].mean():.4f}" for lo, hi in bands(len(per_token))) + ")"
 
 
-def binned(values, bins=50):
-    """values' means over (at most) bins equal runs, for a compact plot."""
-    chunks = torch.as_tensor(values, dtype=torch.float).tensor_split(min(bins, len(values)))
-    return [c.mean().item() for c in chunks]
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--tree", required=True, help="a train_inner_components.py run's folder (its tree/ and models/)")
@@ -79,6 +73,9 @@ def main():
     p.add_argument("--buffer", type=int, default=10000,
                    help="training images whose offsets are kept in host memory (~K * D bytes each)")
     p.add_argument("--rotate", type=int, default=1000, help="images the buffer swaps at the first epoch")
+    p.add_argument("--probe", type=int, default=1000,
+                   help="buffer images scored each epoch (evenly spread by age), and the most of the oldest and of "
+                        "the incoming ones scored for the gap")
     p.add_argument("--rotate-min", type=int, default=128)
     p.add_argument("--rotate-max", type=int, default=5000)
     p.add_argument("--gap-tol", type=float, default=0.5,
@@ -153,10 +150,8 @@ def main():
         """Each token's bits [len(rows), K] under the prior, for st's rows."""
         prior.eval()
         out = []
-        for i in range(0, len(rows), args.batch):
-            r = rows[i:i + args.batch]
-            tb = st.tokens[r].to(device)
-            logits = prior(st.offsets(r, device), tb)
+        for offsets, tb in st.batches(list(torch.as_tensor(rows).split(args.batch)), device):
+            logits = prior(offsets, tb)
             out.append(F.cross_entropy(logits.flatten(0, 1).float(), tb.flatten(), reduction="none")
                        .view(tb.shape).cpu() / LN2)
         return torch.cat(out)
@@ -182,11 +177,14 @@ def main():
     for epoch in range(args.epochs):
         began = time.time()
         timing = dict(train=0.0, replay=0.0, eval=0.0, samples=0.0)
-        # (the whole buffer, oldest first; then the next images in, which have been out of it longest, replayed into
-        # the oldest ones' places and scored before any training on them)
+        # (a probe of the buffer evenly spread by age, and its oldest images; then the next images in, which have been
+        # out of it longest, replayed into the oldest ones' places and scored before any training on them)
         t0 = time.time()
         by_age = age.argsort()
-        buffer_bits = bits_of(store, by_age)
+        ranks = torch.linspace(0, B - 1, min(args.probe, B)).round().long()
+        probe_bits = bits_of(store, by_age[ranks]).sum(1)
+        k = min(rotate, args.probe)
+        old_bits = bits_of(store, by_age[:k])
         slots = by_age[:rotate]
         ids = cycle[(cursor + torch.arange(rotate)) % N]
         timing["eval"] += time.time() - t0
@@ -194,8 +192,7 @@ def main():
         fill(store, "train", train, ids, slots)
         timing["replay"] += time.time() - t0
         t0 = time.time()
-        new_bits = bits_of(store, slots)
-        old_bits = buffer_bits[:rotate]
+        new_bits = bits_of(store, slots[:k])
         gap = new_bits.sum(1).mean().item() - old_bits.sum(1).mean().item()
         age[slots] = inserted + torch.arange(rotate)
         inserted, cursor, swapped = inserted + rotate, (cursor + rotate) % N, rotate
@@ -203,10 +200,9 @@ def main():
 
         prior.train()
         running = 0.0
-        for idx in torch.randperm(B, generator=gen).split(args.batch):
-            t0 = time.time()
-            tokens = store.tokens[idx].to(device, non_blocking=True)
-            logits = prior(store.offsets(idx, device), tokens)
+        t0 = time.time()
+        for offsets, tokens in store.batches(list(torch.randperm(B, generator=gen).split(args.batch)), device):
+            logits = prior(offsets, tokens)
             loss = F.cross_entropy(logits.flatten(0, 1), tokens.flatten())
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -214,10 +210,10 @@ def main():
             opt.step()
             sched.step()
             step += 1
-            running += loss.item() * len(idx)
-            timing["train"] += time.time() - t0
+            running += loss.item() * len(tokens)
             if step % 100 == 0:
                 log.detail(f"  step {step}: loss {loss.item() / LN2:.4f} bits/token")
+        timing["train"] += time.time() - t0
 
         t0 = time.time()
         va = bits_of(val_store, torch.arange(len(val))).mean(0)
@@ -242,10 +238,10 @@ def main():
             timing["samples"] += time.time() - t0
         records["history"].append(dict(
             epoch=epoch, train_loss=running / B / LN2, val=va.tolist(), oldest=old_bits.mean(0).tolist(),
-            incoming=new_bits.mean(0).tolist(), by_age=binned(buffer_bits.sum(1)), gap=gap, swapped=swapped,
+            incoming=new_bits.mean(0).tolist(), by_age=dict(x=ranks.tolist(), y=probe_bits.tolist()), gap=gap, swapped=swapped,
             seconds=time.time() - run_began, wall=time.time() - began, timing=timing, util=util.mean(began)))
         plot_prior(records, args.plot, samples)
-        log(f"epoch {epoch}: val {describe(va)}; buffer {buffer_bits.sum(1).mean():.3f} (oldest "
+        log(f"epoch {epoch}: val {describe(va)}; buffer {probe_bits.mean():.3f} (oldest "
             f"{old_bits.sum(1).mean():.3f}, incoming {new_bits.sum(1).mean():.3f}: gap {gap:+.3f}; swapped {swapped}, "
             f"next {rotate}); training loss {running / B / LN2:.4f} bits/token; baselines: constant "
             f"{constant.sum():.3f}, encoder's shares {own.sum():.3f}; best {best[0]:.3f} at epoch {best[1]}"
