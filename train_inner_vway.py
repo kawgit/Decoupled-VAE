@@ -108,6 +108,8 @@ def main():
     p.add_argument("--hours", type=float, default=0.0)
     p.add_argument("--outer", default=None, metavar="RUN", help="a train_outer.py run: code its latents")
     p.add_argument("--px-images", type=int, default=2000)
+    p.add_argument("--px-every", type=int, default=10,
+                   help="decode the --px-images images for the pixel mse every this many depths (and at the first)")
     p.add_argument("--limit-train", type=int, default=None)
     p.add_argument("--limit-val", type=int, default=None)
     p.add_argument("--limit-test", type=int, default=None)
@@ -293,14 +295,25 @@ def main():
             timing["val"] += time.time() - t_val
             epochs, kept_epoch = train_net(net, st_tr, st_va, query["train"], query["val"], v0, timing, f"d{d}s{t}")
             t_other = time.time()
-            c_tr, p_tr = vanswers(net, train, query["train"], args.node_batch)
             c_va, p_va = vanswers(net, val, query["val"], args.node_batch)
             tp = part("answers", t_other)
-            after = dict(train=vsplit_mse(train, *st_tr, c_tr), val=vsplit_mse(val, *st_va, c_va))
-            gains.append(before["val"] - after["val"])
+            after_val = vsplit_mse(val, *st_va, c_va)
+            after: dict[str, float | None] = dict(val=after_val)
+            gains.append(before["val"] - after_val)
             n_best = best_count(gains, args.lloyd_threshold, args.lloyd_discount)
             if n_best == t + 1:
                 best_n = n_best
+            last = t + 1 - best_n >= args.lloyd_patience or t + 1 >= cap
+            # (the train nodes' answers are the split if this step is kept, else the next step's question: a
+            # depth's last step, which is rarely kept, needs neither, so its train mse goes unmeasured)
+            c_tr = p_tr = None
+            after["train"] = None
+            if best_n == t + 1 or not last:
+                tp = time.time()
+                c_tr, p_tr = vanswers(net, train, query["train"], args.node_batch)
+                tp = part("answers", tp)
+                after["train"] = vsplit_mse(train, *st_tr, c_tr)
+            if best_n == t + 1:
                 best_split = dict(train=(query["train"], c_tr, p_tr, st_tr[0]), val=(query["val"], c_va, p_va))
             state = {k: v.detach().clone() for k, v in net.state_dict().items()}
             states[t] = state
@@ -319,11 +332,12 @@ def main():
                                           gain=gains[-1], empty=empty_share(st_tr[0]), seconds=timing))
             step_gain = gains[-1] - (gains[-2] if t > 0 else 0.0)
             log(f"  d{d} s{t}: {epochs} epochs (kept {kept_epoch}), from {start_label} (val {v0:.6f}); val mse "
-                f"{after['val']:.6f} (step gain {step_gain:+.2e}, depth gain {gains[-1]:.2e}, best {best_n} steps), "
-                f"train {after['train']:.6f}; empty cells {empty_share(st_tr[0]):.1%}; {seconds:.1f}s: "
+                f"{after_val:.6f} (step gain {step_gain:+.2e}, depth gain {gains[-1]:.2e}, best {best_n} steps), "
+                f"train {'-' if after['train'] is None else format(after['train'], '.6f')}; empty cells {empty_share(st_tr[0]):.1%}; {seconds:.1f}s: "
                 f"{timing['train']:.1f} train, {timing['val']:.1f} val, {timing['other']:.1f} other")
-            if t + 1 - best_n >= args.lloyd_patience:
+            if last:
                 break
+            assert c_tr is not None
             query = dict(train=c_tr, val=c_va)
         assert best_split is not None
         empty_best = empty_share(best_split["train"][3])
@@ -354,7 +368,8 @@ def main():
         prev_depth = states
         now = dict(train=mse_now(train), val=mse_now(val), test=mse_now(test))
         tp = part("depth mse", tp)
-        now.update(pixel_mse())
+        if d % args.px_every == 0:
+            now.update(pixel_mse())
         k = args.plot_pairs
         real = images_px["test"][:k] if lat is not None else data["test"][:k]
         atomic_save(dict(real=real.cpu(), recon=as_pixels("test", test.R[:k]).float().cpu(),
@@ -378,7 +393,7 @@ def main():
             f"{now['val']:.6f} (gain {records['depths'][-1]['gain']:.2e}; best {k_best} depths), train "
             f"{now['train']:.6f}, test {now['test']:.6f}"
             + (f" (pixels: train {now['train_px']:.6f}, val {now['val_px']:.6f}, test {now['test_px']:.6f})"
-               if lat is not None else "")
+               if "val_px" in now else "")
             + f"; empty cells {records['depths'][-1]['empty']:.1%} (after: {empty_after:.1%}); nodes "
             f"{nodes['train']} train, {nodes['val']} val; {wall:.0f}s: {timing_depth['train']:.0f} train, "
             f"{timing_depth['val']:.0f} val, {timing_depth['other']:.0f} other ("
@@ -394,7 +409,7 @@ def main():
     best = records["depths"][records["kept"] - 1]
     log(f"the tree keeps {records['kept']} depths ({records['kept'] * math.log2(V):.0f} bits): val mse "
         f"{best['val']:.6f}, test {best['test']:.6f}"
-        + (f" (pixels: val {best['val_px']:.6f}, test {best['test_px']:.6f})" if lat is not None else "") + f"; {out}")
+        + (f" (pixels: val {best['val_px']:.6f}, test {best['test_px']:.6f})" if "val_px" in best else "") + f"; {out}")
 
 
 if __name__ == "__main__":

@@ -107,10 +107,11 @@ def plot_components(records, path, pairs=None):
             by_depth.plot(range(kept, K + 1), ys[kept:], color=color, linewidth=1.2, linestyle="--", marker="o",
                           markersize=2.5, alpha=0.6)
     px = [split for split in COMPONENT_COLORS if f"{split}_px" in depths[0]]  # (on an outer run's latents: decoded)
-    for split in px:
-        ys = [root.get(f"{split}_px", math.nan)] + [h[f"{split}_px"] for h in depths]
-        by_depth.plot(range(0, K + 1), ys, color=COMPONENT_COLORS[split], linewidth=1.4, linestyle=":",
-                      label=f"{split}, decoded to pixels")
+    for split in px:  # (a run may decode only every few depths)
+        at = [(0, root[f"{split}_px"])] if f"{split}_px" in root else []
+        at += [(i + 1, h[f"{split}_px"]) for i, h in enumerate(depths) if f"{split}_px" in h]
+        by_depth.plot([x for x, _ in at], [y for _, y in at], color=COMPONENT_COLORS[split], linewidth=1.4,
+                      linestyle=":", label=f"{split}, decoded to pixels")
     by_depth.xaxis.set_major_locator(MaxNLocator(integer=True))
     _log_y(by_depth)
     by_depth.legend(frameon=False, labelcolor=INK)
@@ -122,7 +123,8 @@ def plot_components(records, path, pairs=None):
     for split, color in COMPONENT_COLORS.items():
         by_hour.plot(hours, [h[split] for h in depths], color=color, linewidth=1.6, label=split)
     for split in px:
-        by_hour.plot(hours, [h[f"{split}_px"] for h in depths], color=COMPONENT_COLORS[split], linewidth=1.4,
+        at = [(h["seconds"] / 3600, h[f"{split}_px"]) for h in depths if f"{split}_px" in h]
+        by_hour.plot([x for x, _ in at], [y for _, y in at], color=COMPONENT_COLORS[split], linewidth=1.4,
                      linestyle=":", label=f"{split}, decoded to pixels")
     by_hour.xaxis.set_major_locator(MaxNLocator(5))
     _log_y(by_hour)
