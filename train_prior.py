@@ -224,7 +224,7 @@ def main():
         keep[slots] = False
         rest = keep.nonzero()[:, 0]
         prior.train()
-        running, seen = 0.0, 0
+        running, seen = torch.zeros((), device=device), 0  # (summed on the device: no wait on it each step)
         t0 = time.time()
         for r, m, tokens in store.batches(list(rest[torch.randperm(len(rest), generator=gen)].split(args.batch)),
                                           device, dtype):
@@ -237,10 +237,11 @@ def main():
             opt.step()
             sched.step()
             step += 1
-            running += loss.item() * len(tokens)
+            running += loss.detach() * len(tokens)
             seen += len(tokens)
             if step % 100 == 0:
                 log.detail(f"  step {step}: loss {loss.item() / LN2:.4f} bits/token")
+        train_loss = running.item() / seen / LN2
         timing["train"] += time.time() - t0
         t0 = time.time()
         replaying.join()  # (its time beyond the training's)
@@ -276,13 +277,13 @@ def main():
             torch.save(samples, samples_path)
             timing["samples"] += time.time() - t0
         records["history"].append(dict(
-            epoch=epoch, train_loss=running / seen / LN2, val=va.tolist(), oldest=old_bits.mean(0).tolist(),
+            epoch=epoch, train_loss=train_loss, val=va.tolist(), oldest=old_bits.mean(0).tolist(),
             incoming=new_bits.mean(0).tolist(), by_age=probed, gap=gap, swapped=swapped,
             seconds=time.time() - run_began, wall=time.time() - began, timing=timing, util=util.mean(began)))
         plot_prior(records, args.plot, samples)
         log(f"epoch {epoch}: val {describe(va)}; buffer{f' {sum(probed["y"]) / len(probed["y"]):.3f}' if probed else ''} (oldest "
             f"{old_bits.sum(1).mean():.3f}, incoming {new_bits.sum(1).mean():.3f}: gap {gap:+.3f}; swapped {swapped}, "
-            f"next {rotate}); training loss {running / seen / LN2:.4f} bits/token; baselines: constant "
+            f"next {rotate}); training loss {train_loss:.4f} bits/token; baselines: constant "
             f"{constant.sum():.3f}, encoder's shares {own.sum():.3f}; best {best[0]:.3f} at epoch {best[1]}"
             f"{' (this one)' if improved else ''}; {time.time() - began:.0f}s: "
             + ", ".join(f"{k} {v:.0f}" for k, v in timing.items())
