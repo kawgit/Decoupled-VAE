@@ -50,6 +50,9 @@ def main():
     p.add_argument("--max-epochs", type=int, default=300)
     p.add_argument("--patience", type=int, default=2, help="epochs without a better val mse before stopping")
     p.add_argument("--lr-patience", type=int, default=1, help="epochs without a better val mse before halving lr")
+    p.add_argument("--encode", type=int, default=None, metavar="C",
+                   help="train nothing: write latents.pt from this run folder's (--out) outer_c<C>.pt, a size picked by "
+                        "hand whatever the targets")
     p.add_argument("--latent-std", type=float, default=0.25, help="each latent channel's std in the latents files")
     p.add_argument("--pairs", type=int, default=12)
     p.add_argument("--tf32", action="store_true")
@@ -118,7 +121,12 @@ def main():
 
     records: dict = dict(args=vars(args), sizes=[], chosen={})
     chosen: dict[float, int] = {}
-    for C in (int(c) for c in args.channels.split(",")):
+    first = float(args.target_mse.split(",")[0])
+    if args.encode is not None:
+        assert os.path.exists(os.path.join(out, f"outer_c{args.encode}.pt")), f"no outer_c{args.encode}.pt in {out}"
+        chosen = {first: args.encode}
+        log(f"--encode {args.encode}: no training, latents from outer_c{args.encode}.pt")
+    for C in ([] if args.encode is not None else (int(c) for c in args.channels.split(","))):
         model = Outer(C, args.width, shape[0], downs).to(device)
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=args.lr_patience)
@@ -175,6 +183,29 @@ def main():
         if len(chosen) == len(targets):
             break
 
+    if records["sizes"]:
+        plot_sweep(records, targets, os.path.join(out, "outer.png"))
+    for t in (t for t in targets if t not in chosen):
+        log(f"no size met the target {t:g}: no latents for it (add larger --channels)")
+    for t, C in chosen.items():
+        saved = torch.load(os.path.join(out, f"outer_c{C}.pt"), map_location=device, weights_only=False)
+        model = Outer(**saved["config"]).to(device)
+        model.load_state_dict(saved["state_dict"])
+        Z = {s: encode(model, x) for s, x in X.items()}
+        mu, sd = Z["train"].mean((0, 2, 3)), Z["train"].std((0, 2, 3))  # (per channel, from the training images)
+        scale = args.latent_std
+        lat = {s: ((z - mu[None, :, None, None]) / sd[None, :, None, None] * scale).half().cpu() for s, z in Z.items()}
+        names = ["latents.pt"] if args.encode is not None else [f"latents_{t:g}.pt"] + (["latents.pt"] if t == first else [])
+        for name in names:
+            torch.save(dict(**lat, channels=C, shape=tuple(lat["train"].shape[1:]), mean=mu.cpu(), std=sd.cpu(),
+                            scale=scale, target=t, dataset=args.dataset,
+                            limits=dict(train=args.limit_train, val=args.limit_val, test=args.limit_test)),
+                       os.path.join(out, name))
+        log(f"target {t:g}: c{C}, latents {tuple(lat['train'].shape)} -> {', '.join(names)}")
+    log(f"done; {out}")
+
+
+def plot_sweep(records, targets, path):
     fig, (by_epoch, by_size) = plt.subplots(1, 2, figsize=(14, 5))
     for r in records["sizes"]:
         line, = by_epoch.plot(range(1, len(r["curve"]) + 1), r["curve"], linewidth=1.6,
@@ -200,27 +231,7 @@ def main():
     for ax in (by_epoch, by_size):
         ax.legend(frameon=False, fontsize=8)
     fig.tight_layout()
-    fig.savefig(os.path.join(out, "outer.png"), dpi=150, facecolor="white")
-
-    first = float(args.target_mse.split(",")[0])
-    for t in (t for t in targets if t not in chosen):
-        log(f"no size met the target {t:g}: no latents for it (add larger --channels)")
-    for t, C in chosen.items():
-        saved = torch.load(os.path.join(out, f"outer_c{C}.pt"), map_location=device, weights_only=False)
-        model = Outer(**saved["config"]).to(device)
-        model.load_state_dict(saved["state_dict"])
-        Z = {s: encode(model, x) for s, x in X.items()}
-        mu, sd = Z["train"].mean((0, 2, 3)), Z["train"].std((0, 2, 3))  # (per channel, from the training images)
-        scale = args.latent_std
-        lat = {s: ((z - mu[None, :, None, None]) / sd[None, :, None, None] * scale).half().cpu() for s, z in Z.items()}
-        names = [f"latents_{t:g}.pt"] + (["latents.pt"] if t == first else [])
-        for name in names:
-            torch.save(dict(**lat, channels=C, shape=tuple(lat["train"].shape[1:]), mean=mu.cpu(), std=sd.cpu(),
-                            scale=scale, target=t, dataset=args.dataset,
-                            limits=dict(train=args.limit_train, val=args.limit_val, test=args.limit_test)),
-                       os.path.join(out, name))
-        log(f"target {t:g}: c{C}, latents {tuple(lat['train'].shape)} -> {', '.join(names)}")
-    log(f"done; {out}")
+    fig.savefig(path, dpi=150, facecolor="white")
 
 
 if __name__ == "__main__":
