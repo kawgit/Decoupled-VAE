@@ -165,12 +165,14 @@ class CompactStore:
     def __len__(self):
         return len(self.r)
 
-    def batches(self, row_batches: list[Tensor], device, dtype=torch.float32):
+    def batches(self, row_batches: list[Tensor], device, dtype=torch.float32, workers: int = 4):
         """For each rows in row_batches: (r [b, K, D] in dtype, m [b, K], tokens [b, K]) on device.
         A thread gathers the next batches' rows into reused pinned buffers while the device works on this one,
-        so copying from host memory (~K * D bytes an image) overlaps the computing."""
+        so copying from host memory (~K * D bytes an image) overlaps the computing; r's rows, nearly all the
+        bytes, are gathered by workers threads at once (one copies only so fast)."""
         import queue
         import threading
+        from concurrent.futures import ThreadPoolExecutor
 
         cuda = torch.device(device).type == "cuda"
         most = max((len(r) for r in row_batches), default=0)
@@ -180,19 +182,26 @@ class CompactStore:
             free.put([torch.empty((most,) + t.shape[1:], dtype=t.dtype, pin_memory=cuda)
                       for t in (self.r, self.scale, self.m, self.tokens)] + [None])
 
+        pool = ThreadPoolExecutor(workers)
+
         def gather():
             for rows in row_batches:
                 staged = free.get()
                 if staged[-1] is not None:
                     staged[-1].synchronize()  # (its last copy to the device is done)
-                for src, dst in zip((self.r, self.scale, self.m, self.tokens), staged[:4]):
+                step = -(-len(rows) // workers)
+                list(pool.map(lambda a: torch.index_select(self.r, 0, rows[a:a + step], out=staged[0][a:a + step]),
+                              range(0, len(rows), step)))
+                for src, dst in zip((self.scale, self.m, self.tokens), staged[1:4]):
                     torch.index_select(src, 0, rows, out=dst[:len(rows)])
                 ready.put((staged, len(rows)))
+            pool.shutdown(wait=False)
 
         threading.Thread(target=gather, daemon=True).start()
         for _ in row_batches:
             staged, n = ready.get()
-            r8, scale, m, tokens = (t[:n].to(device, non_blocking=True) for t in staged[:4])
+            # (on the CPU, a copy: the buffer is refilled at once)
+            r8, scale, m, tokens = (t[:n].to(device, non_blocking=True, copy=not cuda) for t in staged[:4])
             if cuda:
                 staged[-1] = torch.cuda.Event()
                 staged[-1].record()

@@ -302,6 +302,12 @@ if __name__ == "__main__":  # (python -m dvae.plots RECORDS PNG: a components ru
 
     import torch
 
+    if sys.argv[1] == "--prior":  # (python -m dvae.plots --prior RECORDS PNG SAMPLES: train_prior.py's redraw)
+        with open(sys.argv[2]) as f:
+            records = json.load(f)
+        plot_prior(records, sys.argv[3], torch.load(sys.argv[4], weights_only=False)
+                   if os.path.exists(sys.argv[4]) else None)
+        sys.exit(0)
     with open(sys.argv[1]) as f:
         records = json.load(f)
     pairs_path = os.path.join(os.path.dirname(sys.argv[1]), "test_pairs.pt")

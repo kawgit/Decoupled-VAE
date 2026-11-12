@@ -30,8 +30,11 @@ Run from the repo: python train_prior.py --tree artifacts/<inner job>
 """
 
 import argparse
+import json
 import math
 import os
+import subprocess
+import sys
 import time
 
 import torch
@@ -42,7 +45,6 @@ from dvae.codes import TreeCodes, own_bits
 from dvae.components import Utilization
 from dvae.data import SHAPES, get_device
 from dvae.logs import RunLog
-from dvae.plots import plot_prior
 from dvae.prior import TokenPrior, load_token_prior
 from dvae.replay import CompactStore, TreeReplay
 from dvae.stopping import add_patience_args, patience, stagnant
@@ -188,6 +190,27 @@ def main():
     records: dict = dict(K=K, B=B, history=[], best_epoch=None, baselines=dict(
         val_own=own.tolist(), val_constant=constant.tolist()))
     samples_path = os.path.splitext(args.plot)[0] + "_samples.pt"
+    records_path = os.path.splitext(args.plot)[0] + "_records.json"
+    drawing: list[subprocess.Popen] = []  # (the redraw going, if any)
+
+    def plot(final=False):
+        """Redraw the plot from records_path in a process of its own (here it would hold this one's interpreter
+        lock for a second or two each epoch). A redraw still going skips this one; final waits and draws."""
+        if drawing and drawing[0].poll() is None and not final:
+            return
+        if drawing:
+            if drawing[0].wait() != 0:
+                log(f"plot failed (exit {drawing[0].returncode})")
+            drawing.clear()
+        tmp = f"{records_path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(records, f)
+        os.replace(tmp, records_path)
+        drawing.append(subprocess.Popen([sys.executable, "-m", "dvae.plots", "--prior", records_path, args.plot,
+                                         samples_path], cwd=os.path.dirname(os.path.abspath(__file__))))
+        if final:
+            drawing[0].wait()
+
     samples: dict | None = None
     if args.samples > 0:  # (the encoder's own: the same every epoch)
         own_samples = rp.sample(args.samples, None, torch.Generator(device=device).manual_seed(args.seed))[1].cpu()
@@ -284,7 +307,7 @@ def main():
             epoch=epoch, train_loss=train_loss, val=va.tolist(), oldest=old_bits.mean(0).tolist(),
             incoming=new_bits.mean(0).tolist(), by_age=probed, gap=gap, gap_smooth=smooth, swapped=swapped,
             seconds=time.time() - run_began, wall=time.time() - began, timing=timing, util=util.mean(began)))
-        plot_prior(records, args.plot, samples)
+        plot()
         log(f"epoch {epoch}: val {describe(va)}; buffer{f' {sum(probed["y"]) / len(probed["y"]):.3f}' if probed else ''} (oldest "
             f"{old_bits.sum(1).mean():.3f}, incoming {new_bits.sum(1).mean():.3f}: gap {gap:+.3f}, averaged {smooth if smooth is not None else gap:+.3f}; swapped {swapped}, "
             f"next {rotate}); training loss {train_loss:.4f} bits/token; baselines: constant "
@@ -309,8 +332,7 @@ def main():
     own, constant = baselines(test)
     records["test"] = te.tolist()
     records["baselines"].update(test_own=own.tolist(), test_constant=constant.tolist())
-    plot_prior(records, args.plot, torch.load(samples_path, weights_only=False) if os.path.exists(samples_path)
-               else None)
+    plot(final=True)
     log(f"kept epoch {best[1]} (val {best[0]:.3f} bits/image), saved {args.out}")
     log(f"test: prior {describe(te)}")
     log(f"test: encoder's implied shares {describe(own)}")
