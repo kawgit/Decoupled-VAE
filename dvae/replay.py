@@ -87,7 +87,13 @@ class TreeReplay:
         self._replay(X, tokens, offsets)
         return offsets
 
-    def _replay(self, X: Tensor, tokens: Tensor | None, out: Tensor) -> Tensor:
+    @torch.no_grad()
+    def into_store(self, X: Tensor, tokens: Tensor, store: "CompactStore", rows: Tensor):
+        """Replay X [B, D] along tokens [B, K], writing each depth's r (8-bit, a scale per row) and m into store's
+        rows [B] (host memory): what OffsetStore.offsets rebuilds the children offsets from."""
+        self._replay(X, tokens, None, (store, rows))
+
+    def _replay(self, X: Tensor, tokens: Tensor | None, out: Tensor | None, compact=None) -> Tensor:
         g = root_group("replay", X.to(self.device).float(), self.mean, self.window)
         taken = []
         follow = tokens.to(self.device).bool() if tokens is not None else None
@@ -100,7 +106,14 @@ class TreeReplay:
                 if t + 1 < self.steps[d]:
                     hyper = next_hyperplane(r, m)
             rn, mn = r[g.node], m[g.node]
-            out[:, d].copy_(torch.stack([-mn[:, None] * rn, rn], 1).half(), non_blocking=True)
+            if compact is not None:
+                store, rows = compact
+                scale = rn.abs().amax(-1).clamp_min(1e-12) / 127
+                store.r[rows, d] = (rn / scale[:, None]).round().to(torch.int8).cpu()
+                store.scale[rows, d] = scale.half().cpu()
+                store.m[rows, d] = mn.half().cpu()
+            elif out is not None:
+                out[:, d].copy_(torch.stack([-mn[:, None] * rn, rn], 1).half(), non_blocking=True)
             kept = descend(g, *hyper, r, m, budget, self.bits, None if follow is None else follow[:, d])
             taken.append(kept["side"].long())
         if self.device.type == "cuda":
@@ -150,3 +163,27 @@ class TreeReplay:
     def image_shape(self):
         from dvae.data import SHAPES
         return SHAPES[self.args["dataset"]]
+
+
+class CompactStore:
+    """Children offsets of n images at K depths, kept in host memory as each depth's r in 8 bits with a scale per
+    row, and m: K * (D + 4) bytes per image (the offsets in half precision would be 4 * K * D). Filled by
+    TreeReplay.into_store; offsets(rows) rebuilds [b, K, 2, D] (-m r, then r) on a device."""
+
+    def __init__(self, n: int, K: int, D: int):
+        self.r = torch.empty(n, K, D, dtype=torch.int8)
+        self.scale = torch.empty(n, K, dtype=torch.half)
+        self.m = torch.empty(n, K, dtype=torch.half)
+        self.tokens = torch.zeros(n, K, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.r)
+
+    def offsets(self, rows: Tensor, device) -> Tensor:
+        r = self.r[rows].to(device, non_blocking=True).float() * self.scale[rows].to(device).float()[..., None]
+        m = self.m[rows].to(device).float()[..., None]
+        return torch.stack([-m * r, r], 2)
+
+    @staticmethod
+    def gb(n: int, K: int, D: int) -> float:
+        return n * K * (D + 12) / 2 ** 30

@@ -37,7 +37,7 @@ from dvae.plots import plot_prior
 from dvae.components import Utilization
 from dvae.prior import TokenPrior, code_token_bits, load_token_prior
 from dvae.codes import LazyRows
-from dvae.replay import TreeReplay
+from dvae.replay import CompactStore, TreeReplay
 from dvae.stopping import add_patience_args, patience, stagnant
 
 LN2 = math.log(2)
@@ -83,6 +83,17 @@ def main():
     p.add_argument("--replay-chunk", type=int, default=512,
                    help="images replayed at once into host memory, then trained on a batch at a time (the replay "
                         "costs about the same per call however many images it holds; rounded to whole batches)")
+    p.add_argument("--buffer", type=int, default=10000,
+                   help="with the replay: training images whose offsets are kept in host memory (8-bit r, ~K * D bytes "
+                        "each) and trained on each epoch, a rolling window over all of them (0: replay every training "
+                        "image every epoch)")
+    p.add_argument("--rotate", type=int, default=1000, help="images the buffer swaps at the first epoch")
+    p.add_argument("--rotate-min", type=int, default=128)
+    p.add_argument("--rotate-max", type=int, default=5000)
+    p.add_argument("--gap-tol", type=float, default=0.5,
+                   help="bits per image: each epoch the oldest images in the buffer and the next ones in (out of it "
+                        "longest) are scored before the swap; above this gap the next swap doubles, under half of "
+                        "it it halves")
     p.add_argument("--data-root", default="data")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--tf32", action="store_true")
@@ -189,40 +200,124 @@ def main():
         train_constant=constant_tr.tolist()))
     samples_path = os.path.splitext(args.plot)[0] + "_samples.pt"
     run_began, step, best = time.time(), 0, (math.inf, -1)
+    buffered = rp is not None and args.buffer > 0
+    B, ring, cursor, rotate = 0, 0, 0, 0
+    store = val_store = CompactStore(0, K, 1)
+    cycle = torch.zeros(0, dtype=torch.long)
+    if buffered:  # (a rolling window of the training images, their offsets in host memory, and val's)
+        assert rp is not None
+        B = min(args.buffer, N)
+        Dz = rp.D
+        log(f"buffer: {B} training images and the {len(val)} val images in host memory "
+            f"({CompactStore.gb(B + len(val), K, Dz):.1f} GB)")
+        store, val_store = CompactStore(B, K, Dz), CompactStore(len(val), K, Dz)
+        cycle = torch.randperm(N, generator=gen)  # (the order the training images pass through the buffer)
+
+        def fill(st: CompactStore, split: str, codes: TreeCodes, ids, slots):
+            for c in range(0, len(ids), chunk):
+                i, sl = ids[c:c + chunk], slots[c:c + chunk]
+                rp.into_store(inputs[split][i], codes.tokens[i], st, sl)
+                st.tokens[sl] = codes.tokens[i]
+
+        t0 = time.time()
+        fill(store, "train", train, cycle[:B], torch.arange(B))
+        fill(val_store, "val", val, torch.arange(len(val)), torch.arange(len(val)))
+        log(f"buffer filled in {time.time() - t0:.0f}s")
+        ring, cursor, rotate = 0, B % N, min(args.rotate, B)
+
+    @torch.no_grad()
+    def bits_of(st: CompactStore, rows) -> torch.Tensor:
+        """Each token's bits [len(rows), K] under the prior, for st's rows."""
+        prior.eval()
+        out = []
+        for i in range(0, len(rows), args.batch):
+            r = rows[i:i + args.batch]
+            tb = st.tokens[r].to(device)
+            logits = prior(st.offsets(r, device), tb)
+            out.append(F.cross_entropy(logits.flatten(0, 1).float(), tb.flatten(), reduction="none")
+                       .view(tb.shape).cpu() / LN2)
+        return torch.cat(out)
+
     for epoch in range(args.epochs):
         began = time.time()
         timing = dict(train=0.0, replay=0.0, eval=0.0, samples=0.0)
-        prior.train()
-        order = torch.randperm(N, generator=gen)
-        running = 0.0
-        for i in range(0, N, args.batch):
-            idx = order[i:i + args.batch]
-            tokens = train.tokens[idx].to(device, non_blocking=True)
-            if rp is not None:
-                if i % chunk == 0:  # (the next chunk of this epoch's order, replayed at once)
-                    t0 = time.time()
-                    cidx = order[i:i + chunk]
-                    host = rp.to_host(inputs["train"][cidx], train.tokens[cidx])
-                    timing["replay"] += time.time() - t0
-                offsets = host[i % chunk:i % chunk + args.batch].to(device, non_blocking=True)
-            else:
-                offsets = train.offsets[idx].to(device, non_blocking=True)
+        extra: dict = {}
+        swap_note = ""
+        running, trained_on = 0.0, 0
+        if buffered:
+            # (the oldest images in the buffer against the next ones in, which have been out of it longest: scored
+            # before the swap, their gap says how much the prior has fit the buffer itself)
             t0 = time.time()
-            logits = prior(offsets.float(), tokens)
-            loss = F.cross_entropy(logits.flatten(0, 1), tokens.flatten())
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
-            opt.step()
-            sched.step()
-            step += 1
-            running += loss.item() * len(idx)
-            timing["train"] += time.time() - t0
-            if step % 100 == 0:
-                log.detail(f"  step {step}: loss {loss.item() / LN2:.4f} bits/token")
-        t0, replayed = time.time(), timing["replay"]
-        tr, va = cost(prior, train_seen, "train", seen, timing), cost(prior, val, "val", None, timing)
-        timing["eval"] += time.time() - t0 - (timing["replay"] - replayed)  # (scoring, less its replay)
+            slots = (ring + torch.arange(rotate)) % B
+            ids = cycle[(cursor + torch.arange(rotate)) % N]
+            old_bits = bits_of(store, slots)
+            timing["eval"] += time.time() - t0
+            t0 = time.time()
+            fill(store, "train", train, ids, slots)
+            timing["replay"] += time.time() - t0
+            t0 = time.time()
+            new_bits = bits_of(store, slots)
+            timing["eval"] += time.time() - t0
+            gap = new_bits.sum(1).mean().item() - old_bits.sum(1).mean().item()
+            extra = dict(fresh=new_bits.mean(0).tolist(), gap=gap, rotate=rotate)
+            swap_note = (f"buffer: swapped {rotate} (oldest {old_bits.sum(1).mean().item():.3f}, incoming "
+                         f"{new_bits.sum(1).mean().item():.3f} bits/image: gap {gap:+.3f}); ")
+            ring, cursor = (ring + rotate) % B, (cursor + rotate) % N
+            prior.train()
+            for idx in torch.randperm(B, generator=gen).split(args.batch):
+                t0 = time.time()
+                tokens = store.tokens[idx].to(device, non_blocking=True)
+                logits = prior(store.offsets(idx, device), tokens)
+                loss = F.cross_entropy(logits.flatten(0, 1), tokens.flatten())
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
+                opt.step()
+                sched.step()
+                step += 1
+                running += loss.item() * len(idx)
+                trained_on += len(idx)
+                timing["train"] += time.time() - t0
+                if step % 100 == 0:
+                    log.detail(f"  step {step}: loss {loss.item() / LN2:.4f} bits/token")
+            t0 = time.time()
+            tr, va = old_bits.mean(0), bits_of(val_store, torch.arange(len(val))).mean(0)
+            timing["eval"] += time.time() - t0
+            if epoch > 0:  # (the first swap's oldest images had not been trained on more than the rest)
+                rotate = min(rotate * 2, args.rotate_max, B) if gap > args.gap_tol else \
+                    max(rotate // 2, args.rotate_min) if gap < args.gap_tol / 2 else rotate
+        else:
+            prior.train()
+            order = torch.randperm(N, generator=gen)
+            for i in range(0, N, args.batch):
+                idx = order[i:i + args.batch]
+                tokens = train.tokens[idx].to(device, non_blocking=True)
+                if rp is not None:
+                    if i % chunk == 0:  # (the next chunk of this epoch's order, replayed at once)
+                        t0 = time.time()
+                        cidx = order[i:i + chunk]
+                        host = rp.to_host(inputs["train"][cidx], train.tokens[cidx])
+                        timing["replay"] += time.time() - t0
+                    offsets = host[i % chunk:i % chunk + args.batch].to(device, non_blocking=True)
+                else:
+                    offsets = train.offsets[idx].to(device, non_blocking=True)
+                t0 = time.time()
+                logits = prior(offsets.float(), tokens)
+                loss = F.cross_entropy(logits.flatten(0, 1), tokens.flatten())
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
+                opt.step()
+                sched.step()
+                step += 1
+                running += loss.item() * len(idx)
+                trained_on += len(idx)
+                timing["train"] += time.time() - t0
+                if step % 100 == 0:
+                    log.detail(f"  step {step}: loss {loss.item() / LN2:.4f} bits/token")
+            t0, replayed = time.time(), timing["replay"]
+            tr, va = cost(prior, train_seen, "train", seen, timing), cost(prior, val, "val", None, timing)
+            timing["eval"] += time.time() - t0 - (timing["replay"] - replayed)  # (scoring, less its replay)
         improved = va.sum().item() < best[0]
         if improved:
             best = (va.sum().item(), epoch)
@@ -240,12 +335,15 @@ def main():
             samples = dict(prior=from_prior.cpu(), own=from_own.cpu(), shape=sampler.image_shape())
             torch.save(samples, samples_path)
             timing["samples"] += time.time() - t0
-        records["history"].append(dict(epoch=epoch, train_loss=running / N / LN2, train=tr.tolist(), val=va.tolist(),
+        records["history"].append(dict(epoch=epoch, train_loss=running / max(trained_on, 1) / LN2, train=tr.tolist(),
+                                       val=va.tolist(), **extra,
                                        seconds=time.time() - run_began, wall=time.time() - began,
                                        timing=timing, util=util.mean(began)))
         plot_prior(records, args.plot, samples)
         stop = stagnant(epoch, best[1], args)
-        log(f"epoch {epoch}: val {describe(va)}; train {describe(tr)}; training loss {running / N / LN2:.4f} "
+        if swap_note:
+            log(swap_note + f"next swap {rotate}")
+        log(f"epoch {epoch}: val {describe(va)}; train {describe(tr)}; training loss {running / max(trained_on, 1) / LN2:.4f} "
             f"bits/token; baselines: constant {constant.sum():.3f}, encoder's shares {own.sum():.3f}; best "
             f"{best[0]:.3f} at epoch {best[1]}{' (this one)' if improved else ''}; {time.time() - began:.0f}s: "
             + ", ".join(f"{k} {v:.0f}" for k, v in timing.items())

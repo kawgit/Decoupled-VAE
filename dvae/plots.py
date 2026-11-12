@@ -215,8 +215,13 @@ def plot_prior(records, path, samples=None):
 
     window = max(1, K // 50)
     xs = np.arange(1, K + 1)
-    for split, color in (("train", COMPONENT_COLORS["train"]), ("val", COMPONENT_COLORS["val"])):
-        by_depth.plot(xs, _smooth(best[split], window), color=color, linewidth=1.6, label=f"{split}, prior")
+    buffered = "fresh" in history[-1]  # (a rolling buffer: "train" is its oldest images, "fresh" the incoming)
+    names = dict(train="oldest in buffer" if buffered else "train", val="val", fresh="incoming (unseen)")
+    curves = [("train", COMPONENT_COLORS["train"]), ("val", COMPONENT_COLORS["val"])] + \
+        ([("fresh", PRIOR)] if buffered else [])
+    for split, color in curves:
+        if split in best:
+            by_depth.plot(xs, _smooth(best[split], window), color=color, linewidth=1.6, label=f"{names[split]}, prior")
     if "test" in records:
         by_depth.plot(xs, _smooth(records["test"], window), color=COMPONENT_COLORS["test"], linewidth=1.6,
                       label="test, prior")
@@ -230,15 +235,18 @@ def plot_prior(records, path, samples=None):
            "bits per token")
 
     hours = [h["seconds"] / 3600 for h in history]
-    for split, color in (("train", COMPONENT_COLORS["train"]), ("val", COMPONENT_COLORS["val"])):
-        by_hour.plot(hours, [sum(h[split]) for h in history], color=color, linewidth=1.6, marker="o", markersize=3,
-                     label=f"{split}, prior")
+    for split, color in curves:
+        pts = [(hr, sum(h[split])) for hr, h in zip(hours, history) if split in h]
+        if pts:
+            by_hour.plot(*zip(*pts), color=color, linewidth=1.6, marker="o", markersize=3, label=f"{names[split]}, prior")
     by_hour.axhline(sum(base["val_constant"]), color=INK, linewidth=1.2, linestyle=":", label="val, constant share")
     by_hour.axhline(sum(base["val_own"]), color=MUTED, linewidth=1.2, linestyle="--", label="val, encoder's shares")
     by_hour.plot([best["seconds"] / 3600], [sum(best["val"])], "o", color=COMPONENT_COLORS["val"], markersize=8,
                  markerfacecolor="none", markeredgewidth=1.6, label="kept epoch")
     by_hour.legend(frameon=False, labelcolor=INK, fontsize=8)
-    _style(by_hour, f"Bits per image (kept: val {sum(best['val']):.2f}; {K} tokens)", "hours", "bits per image")
+    _style(by_hour, f"Bits per image (kept: val {sum(best['val']):.2f}; {K} tokens"
+           + (f"; buffer swaps {history[-1]['rotate']}, gap {history[-1]['gap']:+.2f})" if buffered else ")"),
+           "hours", "bits per image")
 
     epochs = [h["epoch"] for h in history]
     bottom = np.zeros(len(history))
