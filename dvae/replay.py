@@ -106,3 +106,47 @@ class TreeReplay:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)  # (the copies into host memory are done)
         return torch.stack(taken, 1).to(self.device)
+
+    @torch.no_grad()
+    def sample(self, n: int, prior=None, generator: torch.Generator | None = None) -> tuple[Tensor, Tensor]:
+        """n codes drawn depth by depth (each token's side from prior, a TokenPrior reading the children offsets
+        and tokens so far, or with none from the encoder's own share m / (1 + m)), and the images their nodes
+        decode to: (tokens [n, K], images [n, image numbers] in [0, 1], through the outer decoder for a run on an
+        outer run's latents)."""
+        g = root_group("sample", self.mean.expand(n, -1).clone(), self.mean, self.window)
+        offsets = torch.zeros(n, self.K, 2, self.D, dtype=torch.half, device=self.device)
+        tokens = torch.zeros(n, self.K, dtype=torch.long, device=self.device)
+        for d in range(self.K):
+            hyper = (self.starts[d].expand(g.nodes, -1), g.R.new_zeros(g.nodes))
+            r = m = g.R.new_zeros(0)
+            for t, net in enumerate(self.nets[d]):
+                r, m = answers(net, g, *hyper, self.node_batch)
+                if t + 1 < self.steps[d]:
+                    hyper = next_hyperplane(r, m)
+            rn, mn = r[g.node], m[g.node]
+            offsets[:, d] = torch.stack([-mn[:, None] * rn, rn], 1).half()
+            if prior is None:
+                rare = mn.clamp_min(0) / (1 + mn.clamp_min(0))
+            else:  # (the prior reads this depth's children and the tokens before it)
+                rare = prior(offsets[:, :d + 1].float(), tokens[:, :d + 1])[:, d].float().softmax(-1)[:, 1]
+            side = torch.rand(n, device=self.device, generator=generator) < rare
+            tokens[:, d] = side.long()
+            descend(g, *hyper, r, m, float("inf"), self.bits, side)
+        return tokens, self.to_images(self.mean - g.R)
+
+    @torch.no_grad()
+    def to_images(self, Z: Tensor) -> Tensor:
+        """The run's inputs Z [n, D] (pixels, or an outer run's latents) as images [n, image numbers] in [0, 1]."""
+        if not self.args.get("outer"):
+            return Z.clamp(0, 1)
+        from dvae.outer import decode_latents, load_outer
+        if not hasattr(self, "_outer"):
+            self._outer = load_outer(self.args["outer"], self.device)
+        model, lat = self._outer
+        bf16 = self.args.get("bf16", False)
+        return decode_latents(model, lat, Z, lambda: torch.autocast(self.device.type, dtype=torch.bfloat16 if bf16
+                                                                     else torch.float16, enabled=self.device.type == "cuda"))
+
+    def image_shape(self):
+        from dvae.data import SHAPES
+        return SHAPES[self.args["dataset"]]

@@ -187,30 +187,88 @@ def _save(fig, path):
     plt.close(fig)
 
 
-def plot_prior(history, edges, kept, path):
-    """Save a prior run's progress (train_prior.py): each band of depths' bits per token by epoch on the val
-    codes and on the fixed train subset, one line per band (darker is deeper), each band's kept epoch marked.
-    history holds dicts with "epoch", "val" and "train" (bits per token, per depth); edges [bands + 1] cut the
-    depths into bands, and kept [bands] is each band's kept epoch (-1 for none yet)."""
+def _smooth(ys, window):
+    """A centred moving average of ys (shorter at the ends)."""
+    ys = np.asarray(ys, dtype=float)
+    if window <= 1 or len(ys) < 3:
+        return ys
+    c = np.concatenate([[0.0], np.cumsum(ys)])
+    lo = np.clip(np.arange(len(ys)) - window // 2, 0, len(ys))
+    hi = np.clip(np.arange(len(ys)) + window // 2 + 1, 0, len(ys))
+    return (c[hi] - c[lo]) / (hi - lo)
+
+
+def plot_prior(records, path, samples=None):
+    """Save a prior run's progress (train_prior.py): bits per token by code position (the kept epoch's train and
+    val, and test once scored, beside the constant-share and encoder's-share baselines; a moving average over
+    about 2% of the depths); bits per image against hours (each epoch's train and val, the baselines as lines);
+    each epoch's seconds by part with the GPU's utilization; and, given samples (dict of "prior" and "own" images
+    [n, numbers] and "shape"), codes sampled from the prior (top) and from the encoder's own shares (bottom)."""
+    history = records["history"]
     if not history:
         return
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    K, base = records["K"], records["baselines"]
+    best = next((h for h in history if h["epoch"] == records.get("best_epoch")), history[-1])
+    fig = plt.figure(figsize=(19, 12.5 if samples is not None else 6.5))
+    grid = fig.add_gridspec(2 if samples is not None else 1, 3, height_ratios=[1, 0.5] if samples is not None else [1])
+    by_depth, by_hour, time_ax = (fig.add_subplot(grid[0, i]) for i in range(3))
+
+    window = max(1, K // 50)
+    xs = np.arange(1, K + 1)
+    for split, color in (("train", COMPONENT_COLORS["train"]), ("val", COMPONENT_COLORS["val"])):
+        by_depth.plot(xs, _smooth(best[split], window), color=color, linewidth=1.6, label=f"{split}, prior")
+    if "test" in records:
+        by_depth.plot(xs, _smooth(records["test"], window), color=COMPONENT_COLORS["test"], linewidth=1.6,
+                      label="test, prior")
+    by_depth.plot(xs, _smooth(base["val_constant"], window), color=INK, linewidth=1.2, linestyle=":",
+                  label="val, constant share per depth")
+    by_depth.plot(xs, _smooth(base["val_own"], window), color=MUTED, linewidth=1.2, linestyle="--",
+                  label="val, the encoder's own shares")
+    by_depth.xaxis.set_major_locator(MaxNLocator(integer=True))
+    by_depth.legend(frameon=False, labelcolor=INK, fontsize=8)
+    _style(by_depth, f"Bits per token by code position (epoch {best['epoch']}; {window}-depth average)", "tokens",
+           "bits per token")
+
+    hours = [h["seconds"] / 3600 for h in history]
+    for split, color in (("train", COMPONENT_COLORS["train"]), ("val", COMPONENT_COLORS["val"])):
+        by_hour.plot(hours, [sum(h[split]) for h in history], color=color, linewidth=1.6, marker="o", markersize=3,
+                     label=f"{split}, prior")
+    by_hour.axhline(sum(base["val_constant"]), color=INK, linewidth=1.2, linestyle=":", label="val, constant share")
+    by_hour.axhline(sum(base["val_own"]), color=MUTED, linewidth=1.2, linestyle="--", label="val, encoder's shares")
+    by_hour.plot([best["seconds"] / 3600], [sum(best["val"])], "o", color=COMPONENT_COLORS["val"], markersize=8,
+                 markerfacecolor="none", markeredgewidth=1.6, label="kept epoch")
+    by_hour.legend(frameon=False, labelcolor=INK, fontsize=8)
+    _style(by_hour, f"Bits per image (kept: val {sum(best['val']):.2f}; {K} tokens)", "hours", "bits per image")
+
     epochs = [h["epoch"] for h in history]
-    deep = Normalize(vmin=0, vmax=max(len(edges) - 2, 1))
-    for ax, split in zip(axes, ("val", "train")):
-        for b, (lo, hi) in enumerate(zip(edges, edges[1:])):
-            ys = [sum(h[split][lo:hi]) / (hi - lo) for h in history]
-            color = RAMP(deep(b))
-            ax.plot(epochs, ys, color=color, linewidth=1.6, marker="o", markersize=3, label=f"depths {lo + 1}-{hi}")
-            if kept[b] in epochs:
-                at = epochs.index(kept[b])
-                ax.plot([kept[b]], [ys[at]], "o", color=color, markersize=6.5, markeredgecolor="white",
-                        markeredgewidth=1.5, zorder=3)
-        ax.axhline(1.0, color=MUTED, linewidth=1, linestyle=(0, (4, 3)))
-        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-        _style(ax, f"{split} codes: bits per token by band (dots: each band's kept epoch)", "epoch",
-               "bits per token, mean over the band")
-    axes[0].legend(frameon=False, fontsize=8, ncol=2, loc="lower left")
+    bottom = np.zeros(len(history))
+    parts = [("train", COMPONENT_COLORS["val"]), ("replay", PRIOR), ("eval", COMPONENT_COLORS["train"]),
+             ("samples", COMPONENT_COLORS["test"])]
+    for part, color in parts:
+        ys = np.array([h["timing"].get(part, 0.0) / 60 for h in history])
+        time_ax.bar(epochs, ys, bottom=bottom, color=color, width=0.8, label=part)
+        bottom += ys
+    busy = [(h["epoch"], h["util"]) for h in history if h.get("util") is not None]
+    if busy:
+        twin = time_ax.twinx()
+        twin.plot(*zip(*busy), color=INK, linewidth=1.2, marker="o", markersize=3)
+        twin.set_ylim(0, 105)
+        twin.set_ylabel("GPU % busy", color=MUTED)
+        twin.tick_params(colors=MUTED)
+    time_ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    time_ax.legend(frameon=False, labelcolor=INK, fontsize=8, loc="upper left")
+    _style(time_ax, f"Minutes per epoch ({hours[-1]:.2f} h in all)", "epoch", "minutes")
+
+    if samples is not None:
+        ax = fig.add_subplot(grid[1, :])
+        shape = tuple(samples["shape"])
+        rows = [samples["prior"].view(-1, *shape).numpy(), samples["own"].view(-1, *shape).numpy()]
+        shown = _pair_grid(rows[0], rows[1])
+        ax.imshow(shown[..., 0] if shown.shape[-1] == 1 else shown, cmap="gray", vmin=0, vmax=1,
+                  interpolation="nearest")
+        ax.set_axis_off()
+        ax.set_title(f"Codes sampled from the prior (top) and from the encoder's own shares (bottom), epoch "
+                     f"{history[-1]['epoch']}", loc="left", fontsize=11, color=INK)
     _save(fig, path)
 
 

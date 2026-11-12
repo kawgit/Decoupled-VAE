@@ -1,4 +1,4 @@
-"""Stage 2: train the prior (dvae/prior.py's TokenPrior), a causal transformer over the encoder's codes that
+"""Stage 4: train the prior (dvae/prior.py's TokenPrior), a causal transformer over the inner encoder's codes that
 predicts each token (one of V children), on the codes a train_inner_components.py run keeps in its tree/ folder.
 
 The prior reads each node's children (their centroids) and the tokens before, not the shares the encoder implies
@@ -6,18 +6,19 @@ The prior reads each node's children (their centroids) and the tokens before, no
 training codes and minimizes the cross-entropy of every token, all depths at once. Every epoch logs, in bits, the
 train codes' cost (a fixed subset, scored as val is) and the val codes' cost per image and per range of depths,
 beside two baselines the prior has to beat: the encoder's implied shares and the best constant share of each token
-per depth (fit on the train codes). Early stopping watches the val cost separately in each of
---bands bands of depths (equal widths), since depths need different amounts of training: each band keeps the
-weights of the epoch with its lowest val cost, stops once it goes a --patience-frac share of the run's epochs (at least --patience) without
-a better one (dvae/stopping.py; the model still trains on every depth), and the run ends when every band has stopped. The kept prior answers each depth
-with its band's weights (dvae/prior.py's BandedTokenPrior; --bands 1 is one early stop for all), and at the end it is
-scored on the test codes against the same baselines. The progress plot (dvae/plots.py's plot_prior) is redrawn
-every epoch.
+per depth (fit on the train codes). Early stopping keeps the epoch with the lowest val bits per image and stops once
+a --patience-frac share of the run's epochs (at least --patience) passes without a better one (dvae/stopping.py);
+the kept prior is then scored on the test codes against the same baselines.
 
 With --replay (automatic when the run kept no r), each batch's children offsets are computed by replaying the
 run's inner networks on its images (dvae/replay.py) instead of read from tree/, so a deep tree needs no stored r.
+Every epoch it also samples --samples codes from the prior and as many from the encoder's own shares, decoded.
 
-Run from the repo: python train_prior.py --tree artifacts/<encoder job> --images
+The progress plot (the log's path as .png, dvae/plots.py's plot_prior), redrawn every epoch: bits per token by code
+position (the kept epoch's train, val and test, beside the baselines), bits per image against hours, each epoch's
+seconds by part with the GPU's use, and the samples.
+
+Run from the repo: python train_prior.py --tree artifacts/<inner job>
 """
 
 import argparse
@@ -33,7 +34,8 @@ from dvae.codes import TreeCodes, own_bits
 from dvae.data import SHAPES, get_device
 from dvae.logs import RunLog
 from dvae.plots import plot_prior
-from dvae.prior import TokenPrior, band_edges, code_token_bits, load_token_prior
+from dvae.components import Utilization
+from dvae.prior import TokenPrior, code_token_bits, load_token_prior
 from dvae.codes import LazyRows
 from dvae.replay import TreeReplay
 from dvae.stopping import add_patience_args, patience, stagnant
@@ -68,7 +70,10 @@ def main():
     p.add_argument("--batch", type=int, default=256)
     p.add_argument("--epochs", type=int, default=1000)
     add_patience_args(p)
-    p.add_argument("--bands", type=int, default=8, help="bands of depths, each early-stopped on its own")
+    p.add_argument("--init", default=None, metavar="CKPT",
+                   help="start from an earlier prior.pt's weights (one per band in old checkpoints: the latest is taken)")
+    p.add_argument("--samples", type=int, default=12, help="codes sampled each epoch, from the prior and from the "
+                                                        "encoder's own shares (needs the run's networks)")
     p.add_argument("--train-eval", type=int, default=5000, help="train codes scored each epoch, beside val")
     p.add_argument("--replay", action="store_true",
                    help="compute each batch's children offsets by replaying the run's networks (dvae/replay.py) "
@@ -124,14 +129,19 @@ def main():
     chunk = max(1, args.replay_chunk // args.batch) * args.batch
 
     @torch.no_grad()
-    def cost(model, codes: TreeCodes, split: str, rows=None):
+    def cost(model, codes: TreeCodes, split: str, rows=None, timing: dict | None = None):
+        """The bits each of codes' tokens costs under model, mean over codes [K]; timing (if given) gets the
+        replay's seconds added to its "replay"."""
         if rp is None:
             return code_token_bits(model, offsets_of(codes, split, rows), codes.tokens, device, args.batch).mean(0)
         model.eval()  # (as code_token_bits, a chunk replayed at a time)
         X = inputs[split] if rows is None else inputs[split][rows]
         bits = []
         for c in range(0, len(X), chunk):
+            t0 = time.time()
             host = rp.to_host(X[c:c + chunk], codes.tokens[c:c + chunk])
+            if timing is not None:
+                timing["replay"] += time.time() - t0
             for i in range(0, len(host), args.batch):
                 tb = codes.tokens[c + i:c + i + args.batch].to(device)
                 logits = model(host[i:i + args.batch].to(device, non_blocking=True).float(), tb)
@@ -150,6 +160,11 @@ def main():
                        shape=shape).to(device)
     if args.images:  # the children's centroids are offsets from the predicted means, which start from the training mean
         prior.mean.copy_(train.mean.to(device))
+    if args.init:
+        ckpt = torch.load(args.init, map_location=device, weights_only=False)
+        state = ckpt["state_dict"] if "state_dict" in ckpt else ckpt["states"][max(ckpt["states"])]
+        prior.load_state_dict(state)
+        log(f"started from {args.init} (its epoch {ckpt.get('epoch')})")
     decay = [q for q in prior.parameters() if q.dim() >= 2]
     rest = [q for q in prior.parameters() if q.dim() < 2]
     opt = torch.optim.AdamW([dict(params=decay, weight_decay=args.wd), dict(params=rest, weight_decay=0.0)],
@@ -164,16 +179,19 @@ def main():
         got = rp(inputs["train"][seen[:args.batch]])[1].cpu()
         log(f"replayed codes, left to themselves, match tree/'s on {(got == train_seen.tokens[:args.batch]).float().mean().item():.4%}"
             f" of {got.numel()} tokens (low-precision rounding in other batch shapes); the replay follows tree/'s")
-    edges = band_edges(K, args.bands)
-    spans = list(zip(edges, edges[1:]))
-    names = [f"{lo + 1}-{hi}" for lo, hi in spans]
-    log(f"bands of depths: {', '.join(names)}")
-    history, step = [], 0
-    best = [(math.inf, -1)] * len(spans)  # each band's lowest val cost (bits per image) and its epoch
-    stopped = [False] * len(spans)
-    states = {}  # the kept epochs' weights, on the CPU
+    sampler = rp
+    if sampler is None and args.samples > 0 and os.path.isdir(os.path.join(args.tree, "models")):
+        sampler = TreeReplay(args.tree, device, K, args.node_batch)
+    util = Utilization(device)
+    own_tr, constant_tr = baselines(train_seen)
+    records: dict = dict(K=K, history=[], best_epoch=None, baselines=dict(
+        val_own=own.tolist(), val_constant=constant.tolist(), train_own=own_tr.tolist(),
+        train_constant=constant_tr.tolist()))
+    samples_path = os.path.splitext(args.plot)[0] + "_samples.pt"
+    run_began, step, best = time.time(), 0, (math.inf, -1)
     for epoch in range(args.epochs):
         began = time.time()
+        timing = dict(train=0.0, replay=0.0, eval=0.0, samples=0.0)
         prior.train()
         order = torch.randperm(N, generator=gen)
         running = 0.0
@@ -182,11 +200,14 @@ def main():
             tokens = train.tokens[idx].to(device, non_blocking=True)
             if rp is not None:
                 if i % chunk == 0:  # (the next chunk of this epoch's order, replayed at once)
+                    t0 = time.time()
                     cidx = order[i:i + chunk]
                     host = rp.to_host(inputs["train"][cidx], train.tokens[cidx])
+                    timing["replay"] += time.time() - t0
                 offsets = host[i % chunk:i % chunk + args.batch].to(device, non_blocking=True)
             else:
                 offsets = train.offsets[idx].to(device, non_blocking=True)
+            t0 = time.time()
             logits = prior(offsets.float(), tokens)
             loss = F.cross_entropy(logits.flatten(0, 1), tokens.flatten())
             opt.zero_grad(set_to_none=True)
@@ -196,42 +217,52 @@ def main():
             sched.step()
             step += 1
             running += loss.item() * len(idx)
+            timing["train"] += time.time() - t0
             if step % 100 == 0:
                 log.detail(f"  step {step}: loss {loss.item() / LN2:.4f} bits/token")
-        trained = time.time() - began
-        tr, va = cost(prior, train_seen, "train", seen), cost(prior, val, "val")
-        history.append(dict(epoch=epoch, train_loss=running / N / LN2, train=tr.tolist(), val=va.tolist(),
-                            seconds=time.time() - began))
-        improved = []
-        for b, (lo, hi) in enumerate(spans):
-            band_cost = va[lo:hi].sum().item()
-            if not stopped[b] and band_cost < best[b][0]:
-                best[b] = (band_cost, epoch)
-                improved.append(names[b])
+        t0, replayed = time.time(), timing["replay"]
+        tr, va = cost(prior, train_seen, "train", seen, timing), cost(prior, val, "val", None, timing)
+        timing["eval"] += time.time() - t0 - (timing["replay"] - replayed)  # (scoring, less its replay)
+        improved = va.sum().item() < best[0]
         if improved:
-            states[epoch] = {k: v.detach().cpu().clone() for k, v in prior.state_dict().items()}
-            kept = [e for _, e in best]
-            states = {e: w for e, w in states.items() if e in kept}
-            torch.save(dict(config=prior.config, bands=edges, band_epochs=kept, states=states, args=vars(args),
-                            codes=args.tree, encoder=train.ckpt, epoch=epoch, history=history), args.out)
-        stopped = [done or stagnant(epoch, e, args) for done, (_, e) in zip(stopped, best)]
-        plot_prior(history, edges, [e for _, e in best], args.plot)
-        bands_now = ", ".join(f"{n}@{e}" + (" stopped" if done else "")
-                              for n, (_, e), done in zip(names, best, stopped))
-        log(f"epoch {epoch}: val {describe(va)}; train {describe(tr)}; training loss "
-            f"{running / N / LN2:.4f} bits/token; encoder's implied shares {own.sum():.3f}; kept bands "
-            f"{sum(c for c, _ in best):.3f} bits/image ({bands_now})"
-            f"{'; better in ' + ', '.join(improved) if improved else ''} ({trained:.0f}s train, "
-            f"{time.time() - began - trained:.0f}s eval)")
-        if all(stopped):
-            log(f"every band went {patience(epoch, args)} epochs or more without a better val cost: stopping")
+            best = (va.sum().item(), epoch)
+            records["best_epoch"] = epoch
+            torch.save(dict(config=prior.config, state_dict=prior.state_dict(), args=vars(args), codes=args.tree,
+                            encoder=train.ckpt, epoch=epoch, history=records["history"]), args.out)
+        samples = None
+        if sampler is not None and args.samples > 0:
+            t0 = time.time()
+            prior.eval()
+            sg = torch.Generator(device=device).manual_seed(args.seed)  # (the same draws every epoch)
+            _, from_prior = sampler.sample(args.samples, prior, sg)
+            sg = torch.Generator(device=device).manual_seed(args.seed)
+            _, from_own = sampler.sample(args.samples, None, sg)
+            samples = dict(prior=from_prior.cpu(), own=from_own.cpu(), shape=sampler.image_shape())
+            torch.save(samples, samples_path)
+            timing["samples"] += time.time() - t0
+        records["history"].append(dict(epoch=epoch, train_loss=running / N / LN2, train=tr.tolist(), val=va.tolist(),
+                                       seconds=time.time() - run_began, wall=time.time() - began,
+                                       timing=timing, util=util.mean(began)))
+        plot_prior(records, args.plot, samples)
+        stop = stagnant(epoch, best[1], args)
+        log(f"epoch {epoch}: val {describe(va)}; train {describe(tr)}; training loss {running / N / LN2:.4f} "
+            f"bits/token; baselines: constant {constant.sum():.3f}, encoder's shares {own.sum():.3f}; best "
+            f"{best[0]:.3f} at epoch {best[1]}{' (this one)' if improved else ''}; {time.time() - began:.0f}s: "
+            + ", ".join(f"{k} {v:.0f}" for k, v in timing.items())
+            + (f"; GPU {records['history'][-1]['util']:.0f}% busy" if records["history"][-1]["util"] is not None
+               else ""))
+        if stop:
+            log(f"{patience(epoch, args)} epochs without a better val cost: stopping")
             break
 
     kept = load_token_prior(torch.load(args.out, map_location=device, weights_only=False), device)
     own, constant = baselines(test)
     te = cost(kept, test, "test")
-    log(f"kept epochs per band {', '.join(f'{n}@{e}' for n, (_, e) in zip(names, best))} (val "
-        f"{sum(c for c, _ in best):.3f} bits/image), saved {args.out}")
+    records["test"] = te.tolist()
+    records["baselines"].update(test_own=own.tolist(), test_constant=constant.tolist())
+    plot_prior(records, args.plot, torch.load(samples_path, weights_only=False) if os.path.exists(samples_path)
+               else None)
+    log(f"kept epoch {best[1]} (val {best[0]:.3f} bits/image), saved {args.out}")
     log(f"test: prior {describe(te)}")
     log(f"test: encoder's implied shares {describe(own)}")
     log(f"test: constant share per depth {describe(constant)}")
