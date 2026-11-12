@@ -202,6 +202,10 @@ def main():
     log(f"=== train_inner_components.py {time.strftime('%Y-%m-%d')} {vars(args)}")
     began = time.time()
 
+    # (before the init run's settings are compared: with --outer the dataset is the outer run's)
+    outer, lat = load_outer(args.outer, device) if args.outer else (None, None)
+    if lat is not None:
+        args.dataset = lat["dataset"]
     old = None
     if init is not None:
         with open(os.path.join(init, "records.json")) as f:
@@ -212,6 +216,8 @@ def main():
             "limit_val", "seed", "flip", "outer")
     if old is not None:
         differ = [k for k in same if old["args"].get(k, parser_defaults.get(k)) != getattr(args, k)]
+        if differ and args.resume:  # (going on would overwrite the run's own records, networks and tree)
+            raise SystemExit(f"--resume: {init} differs in {', '.join(differ)}; resume it with its own settings")
         if differ:
             log(f"{init} differs in {', '.join(differ)}: its networks are warm starts only, none reused as they are")
             old["models"], old["depths"] = [], []
@@ -219,10 +225,8 @@ def main():
     old_depths = {r["d"]: r for r in old["depths"]} if old else {}
 
     limits = (("train", args.limit_train), ("val", args.limit_val), ("test", args.limit_test))
-    outer, lat = load_outer(args.outer, device) if args.outer else (None, None)
     if lat is not None:  # (the outer encoder's latents of the outer run's images, in their order)
         assert not args.flip, "--flip with --outer: the latents are of the images as they are"
-        args.dataset = lat["dataset"]
         data = {s: lat[s][:lim].float().flatten(1).to(device) for s, lim in limits}
     else:
         images = {s: load_images(args.dataset, s, args.data_root)[:lim] for s, lim in limits}
