@@ -291,7 +291,7 @@ def plot_prior(records, path, samples=None):
         ax.imshow(shown[..., 0] if shown.shape[-1] == 1 else shown, cmap="gray", vmin=0, vmax=1,
                   interpolation="nearest")
         ax.set_axis_off()
-        ax.set_title(f"Sampled codes: the prior (top), the encoder's own shares (bottom); epoch {history[-1]['epoch']}",
+        ax.set_title(f"Sampled codes: the prior (top), the encoder's own shares (bottom); epoch {samples.get('epoch', history[-1]['epoch'])}",
                      loc="left", fontsize=11, color=INK)
     _save(fig, path)
 

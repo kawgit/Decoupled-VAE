@@ -41,13 +41,14 @@ class SideMeans(nn.Module):
 
 
 class TokenPrior(nn.Module):
-    """A prior over a tree's codes (dvae/codes.py's TreeCodes): p(token k | tokens before it), V-way. Each token
-    reads its node's V children (each centroid offset's direction and log length plus a slot embedding, summed
-    over the children) and the token before (none at the root); causal attention
-    lets it see everything earlier but not its own token. It does not read the encoder's implied shares (they are
-    train_prior.py's baseline); its head starts at zero, so an untrained prior is uniform. With images=True, each
-    token also shows its children's centroids as images (the node's predicted mean plus each offset), one
-    V-channel 28x28 image read by a small convolutional net."""
+    """A prior over a tree's codes (dvae/codes.py's TreeCodes): p(token k | tokens before it), V = 2-way. Each
+    token reads its node's split: the rare child's offset r (its direction, and its log length) and m (the common
+    child's offset is -m r), and the token before (none at the root); causal attention lets it see everything
+    earlier but not its own token. (The two children's offsets are not read as two inputs summed through one
+    layer: -r and r would cancel, leaving only their lengths.) It does not read the encoder's implied shares (they
+    are train_prior.py's baseline); its head starts at zero, so an untrained prior is uniform. With images=True,
+    each token also shows its children's centroids as images (the node's predicted mean plus each offset), one
+    V-channel image read by a small convolutional net."""
 
     mean: Tensor  # [D] the tree's training mean, with images
 
@@ -55,11 +56,11 @@ class TokenPrior(nn.Module):
                  shape=(1, 28, 28)):
         super().__init__()
         shape = tuple(shape)
-        assert D == shape[0] * shape[1] * shape[2], (D, shape)
+        assert V == 2 and D == shape[0] * shape[1] * shape[2], (V, D, shape)
         self.config = dict(depths=depths, V=V, width=width, layers=layers, heads=heads, dropout=dropout, D=D,
                            images=images, shape=shape)
-        self.child_in = nn.Linear(D + 1, width)
-        self.slot = nn.Parameter(torch.randn(V, width) * 0.02)
+        self.direction_in = nn.Linear(D, width)
+        self.scalars_in = nn.Linear(3, width)  # log |r|, m, log m
         self.means_in = SideMeans(width, count=V, shape=shape) if images else None
         if images:
             self.register_buffer("mean", torch.zeros(D))
@@ -73,16 +74,20 @@ class TokenPrior(nn.Module):
         nn.init.zeros_(self.head.bias)
         self.V = V
 
-    def forward(self, offsets: Tensor, tokens: Tensor) -> Tensor:
-        """Logits [B, k, V] for each token of codes with children offsets [B, k, V, D] and tokens [B, k] (only
-        those before each token are read, so the last may be anything)."""
+    def forward(self, r: Tensor, m: Tensor, tokens: Tensor) -> Tensor:
+        """Logits [B, k, V] for each token of codes whose nodes split with rare offsets r [B, k, D] and m [B, k]
+        (the common offset -m r), with tokens [B, k] (only those before each token are read, so the last may be
+        anything)."""
         B, k = tokens.shape
-        length = offsets.norm(dim=-1, keepdim=True).clamp_min(EPS)
-        h = (self.child_in(torch.cat([offsets / length, length.log()], -1)) + self.slot).sum(2)
+        length = r.norm(dim=-1, keepdim=True).float().clamp_min(EPS)
+        m = m.float()[..., None]
+        h = self.direction_in(r / length.to(r.dtype)) + self.scalars_in(
+            torch.cat([length.log(), m, m.clamp_min(EPS).log()], -1))
         before = torch.cat([tokens.new_full((B, 1), self.V), tokens[:, :-1]], 1)
         h = h + self.token_in(before)
         if self.means_in is not None:
-            taken = offsets.gather(2, tokens[:, :, None, None].expand(B, k, 1, offsets.shape[-1]))[:, :, 0]
+            offsets = torch.stack([-m * r, r], 2)
+            taken = torch.where(tokens[..., None].bool(), r, -m * r)
             mu = self.mean + torch.cumsum(taken, 1) - taken  # each node's predicted mean, from the tokens before it
             h = h + self.means_in(mu[:, :, None] + offsets)
         h = self.drop(h + self.position[:k])
@@ -92,8 +97,7 @@ class TokenPrior(nn.Module):
 
 
 def load_token_prior(ckpt, device) -> "TokenPrior":
-    """train_prior.py's checkpoint as a TokenPrior, in eval mode (an old checkpoint with one snapshot per band of
-    depths: its latest)."""
+    """train_prior.py's checkpoint as a TokenPrior, in eval mode."""
     prior = TokenPrior(**ckpt["config"]).to(device)
-    prior.load_state_dict(ckpt["state_dict"] if "state_dict" in ckpt else ckpt["states"][max(ckpt["states"])])
+    prior.load_state_dict(ckpt["state_dict"])
     return prior.eval()

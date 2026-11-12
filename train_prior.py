@@ -1,8 +1,8 @@
 """Stage 4: train the prior (dvae/prior.py's TokenPrior), a causal transformer over the inner encoder's codes that
 predicts each token (one of V children), on the codes a train_inner_components.py run keeps in its tree/ folder.
 
-The prior reads each node's children (their centroids, offsets from the node's mean) and the tokens before, not the
-shares the encoder implies, and starts uniform; it is trained on cross-entropy alone, all depths at once. The
+The prior reads each node's split (the rare child's offset r from the node's mean, and m: the common child's is
+-m r) and the tokens before, not the shares the encoder implies, and starts uniform; it is trained on cross-entropy alone, all depths at once. The
 children offsets are not stored (r for every image at every depth of a deep tree would take hundreds of GB): they
 come from replaying the run's networks along each image's code (dvae/replay.py), into a rolling buffer of --buffer
 training images kept in host memory (8-bit r and m), beside val's, replayed once.
@@ -11,21 +11,26 @@ Each epoch: --probe images of the buffer (evenly spread by age) and its oldest a
 of them, so those out of the buffer longest) are replayed into the oldest ones' places and scored before any
 training on them. The gap between the incoming and the replaced images says how much the prior has fit the buffer
 itself: above --gap-tol bits per image the next swap doubles, under half of it it halves. Then one pass over the
-buffer, and val. Every epoch logs, in bits, val beside two baselines the prior has to beat: the encoder's implied
+buffer, and val. The incoming images are replayed in a thread (on a CUDA stream of its own) while that pass trains
+on the rest of the buffer: the images they replace are not trained on again, and the replay's launches, many small
+ones, fill the gaps in the training's. Every epoch logs, in bits, val beside two baselines the prior has to beat: the encoder's implied
 shares and the best constant share of each token per depth (fit on the train codes). Early stopping keeps the epoch
 with the lowest val bits per image and stops once a --patience-frac share of the run's epochs (at least --patience)
 passes without a better one (dvae/stopping.py); the kept prior is then scored on the test codes.
 
 The progress plot (the log's path as .png, dvae/plots.py's plot_prior), redrawn every epoch: bits per token by code
 position, bits per image against hours, bits per image by age in the buffer, each epoch's minutes by part with the
-GPU's use, and codes sampled from the prior and from the encoder's own shares.
+GPU's use, and codes sampled from the prior (every --samples-every epochs) and from the encoder's own shares (once:
+they do not change).
 
 Run from the repo: python train_prior.py --tree artifacts/<inner job>
 """
 
 import argparse
+import contextlib
 import math
 import os
+import threading
 import time
 
 import torch
@@ -83,14 +88,16 @@ def main():
                         "half of it, it halves)")
     p.add_argument("--init", default=None, metavar="CKPT", help="start from an earlier prior.pt's weights")
     p.add_argument("--samples", type=int, default=12,
-                   help="codes sampled each epoch, from the prior and from the encoder's own shares")
+                   help="codes sampled from the prior and from the encoder's own shares, for the plot")
+    p.add_argument("--samples-every", type=int, default=10, help="epochs between draws from the prior")
     p.add_argument("--depths", type=int, default=None, help="tokens per code (default: the run's kept depths)")
     p.add_argument("--node-batch", type=int, default=4096, help="nodes per forward pass of the replay")
-    p.add_argument("--replay-chunk", type=int, default=512, help="images replayed at once (it costs about the same "
+    p.add_argument("--replay-chunk", type=int, default=1024, help="images replayed at once (it costs about the same "
                                                                    "per call however many it holds)")
     p.add_argument("--data-root", default="data")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--tf32", action="store_true")
+    p.add_argument("--bf16", action="store_true", help="the prior computes in bfloat16 (autocast)")
     p.add_argument("--device", default=None)
     p.add_argument("--out", default=None, help="checkpoint (default: the run's artifacts folder's prior.pt)")
     p.add_argument("--log", default=None, help="log (default: the run's artifacts folder's run.log)")
@@ -138,6 +145,10 @@ def main():
                             lr=args.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / args.warmup))
     log(f"prior: {sum(q.numel() for q in prior.parameters()) / 1e6:.2f}M parameters")
+    dtype = torch.bfloat16 if args.bf16 else torch.float32
+
+    def autocast():
+        return torch.autocast(device.type, dtype=torch.bfloat16, enabled=args.bf16)
 
     def fill(st: CompactStore, split: str, codes: TreeCodes, ids, slots):
         for c in range(0, len(ids), args.replay_chunk):
@@ -150,8 +161,9 @@ def main():
         """Each token's bits [len(rows), K] under the prior, for st's rows."""
         prior.eval()
         out = []
-        for offsets, tb in st.batches(list(torch.as_tensor(rows).split(args.batch)), device):
-            logits = prior(offsets, tb)
+        for r, m, tb in st.batches(list(torch.as_tensor(rows).split(args.batch)), device, dtype):
+            with autocast():
+                logits = prior(r, m, tb)
             out.append(F.cross_entropy(logits.flatten(0, 1).float(), tb.flatten(), reduction="none")
                        .view(tb.shape).cpu() / LN2)
         return torch.cat(out)
@@ -173,6 +185,10 @@ def main():
     records: dict = dict(K=K, B=B, history=[], best_epoch=None, baselines=dict(
         val_own=own.tolist(), val_constant=constant.tolist()))
     samples_path = os.path.splitext(args.plot)[0] + "_samples.pt"
+    samples: dict | None = None
+    if args.samples > 0:  # (the encoder's own: the same every epoch)
+        own_samples = rp.sample(args.samples, None, torch.Generator(device=device).manual_seed(args.seed))[1].cpu()
+    side = torch.cuda.Stream(device) if device.type == "cuda" else None
     run_began, step, best = time.time(), 0, (math.inf, -1)
     for epoch in range(args.epochs):
         began = time.time()
@@ -188,22 +204,29 @@ def main():
         slots = by_age[:rotate]
         ids = cycle[(cursor + torch.arange(rotate)) % N]
         timing["eval"] += time.time() - t0
-        t0 = time.time()
-        fill(store, "train", train, ids, slots)
-        timing["replay"] += time.time() - t0
-        t0 = time.time()
-        new_bits = bits_of(store, slots[:k])
-        gap = new_bits.sum(1).mean().item() - old_bits.sum(1).mean().item()
-        age[slots] = inserted + torch.arange(rotate)
-        inserted, cursor, swapped = inserted + rotate, (cursor + rotate) % N, rotate
-        timing["eval"] += time.time() - t0
+        # (the incoming images replayed into the oldest ones' places in a thread, while the rest of the buffer trains)
+        failed: list[BaseException] = []
 
+        def replay():
+            try:
+                with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
+                    fill(store, "train", train, ids, slots)
+            except BaseException as e:  # (raised again below)
+                failed.append(e)
+
+        replaying = threading.Thread(target=replay)
+        replaying.start()
+        keep = torch.ones(B, dtype=torch.bool)
+        keep[slots] = False
+        rest = keep.nonzero()[:, 0]
         prior.train()
-        running = 0.0
+        running, seen = 0.0, 0
         t0 = time.time()
-        for offsets, tokens in store.batches(list(torch.randperm(B, generator=gen).split(args.batch)), device):
-            logits = prior(offsets, tokens)
-            loss = F.cross_entropy(logits.flatten(0, 1), tokens.flatten())
+        for r, m, tokens in store.batches(list(rest[torch.randperm(len(rest), generator=gen)].split(args.batch)),
+                                          device, dtype):
+            with autocast():
+                logits = prior(r, m, tokens)
+            loss = F.cross_entropy(logits.flatten(0, 1).float(), tokens.flatten())
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
@@ -211,9 +234,22 @@ def main():
             sched.step()
             step += 1
             running += loss.item() * len(tokens)
+            seen += len(tokens)
             if step % 100 == 0:
                 log.detail(f"  step {step}: loss {loss.item() / LN2:.4f} bits/token")
         timing["train"] += time.time() - t0
+        t0 = time.time()
+        replaying.join()  # (its time beyond the training's)
+        if failed:
+            raise failed[0]
+        timing["replay"] += time.time() - t0
+
+        t0 = time.time()
+        new_bits = bits_of(store, slots[:k])
+        gap = new_bits.sum(1).mean().item() - old_bits.sum(1).mean().item()
+        age[slots] = inserted + torch.arange(rotate)
+        inserted, cursor, swapped = inserted + rotate, (cursor + rotate) % N, rotate
+        timing["eval"] += time.time() - t0
 
         t0 = time.time()
         va = bits_of(val_store, torch.arange(len(val))).mean(0)
@@ -227,23 +263,22 @@ def main():
             records["best_epoch"] = epoch
             torch.save(dict(config=prior.config, state_dict=prior.state_dict(), args=vars(args), codes=args.tree,
                             epoch=epoch, history=records["history"]), args.out)
-        samples = None
-        if args.samples > 0:
+        if args.samples > 0 and epoch % args.samples_every == 0:
             t0 = time.time()
             prior.eval()
-            draws = [torch.Generator(device=device).manual_seed(args.seed) for _ in range(2)]  # (the same each epoch)
-            samples = dict(prior=rp.sample(args.samples, prior, draws[0])[1].cpu(),
-                           own=rp.sample(args.samples, None, draws[1])[1].cpu(), shape=rp.image_shape())
+            draw = torch.Generator(device=device).manual_seed(args.seed)  # (the same each time)
+            samples = dict(prior=rp.sample(args.samples, prior, draw, args.bf16)[1].cpu(), own=own_samples,
+                           shape=rp.image_shape(), epoch=epoch)
             torch.save(samples, samples_path)
             timing["samples"] += time.time() - t0
         records["history"].append(dict(
-            epoch=epoch, train_loss=running / B / LN2, val=va.tolist(), oldest=old_bits.mean(0).tolist(),
+            epoch=epoch, train_loss=running / seen / LN2, val=va.tolist(), oldest=old_bits.mean(0).tolist(),
             incoming=new_bits.mean(0).tolist(), by_age=dict(x=ranks.tolist(), y=probe_bits.tolist()), gap=gap, swapped=swapped,
             seconds=time.time() - run_began, wall=time.time() - began, timing=timing, util=util.mean(began)))
         plot_prior(records, args.plot, samples)
         log(f"epoch {epoch}: val {describe(va)}; buffer {probe_bits.mean():.3f} (oldest "
             f"{old_bits.sum(1).mean():.3f}, incoming {new_bits.sum(1).mean():.3f}: gap {gap:+.3f}; swapped {swapped}, "
-            f"next {rotate}); training loss {running / B / LN2:.4f} bits/token; baselines: constant "
+            f"next {rotate}); training loss {running / seen / LN2:.4f} bits/token; baselines: constant "
             f"{constant.sum():.3f}, encoder's shares {own.sum():.3f}; best {best[0]:.3f} at epoch {best[1]}"
             f"{' (this one)' if improved else ''}; {time.time() - began:.0f}s: "
             + ", ".join(f"{k} {v:.0f}" for k, v in timing.items())

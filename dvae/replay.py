@@ -72,7 +72,7 @@ class TreeReplay:
     def into_store(self, X: Tensor, tokens: Tensor, store: "CompactStore", rows: Tensor):
         """Replay X [B, D] along its tokens [B, K] (the run's own codes: at each depth every image goes to the side
         its token says), writing each depth's r (8-bit, a scale per row) and m into store's rows [B] (host
-        memory), from which CompactStore.offsets rebuilds the children offsets."""
+        memory), from which CompactStore.batches rebuilds them."""
         g = root_group("replay", X.to(self.device).float(), self.mean, self.window)
         follow = tokens.to(self.device).bool()
         for d in range(self.K):
@@ -90,13 +90,15 @@ class TreeReplay:
             descend(g, *hyper, r, m, float("inf"), self.bits, follow[:, d])
 
     @torch.no_grad()
-    def sample(self, n: int, prior=None, generator: torch.Generator | None = None) -> tuple[Tensor, Tensor]:
-        """n codes drawn depth by depth (each token's side from prior, a TokenPrior reading the children offsets
-        and tokens so far, or with none from the encoder's own share m / (1 + m)), and the images their nodes
+    def sample(self, n: int, prior=None, generator: torch.Generator | None = None,
+               bf16: bool = False) -> tuple[Tensor, Tensor]:
+        """n codes drawn depth by depth (each token's side from prior, a TokenPrior reading the splits and tokens
+        so far, or with none from the encoder's own share m / (1 + m)), and the images their nodes
         decode to: (tokens [n, K], images [n, image numbers] in [0, 1], through the outer decoder for a run on an
-        outer run's latents)."""
+        outer run's latents). bf16: the prior computes in bfloat16."""
         g = root_group("sample", self.mean.expand(n, -1).clone(), self.mean, self.window)
-        offsets = torch.zeros(n, self.K, 2, self.D, dtype=torch.half, device=self.device)
+        rs = torch.zeros(n, self.K, self.D, dtype=torch.bfloat16 if bf16 else torch.float32, device=self.device)
+        ms = torch.zeros(n, self.K, device=self.device)
         tokens = torch.zeros(n, self.K, dtype=torch.long, device=self.device)
         for d in range(self.K):
             hyper = (self.starts[d].expand(g.nodes, -1), g.R.new_zeros(g.nodes))
@@ -106,11 +108,12 @@ class TreeReplay:
                 if t + 1 < self.steps[d]:
                     hyper = next_hyperplane(r, m)
             rn, mn = r[g.node], m[g.node]
-            offsets[:, d] = torch.stack([-mn[:, None] * rn, rn], 1).half()
+            rs[:, d], ms[:, d] = rn, mn
             if prior is None:
                 rare = mn.clamp_min(0) / (1 + mn.clamp_min(0))
-            else:  # (the prior reads this depth's children and the tokens before it)
-                rare = prior(offsets[:, :d + 1].float(), tokens[:, :d + 1])[:, d].float().softmax(-1)[:, 1]
+            else:  # (the prior reads this depth's split and the tokens before it)
+                with torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=bf16):
+                    rare = prior(rs[:, :d + 1], ms[:, :d + 1], tokens[:, :d + 1])[:, d].float().softmax(-1)[:, 1]
             side = torch.rand(n, device=self.device, generator=generator) < rare
             tokens[:, d] = side.long()
             descend(g, *hyper, r, m, float("inf"), self.bits, side)
@@ -137,7 +140,7 @@ class TreeReplay:
 class CompactStore:
     """Children offsets of n images at K depths, kept in host memory as each depth's r in 8 bits with a scale per
     row, and m: K * (D + 4) bytes per image (the offsets in half precision would be 4 * K * D). Filled by
-    TreeReplay.into_store; batches(...) rebuilds [b, K, 2, D] (-m r, then r) on a device."""
+    TreeReplay.into_store; batches(...) rebuilds r and m on a device."""
 
     def __init__(self, n: int, K: int, D: int):
         self.r = torch.empty(n, K, D, dtype=torch.int8)
@@ -148,8 +151,8 @@ class CompactStore:
     def __len__(self):
         return len(self.r)
 
-    def batches(self, row_batches: list[Tensor], device):
-        """For each rows in row_batches: (children offsets [b, K, 2, D] (-m r, then r), tokens [b, K]) on device.
+    def batches(self, row_batches: list[Tensor], device, dtype=torch.float32):
+        """For each rows in row_batches: (r [b, K, D] in dtype, m [b, K], tokens [b, K]) on device.
         A thread gathers the next batches' rows into reused pinned buffers while the device works on this one,
         so copying from host memory (~K * D bytes an image) overlaps the computing."""
         import queue
@@ -180,9 +183,7 @@ class CompactStore:
                 staged[-1] = torch.cuda.Event()
                 staged[-1].record()
             free.put(staged)
-            r = r8.float() * scale.float()[..., None]
-            m = m.float()[..., None]
-            yield torch.stack([-m * r, r], 2), tokens
+            yield r8.to(dtype) * scale.to(dtype)[..., None], m.float(), tokens
 
     @staticmethod
     def gb(n: int, K: int, D: int) -> float:
