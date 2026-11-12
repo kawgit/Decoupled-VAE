@@ -63,17 +63,19 @@ def bisector(r, m):
 
 class ImageHead(nn.Module):
     """A feature vector -> channels images of shape (C, H, W) (28 x 28 grey by default), each flattened as
-    pixels() flattens: [..., channels, C * H * W]. With channels_last, the convolutions run in that memory layout
+    pixels() flattens: [..., channels, C * H * W]. hidden multiplies its convolutions' channels. With channels_last, the convolutions run in that memory layout
     (faster on tensor cores; the same results)."""
 
-    def __init__(self, width, channels, channels_last=False, shape=(1, 28, 28)):
+    def __init__(self, width, channels, channels_last=False, shape=(1, 28, 28), hidden=1):
         super().__init__()
         C, H, W = shape
         self.shape, self.channels = shape, channels
-        self.fc = nn.Linear(width, 64 * (H // 4) * (W // 4))
-        self.up = nn.Sequential(nn.GELU(), nn.ConvTranspose2d(64, 64, 4, 2, 1), nn.GELU(),
-                                nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.GELU(),
-                                nn.Conv2d(32, channels * C, 3, padding=1))
+        a, b = 64 * hidden, 32 * hidden  # (its convolutions' channels)
+        self.a = a
+        self.fc = nn.Linear(width, a * (H // 4) * (W // 4))
+        self.up = nn.Sequential(nn.GELU(), nn.ConvTranspose2d(a, a, 4, 2, 1), nn.GELU(),
+                                nn.ConvTranspose2d(a, b, 4, 2, 1), nn.GELU(),
+                                nn.Conv2d(b, channels * C, 3, padding=1))
         self.channels_last = channels_last
         if channels_last:
             self.up.to(memory_format=torch.channels_last)
@@ -81,7 +83,7 @@ class ImageHead(nn.Module):
     def forward(self, f):
         lead = f.shape[:-1]
         C, H, W = self.shape
-        x = self.fc(f.reshape(-1, f.shape[-1])).view(-1, 64, H // 4, W // 4)
+        x = self.fc(f.reshape(-1, f.shape[-1])).view(-1, self.a, H // 4, W // 4)
         if self.channels_last:
             x = x.contiguous(memory_format=torch.channels_last)
         x = self.up(x)
