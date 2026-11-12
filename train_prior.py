@@ -14,9 +14,9 @@ training on them. The gap between the incoming images and the buffer's oldest (-
 much the prior has fit the buffer itself: its running average (--gap-smooth: one image's bits vary by several, so a
 swap of a hundred images gives a gap a bit off either way) above --gap-tol bits per image doubles the next swap,
 under half of it halves it. Then one pass over the
-buffer, and val. The incoming images are replayed in a thread (on a CUDA stream of its own) while that pass trains
-on the rest of the buffer: the images they replace are not trained on again, and the replay's launches, many small
-ones, fill the gaps in the training's. Every epoch logs, in bits, val beside two baselines the prior has to beat: the encoder's implied
+buffer, and val. The incoming images are replayed a few depths after each step of that pass (on a CUDA stream of
+their own), which trains on the rest of the buffer: the images they replace are not trained on again, and the
+replay's work, many small kernels, fills the gaps in the training's. Every epoch logs, in bits, val beside two baselines the prior has to beat: the encoder's implied
 shares and the best constant share of each token per depth (fit on the train codes). Early stopping keeps the epoch
 with the lowest val bits per image and stops once a --patience-frac share of the run's epochs (at least --patience)
 passes without a better one (dvae/stopping.py); the kept prior is then scored on the test codes.
@@ -30,10 +30,8 @@ Run from the repo: python train_prior.py --tree artifacts/<inner job>
 """
 
 import argparse
-import contextlib
 import math
 import os
-import threading
 import time
 
 import torch
@@ -212,26 +210,24 @@ def main():
         slots = by_age[:rotate]
         ids = cycle[(cursor + torch.arange(rotate)) % N]
         timing["eval"] += time.time() - t0
-        # (the incoming images replayed into the oldest ones' places in a thread, while the rest of the buffer trains)
-        failed: list[BaseException] = []
+        # (the incoming images replayed into the oldest ones' places a few depths after each training step, on a
+        # stream of their own, while the rest of the buffer trains)
+        def replay_steps():
+            for c in range(0, rotate, args.replay_chunk):
+                i, sl = ids[c:c + args.replay_chunk], slots[c:c + args.replay_chunk]
+                yield from rp.into_store_steps(inputs["train"][i], train.tokens[i], store, sl, side)
+                store.tokens[sl] = train.tokens[i]
 
-        def replay():
-            try:
-                with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
-                    fill(store, "train", train, ids, slots)
-            except BaseException as e:  # (raised again below)
-                failed.append(e)
-
-        replaying = threading.Thread(target=replay)
-        replaying.start()
+        replaying = replay_steps()
         keep = torch.ones(B, dtype=torch.bool)
         keep[slots] = False
         rest = keep.nonzero()[:, 0]
+        order = list(rest[torch.randperm(len(rest), generator=gen)].split(args.batch))
+        pending = math.ceil(rotate / args.replay_chunk) * (K + 1)  # (the replay's steps left)
         prior.train()
         running, seen = torch.zeros((), device=device), 0  # (summed on the device: no wait on it each step)
         t0 = time.time()
-        for r, m, tokens in store.batches(list(rest[torch.randperm(len(rest), generator=gen)].split(args.batch)),
-                                          device, dtype):
+        for done, (r, m, tokens) in enumerate(store.batches(order, device, dtype)):
             with autocast():
                 logits = prior(r, m, tokens)
             loss = F.cross_entropy(logits.flatten(0, 1).float(), tokens.flatten())
@@ -243,14 +239,16 @@ def main():
             step += 1
             running += loss.detach() * len(tokens)
             seen += len(tokens)
+            for _ in range(math.ceil(pending / (len(order) - done))):  # (spread evenly over the steps)
+                next(replaying, None)
+                pending -= 1
             if step % 100 == 0:
                 log.detail(f"  step {step}: loss {loss.item() / LN2:.4f} bits/token")
         train_loss = running.item() / seen / LN2
         timing["train"] += time.time() - t0
         t0 = time.time()
-        replaying.join()  # (its time beyond the training's)
-        if failed:
-            raise failed[0]
+        for _ in replaying:  # (whatever is left)
+            pass
         timing["replay"] += time.time() - t0
 
         t0 = time.time()

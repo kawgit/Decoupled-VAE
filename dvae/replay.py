@@ -9,6 +9,7 @@ enough to send an image near a split to the other side; given the run's own toke
 instead, so the codes are the run's and only the offsets are recomputed.
 """
 
+import contextlib
 import json
 import os
 
@@ -68,26 +69,39 @@ class TreeReplay:
         from dvae.data import SHAPES
         return SHAPES[self.args["dataset"]]
 
-    @torch.no_grad()
     def into_store(self, X: Tensor, tokens: Tensor, store: "CompactStore", rows: Tensor):
         """Replay X [B, D] along its tokens [B, K] (the run's own codes: at each depth every image goes to the side
         its token says), writing each depth's r (8-bit, a scale per row) and m into store's rows [B] (host
         memory), from which CompactStore.batches rebuilds them."""
-        g = root_group("replay", X.to(self.device).float(), self.mean, self.window)
-        follow = tokens.to(self.device).bool()
+        for _ in self.into_store_steps(X, tokens, store, rows):
+            pass
+
+    @torch.no_grad()
+    def into_store_steps(self, X: Tensor, tokens: Tensor, store: "CompactStore", rows: Tensor,
+                         stream: torch.cuda.Stream | None = None):
+        """into_store a depth at a time: a generator that yields after each depth (K + 1 times), so a caller can
+        interleave it with other work. Its work runs on stream, if given (made current only while it runs, so
+        the caller's own work between steps stays on its own stream)."""
+        on = lambda: torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()  # noqa: E731
+        with on():
+            g = root_group("replay", X.to(self.device).float(), self.mean, self.window)
+            follow = tokens.to(self.device).bool()
+        yield
         for d in range(self.K):
-            hyper = (self.starts[d].expand(g.nodes, -1), g.R.new_zeros(g.nodes))
-            r = m = g.R.new_zeros(0)
-            for t, net in enumerate(self.nets[d]):
-                r, m = answers(net, g, *hyper, self.node_batch)
-                if t + 1 < self.steps[d]:
-                    hyper = next_hyperplane(r, m)
-            rn, mn = r[g.node], m[g.node]
-            scale = rn.abs().amax(-1).clamp_min(1e-12) / 127
-            store.r[rows, d] = (rn / scale[:, None]).round().to(torch.int8).cpu()
-            store.scale[rows, d] = scale.half().cpu()
-            store.m[rows, d] = mn.half().cpu()
-            descend(g, *hyper, r, m, float("inf"), self.bits, follow[:, d])
+            with on():
+                hyper = (self.starts[d].expand(g.nodes, -1), g.R.new_zeros(g.nodes))
+                r = m = g.R.new_zeros(0)
+                for t, net in enumerate(self.nets[d]):
+                    r, m = answers(net, g, *hyper, self.node_batch)
+                    if t + 1 < self.steps[d]:
+                        hyper = next_hyperplane(r, m)
+                rn, mn = r[g.node], m[g.node]
+                scale = rn.abs().amax(-1).clamp_min(1e-12) / 127
+                store.r[rows, d] = (rn / scale[:, None]).round().to(torch.int8).cpu()
+                store.scale[rows, d] = scale.half().cpu()
+                store.m[rows, d] = mn.half().cpu()
+                descend(g, *hyper, r, m, float("inf"), self.bits, follow[:, d])
+            yield
 
     @torch.no_grad()
     def sample(self, n: int, prior=None, generator: torch.Generator | None = None,
