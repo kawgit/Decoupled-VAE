@@ -81,6 +81,11 @@ def main():
     if device.type == "cuda":
         X = {s: x.pin_memory() for s, x in X.items()}
     eval_batch = max(32, 1_000_000 // (shape[1] * shape[2]))
+    # (a fixed random part of the training images, as many as val, scored as val is: the train/val gap each epoch)
+    seen = torch.randperm(len(X["train"]), generator=torch.Generator().manual_seed(args.seed + 1))[:len(X["val"])]
+    X_seen = X["train"][seen.sort().values]
+    if device.type == "cuda":
+        X_seen = X_seen.pin_memory()
     log(f"{len(X['train'])} train, {len(X['val'])} val, {len(X['test'])} test images {tuple(shape)}; latents "
         f"C x {side[0]} x {side[1]}; targets {targets}")
     amp = (torch.bfloat16 if args.bf16 else torch.float16) if (args.bf16 or args.fp16) else None
@@ -121,7 +126,7 @@ def main():
         gen = torch.Generator(device="cpu").manual_seed(args.seed)
         dims = C * side[0] * side[1]
         best = (float("inf"), 0, copy.deepcopy(model.state_dict()))
-        curve = []
+        curve, curve_train = [], []
         began = time.time()
         log(f"latent {C} x {side[0]} x {side[1]} = {dims} numbers ({dims / (shape[0] * shape[1] * shape[2]):.3f} of the "
             f"image's); {sum(q.numel() for q in model.parameters()) / 1e6:.2f}M parameters")
@@ -136,13 +141,14 @@ def main():
                 scaler.scale(loss).backward()
                 scaler.step(opt)
                 scaler.update()
-            v = mse_of(model, X["val"])
+            v, tr = mse_of(model, X["val"]), mse_of(model, X_seen)
             sched.step(v)
             curve.append(v)
+            curve_train.append(tr)
             if v < best[0]:
                 best = (v, epoch, copy.deepcopy(model.state_dict()))
-            log(f"  c{C} epoch {epoch}: val mse {v:.6f} (best {best[0]:.6f} at epoch {best[1]}); lr "
-                f"{opt.param_groups[0]['lr']:.1e}; {time.time() - t0:.0f}s")
+            log(f"  c{C} epoch {epoch}: val mse {v:.6f}, train {tr:.6f} (val {100 * (v / tr - 1):+.1f}%; best val "
+                f"{best[0]:.6f} at epoch {best[1]}); lr {opt.param_groups[0]['lr']:.1e}; {time.time() - t0:.0f}s")
             if epoch - best[1] >= args.patience:
                 break
         model.load_state_dict(best[2])
@@ -152,8 +158,10 @@ def main():
         met = [t for t in targets if t not in chosen and best[0] <= t]
         for t in met:
             chosen[t] = C
-        records["sizes"].append(dict(channels=C, dims=dims, val=best[0], test=test, epochs=len(curve),
-                                     best_epoch=best[1], curve=curve, seconds=time.time() - began))
+        train_mse = curve_train[best[1] - 1]
+        records["sizes"].append(dict(channels=C, dims=dims, val=best[0], test=test, train=train_mse, epochs=len(curve),
+                                     best_epoch=best[1], curve=curve, curve_train=curve_train,
+                                     seconds=time.time() - began))
         records["chosen"] = {f"{t:g}": c for t, c in chosen.items()}
         with open(os.path.join(out, "records.json"), "w") as f:
             json.dump(records, f)
@@ -161,14 +169,18 @@ def main():
             shown = model(on_device(X["test"][:args.pairs])).float().clamp(0, 1)
         save_grid(torch.cat([on_device(X["test"][:args.pairs]), shown]), os.path.join(out, f"pairs_c{C}.png"),
                   nrow=args.pairs)
-        log(f"c{C} ({dims} numbers): val mse {best[0]:.6f}, test {test:.6f} (epoch {best[1]} of {len(curve)}); "
+        log(f"c{C} ({dims} numbers): val mse {best[0]:.6f}, test {test:.6f}, train {train_mse:.6f} (val "
+            f"{100 * (best[0] / train_mse - 1):+.1f}%; epoch {best[1]} of {len(curve)}); "
             f"{(time.time() - began) / 60:.1f} min" + (f"; meets {', '.join(f'{t:g}' for t in met)}" if met else ""))
         if len(chosen) == len(targets):
             break
 
     fig, (by_epoch, by_size) = plt.subplots(1, 2, figsize=(14, 5))
     for r in records["sizes"]:
-        by_epoch.plot(range(1, len(r["curve"]) + 1), r["curve"], linewidth=1.6, label=f"{r['dims']} numbers (c{r['channels']})")
+        line, = by_epoch.plot(range(1, len(r["curve"]) + 1), r["curve"], linewidth=1.6,
+                              label=f"{r['dims']} numbers (c{r['channels']}): val")
+        by_epoch.plot(range(1, len(r["curve_train"]) + 1), r["curve_train"], linewidth=1.2, linestyle="--",
+                      color=line.get_color(), label="train")
     for ax in (by_epoch, by_size):
         for t in targets:
             ax.axhline(t, color="#1d1d1f", linestyle=":", linewidth=1.2)
@@ -180,8 +192,10 @@ def main():
                  label="val")
     by_size.plot([r["dims"] for r in records["sizes"]], [r["test"] for r in records["sizes"]], "o--", color="#3aa57a",
                  label="test")
+    by_size.plot([r["dims"] for r in records["sizes"]], [r["train"] for r in records["sizes"]], "o:", color="#e8743b",
+                 label="train (as many images as val)")
     by_size.set_xscale("log")
-    by_epoch.set(title="Val pixel mse by epoch (dotted: targets)", xlabel="epoch", ylabel="mse")
+    by_epoch.set(title="Pixel mse by epoch (val solid, train dashed; dotted: targets)", xlabel="epoch", ylabel="mse")
     by_size.set(title="Best val pixel mse by latent size", xlabel="numbers per image", ylabel="mse")
     for ax in (by_epoch, by_size):
         ax.legend(frameon=False, fontsize=8)
