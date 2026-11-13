@@ -14,6 +14,13 @@ Each depth logs the share of its nodes' cells (train, nodes of at least 2 V imag
 centroids the chosen split was asked about, and under those its predicted means would make; --attraction pulls every predicted mean toward all of its
 node's images, so an empty cell's centroid still moves.
 
+With --pool (encode_imagenet128_train.py's latents of every ImageNet training image) the tree trains on a rolling
+buffer of --buffer of them instead of a fixed set: before each depth the oldest leave and new ones come in, coded
+through every depth so far by the kept networks (all of them in host memory, in bfloat16 with --bf16) exactly as
+test is, so that no network has seen them; as many as take about --rotate-share of the run's time (coding one costs
+time in proportion to the depth, so deep depths swap fewer). Each depth logs the new images' mse on entering, which
+should match val's. Then there is no train pixel mse and no tree/train.
+
 What the run keeps (artifacts/<job>/): records.json (the plot's, as train_inner_components.py's, plus each depth's
 empty cells), run.png, tree/<split>/dDDD.pt (each image's token, its next node, each next node's parent, child and
 every node's shares; with --store-centroids each node's predicted means too) and with --save-models every network
@@ -42,8 +49,8 @@ from dvae.data import SHAPES, get_device, load_images  # noqa: E402
 from dvae.deltatree import pixels  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
 from dvae.outer import decode_latents, load_outer  # noqa: E402
-from dvae.vway import (CellSums, VStepNet, attraction_sse, cell_stats, cells_of, pca_start, split_rows,  # noqa: E402
-                       vanswers, vdescend, vsplit_mse, vsplit_sse)
+from dvae.vway import (CellSums, VStepNet, append_group, attraction_sse, cell_stats, cells_of, keep_images,  # noqa: E402
+                       pca_start, split_rows, vanswers, vdescend, vsplit_mse, vsplit_sse)
 
 
 def atomic_save(obj, path):
@@ -119,7 +126,17 @@ def main():
     p.add_argument("--px-images", type=int, default=2000)
     p.add_argument("--px-every", type=int, default=10,
                    help="decode the --px-images images for the pixel mse every this many depths (and at the first)")
-    p.add_argument("--limit-train", type=int, default=None)
+    p.add_argument("--pool", default=None, metavar="FILE",
+                   help="draw the training images from this pool of latents (encode_imagenet128_train.py's "
+                        "latents_train_full.pt, made by --outer's encoder) through a rolling buffer of --buffer images; "
+                        "val and test are --outer's")
+    p.add_argument("--buffer", type=int, default=100000, help="training images the tree trains on at once (--pool)")
+    p.add_argument("--rotate-share", type=float, default=0.1,
+                   help="before each depth the buffer's oldest images leave and new ones from the pool, coded by every "
+                        "network so far, come in: as many as take about this share of the run's time (at most the "
+                        "whole buffer)")
+    p.add_argument("--rotate-chunk", type=int, default=10000, help="new images coded at once")
+    p.add_argument("--limit-train", type=int, default=None, help="(with --pool: the pool's first this many images)")
     p.add_argument("--limit-val", type=int, default=None)
     p.add_argument("--limit-test", type=int, default=None)
     p.add_argument("--out", default=None)
@@ -143,12 +160,30 @@ def main():
 
     limits = (("train", args.limit_train), ("val", args.limit_val), ("test", args.limit_test))
     outer, lat = load_outer(args.outer, device) if args.outer else (None, None)
+    pool: torch.Tensor | None = None
+    pool_stream: ImageStream | None = None
+    if args.pool:
+        assert lat is not None, "--pool needs --outer (val and test, and the decoder)"
+        log(f"loading the pool {args.pool}")
+        pooled: torch.Tensor = torch.load(args.pool, map_location="cpu", weights_only=False)["train"]
+        pool = pooled[:args.limit_train].flatten(1)
+        pool_stream = ImageStream(len(pool), torch.Generator().manual_seed(args.seed + 7))
+        del pooled
+        limits = limits[1:]
     if lat is not None:
         args.dataset = lat["dataset"]
         data = {s: lat[s][:lim].float().flatten(1).to(device) for s, lim in limits}
     else:
         data = {s: pixels(load_images(args.dataset, s, args.data_root)[:lim]).to(device) for s, lim in limits}
-    mean = data["train"].mean(0)
+    if pool is not None and pool_stream is not None:
+        mean = sum(pool[i:i + 65536].to(device).float().sum(0) for i in range(0, len(pool), 65536)) / len(pool)
+        assert isinstance(mean, torch.Tensor)
+        data = dict(train=pool[pool_stream.take(min(args.buffer, len(pool)))].to(device).float(), **data)
+        log(f"pool: {len(pool)} training images ({pool.numel() * pool.element_size() / 2**30:.1f} GB in host memory); "
+            f"a buffer of {len(data['train'])} trains the tree, its oldest replaced before each depth by new ones "
+            f"coded by every network so far, in about {args.rotate_share:.0%} of the time")
+    else:
+        mean = data["train"].mean(0)
     groups = {s: root_group(s, X, mean, args.history_window) for s, X in data.items()}
     train, val, test = groups["train"], groups["val"], groups["test"]
     N, D = train.R.shape
@@ -164,7 +199,7 @@ def main():
                               enabled=args.bf16 or args.fp16)
 
     images_px = {s: pixels(load_images(args.dataset, s, args.data_root)[:min(len(data[s]), args.px_images)]).to(device)
-                 for s in ("train", "val", "test")} if lat is not None else {}
+                 for s in ("train", "val", "test") if s != "train" or pool is None} if lat is not None else {}
 
     # (the raw data past what pixel_mse and test_pairs read: the groups hold the remainders)
     data = {s: X[:max(args.px_images, args.plot_pairs)].clone() for s, X in data.items()}
@@ -186,6 +221,29 @@ def main():
         torch._dynamo.config.recompile_limit = 64
         setattr(net, "memory_q", torch.compile(net.memory_q, dynamic=True))
         setattr(net, "query", torch.compile(net.query, dynamic=True))
+    # (with --pool: every kept network, in host memory, to code the pool's new images through the tree so far. They
+    # are loaded into net, between depths: each step loads the weights it starts from)
+    coded: list[tuple[torch.Tensor, list[dict]]] = []  # (each depth's start and its kept steps' networks)
+    coded_bytes = 0
+    rotate_k = N  # (images to rotate before the next depth: steered toward --rotate-share of the time)
+    entered = torch.zeros(N, dtype=torch.long)  # (each buffer image's depth on entering it; oldest first)
+
+    def code_fresh(X):
+        """New images X [n, D] (on the device) coded by the tree so far, as test is: a group at its depth."""
+        h = root_group("fresh", X, mean, args.history_window)
+        for start_j, nets in coded:
+            q = start_j.to(cdtype).expand(h.nodes, -1, -1)
+            c, p = q, None
+            for t, state in enumerate(nets):
+                net.load_state_dict(state)
+                c, p = vanswers(net, h, q, args.node_batch)
+                if t + 1 < len(nets):
+                    q = c
+            assert p is not None
+            cells = cells_of(h, q)
+            vdescend(h, cells, split_rows(h, cells, c, p), budget, args.table_bits)
+        return h
+
     log(f"{N} train, {len(val.R)} val, {len(test.R)} test images of {D} numbers; V = {V} ({math.log2(V):.2f} bits a "
         f"token); each network {sum(q.numel() for q in net.parameters()) / 1e6:.2f}M parameters")
     root_val = mse_now(val)
@@ -288,6 +346,23 @@ def main():
         timing_depth = dict(train=0.0, val=0.0, other=0.0)
         parts.clear()
         peaks.clear()
+        rotated = None
+        if pool is not None and pool_stream is not None and d > 0:
+            # (the buffer's oldest images leave; new ones, coded by every network so far, come in at its end)
+            t_rot = time.time()
+            k = min(rotate_k, N)
+            keep_images(train, torch.arange(k, N, device=device))
+            fresh_sq = 0.0
+            for c0 in range(0, k, args.rotate_chunk):
+                h = code_fresh(pool[pool_stream.take(min(args.rotate_chunk, k - c0))].to(device).float())
+                fresh_sq += mse_now(h) * len(h.R)
+                append_group(train, h)
+                del h
+            entered = torch.cat([entered[k:], torch.full((k,), d)])
+            seconds = part("rotate", t_rot) - t_rot
+            timing_depth["other"] += seconds
+            rotated = dict(images=k, seconds=seconds, fresh=fresh_sq / k, age=float(d - entered.float().mean()),
+                           nets_gb=coded_bytes / 2**30)
         t_other = time.time()
         start = pca_start(train.R, V)
         tp = part("start", t_other)
@@ -429,11 +504,18 @@ def main():
             nodes[s] = g.nodes
             kept = vdescend(g, cells, rows, budget, args.table_bits)
             c = rows["c"]
+            if s == "train" and pool is not None:  # (the buffer's tree changes as it rotates)
+                continue
             atomic_save(dict(V=V, c=c.half().cpu() if c is not None else None, start=start.cpu(), **kept),
                         os.path.join(out, "tree", s, f"d{d:03d}.pt"))
         del splits, best_split, cells, rows, c
         tp = part("split", tp)
         chosen_steps.append(best_n)
+        if pool is not None:
+            nets = [{k: v.to("cpu", dtype=torch.bfloat16 if args.bf16 and v.is_floating_point() else v.dtype)
+                     for k, v in states[t].items()} for t in range(best_n)]
+            coded.append((start, nets))
+            coded_bytes += sum(v.numel() * v.element_size() for net_state in nets for v in net_state.values())
         prev_depth = states
         now = dict(train=mse_now(train), val=mse_now(val), test=mse_now(test))
         tp = part("depth mse", tp)
@@ -457,7 +539,7 @@ def main():
                                       bits=(d + 1) * math.log2(V), empty=empty_best,
                                       empty_after=empty_after, seconds=elapsed, wall=time.time() - depth_began,
                                       timing=timing_depth, other=dict(parts), util=busy,
-                                      peak_gib=peak, peaks=dict(peaks)))
+                                      peak_gib=peak, peaks=dict(peaks), rotated=rotated))
         records["kept"] = k_best
         atomic_json(records, os.path.join(out, "records.json"))
         plot()
@@ -465,14 +547,22 @@ def main():
         log(f"depth {d} ({(d + 1) * math.log2(V):.0f} bits): {best_n} of {len(gains)} Lloyd steps; mse val "
             f"{now['val']:.6f} (gain {records['depths'][-1]['gain']:.2e}; best {k_best} depths), train "
             f"{now['train']:.6f}, test {now['test']:.6f}"
-            + (f" (pixels: train {now['train_px']:.6f}, val {now['val_px']:.6f}, test {now['test_px']:.6f})"
-               if "val_px" in now else "")
+            + (" (pixels: " + ", ".join(f"{s} {now[f'{s}_px']:.6f}" for s in ("train", "val", "test")
+                                        if f"{s}_px" in now) + ")" if "val_px" in now else "")
             + f"; empty cells {records['depths'][-1]['empty']:.1%} (after: {empty_after:.1%}); nodes "
             f"{nodes['train']} train, {nodes['val']} val; {wall:.0f}s: {timing_depth['train']:.0f} train, "
             f"{timing_depth['val']:.0f} val, {timing_depth['other']:.0f} other ("
             + ", ".join(f"{k} {v:.1f}" for k, v in parts.items()) + ")"
             + (f"; GPU {busy:.0f}% busy" if busy is not None else "")
-            + (f", peak {peak:.1f} GiB ({peak_in})" if peak is not None else "") + f"; {elapsed / 3600:.2f} h in all")
+            + (f", peak {peak:.1f} GiB ({peak_in})" if peak is not None else "")
+            + (f"; buffer: {rotated['images']} new in {rotated['seconds']:.1f}s (their mse {rotated['fresh']:.6f} on "
+               f"entering, val's {before['val']:.6f}), mean age {rotated['age']:.1f} depths, networks "
+               f"{rotated['nets_gb']:.1f} GB" if rotated is not None else "") + f"; {elapsed / 3600:.2f} h in all")
+        if rotated is not None:
+            # (the next depth's rotation: scaled toward --rotate-share of the depth's time, at most doubling or
+            # halving at once)
+            target = args.rotate_share / (1 - args.rotate_share) * (wall - rotated["seconds"])
+            rotate_k = int(min(N, max(64, rotated["images"] * min(2.0, max(0.5, target / max(rotated["seconds"], 1e-3))))))
         if d + 1 - k_best >= args.depth_patience:
             log(f"no depth past {k_best} paid {args.depth_threshold:.1e} for {args.depth_patience} depths: done")
             break

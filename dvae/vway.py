@@ -232,5 +232,77 @@ def vdescend(g: Group, cells: Tensor, rows: dict, gpu_budget: float, table_bits:
                 child=token.to(torch.int8).cpu(), share=p.half().cpu())
 
 
+def _live(g: Group) -> range:
+    """The tables g's window still reads (vdescend has emptied those before: their sides, shares and scales go
+    unread too)."""
+    return range(max(0, g.depth - g.window) if g.window > 0 else 0, g.depth)
+
+
+def _like(x: Tensor, table: Tensor) -> Tensor:
+    """x where table is: pinned host memory for a table vdescend put there."""
+    return x.pin_memory() if table.device.type == "cpu" and table.is_pinned() else x
+
+
+def _drop_unread(g: Group):
+    """Empty the sides, shares and scales of the tables g's window no longer reads (vdescend keeps them)."""
+    live = _live(g)
+    for j in range(live.start):
+        g.sides[j], g.ms[j] = g.sides[j].new_zeros(0), g.ms[j].new_zeros(0)
+        s = g.scales[j]
+        g.scales[j] = None if s is None else s.new_zeros(0)
+
+
+@torch.no_grad()
+def keep_images(g: Group, idx: Tensor):
+    """Keep only g's images idx [n] (indices on g's device, in their new order), the nodes they are in and the
+    table rows those read (a rolling buffer's oldest images leave so)."""
+    from dvae.components import refresh_stats
+    used, node = torch.unique(g.node[idx], return_inverse=True)
+    g.R, g.node = g.R[idx], node
+    g.keys = g.keys[used.cpu()]
+    g.early = None if g.early is None else g.early[used]
+    g.sums = None if g.sums is None else g.sums[used]
+    anc = g.anc[used]
+    _drop_unread(g)
+    for j in _live(g):
+        rows, at = torch.unique(anc[:, j], return_inverse=True)
+        anc[:, j] = at
+        table = g.deltas[j]
+        g.deltas[j] = _like(table[rows.to(table.device)], table)
+        s = g.scales[j]
+        g.scales[j] = None if s is None else s[rows]
+        g.sides[j], g.ms[j] = g.sides[j][rows], g.ms[j][rows]
+    g.anc = anc
+    refresh_stats(g)
+
+
+@torch.no_grad()
+def append_group(g: Group, h: Group):
+    """Add h's images after g's: h is a group of other images at g's depth with g's window and table bits (coded
+    by the same networks), its nodes going after g's and its table rows after g's. Nodes with the same code in
+    both stay apart: as two nodes they get the same answers and the same loss as one."""
+    from dvae.components import refresh_stats
+    assert g.depth == h.depth and g.window == h.window, (g.depth, h.depth, g.window, h.window)
+    assert (g.early is None) == (h.early is None) and (g.sums is None) == (h.sums is None)
+    _drop_unread(g)
+    anc = h.anc.clone()
+    anc[:, :_live(g).start] = 0  # (rows of emptied tables: never read)
+    for j in _live(g):
+        table = g.deltas[j]
+        anc[:, j] += len(table)
+        g.deltas[j] = _like(torch.cat([table, h.deltas[j].to(table.device)]), table)
+        s, sh = g.scales[j], h.scales[j]
+        g.scales[j] = None if s is None or sh is None else torch.cat([s, sh])
+        g.sides[j], g.ms[j] = torch.cat([g.sides[j], h.sides[j]]), torch.cat([g.ms[j], h.ms[j]])
+    g.node = torch.cat([g.node, h.node + g.nodes])
+    g.keys = torch.cat([g.keys, h.keys])
+    g.R, g.anc = torch.cat([g.R, h.R]), torch.cat([g.anc, anc])
+    if g.early is not None and h.early is not None:
+        g.early = torch.cat([g.early, h.early])
+    if g.sums is not None and h.sums is not None:
+        g.sums = torch.cat([g.sums, h.sums])
+    refresh_stats(g)
+
+
 __all__ = ["VStepNet", "CellSums", "split_rows", "cells_of", "cell_stats", "vsplit_sse", "attraction_sse", "vsplit_mse", "vanswers",
-           "pca_start", "vdescend"]
+           "pca_start", "vdescend", "keep_images", "append_group"]
