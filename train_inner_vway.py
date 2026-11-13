@@ -105,6 +105,9 @@ def main():
     p.add_argument("--tf32", action="store_true")
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--fp16", action="store_true", help="float16 autocast with a gradient scaler (V100s)")
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile the network's memory and query (fewer, fused kernels: the training loop is "
+                        "otherwise bound by the CPU launching small ones)")
     p.add_argument("--hours", type=float, default=0.0)
     p.add_argument("--outer", default=None, metavar="RUN", help="a train_outer.py run: code its latents")
     p.add_argument("--px-images", type=int, default=2000)
@@ -156,6 +159,9 @@ def main():
     images_px = {s: pixels(load_images(args.dataset, s, args.data_root)[:min(len(data[s]), args.px_images)]).to(device)
                  for s in ("train", "val", "test")} if lat is not None else {}
 
+    # (the raw data past what pixel_mse and test_pairs read: the groups hold the remainders)
+    data = {s: X[:max(args.px_images, args.plot_pairs)].clone() for s, X in data.items()}
+
     def as_pixels(s, R):
         if outer is None or lat is None:
             return data[s][:len(R)] - R
@@ -167,6 +173,9 @@ def main():
     net = VStepNet(V, args.width, args.layers, args.heads, not args.side_m_history, shape, args.dropout,
                    args.head, args.head_hidden).to(device)
     net.bf16, net.fp16 = args.bf16, args.fp16
+    if args.compile:  # (dynamic: the batch's nodes and the history's length vary)
+        setattr(net, "memory", torch.compile(net.memory, dynamic=True))
+        setattr(net, "query", torch.compile(net.query, dynamic=True))
     log(f"{N} train, {len(val.R)} val, {len(test.R)} test images of {D} numbers; V = {V} ({math.log2(V):.2f} bits a "
         f"token); each network {sum(q.numel() for q in net.parameters()) / 1e6:.2f}M parameters")
     root_val = mse_now(val)
@@ -194,7 +203,7 @@ def main():
     stream = ImageStream(N, gen)
     epoch_steps = max(1, round(args.images_per_epoch / args.batch))
 
-    def val_mse(model, st_va: tuple[torch.Tensor, CellSums], q_va):
+    def val_mse(model, st_va: tuple[torch.Tensor, CellSums, torch.Tensor], q_va):
         return vsplit_mse(val, st_va[0], st_va[1], vanswers(model, val, q_va, args.node_batch)[0])
 
     def train_net(model, st_tr, st_va, q_tr, q_va, v0, timing, label):
@@ -202,7 +211,7 @@ def main():
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / args.warmup_steps))
         best = (0.0, 0, v0, copy.deepcopy(model.state_dict()))
         scaler = torch.amp.GradScaler(device.type, enabled=args.fp16)
-        count, total = st_tr
+        count, total, _ = st_tr
         assert train.stats is not None
         e = 0
         while True:
@@ -254,6 +263,8 @@ def main():
 
     for d in range(args.max_depths):
         depth_began = time.time()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         timing_depth = dict(train=0.0, val=0.0, other=0.0)
         parts.clear()
         t_other = time.time()
@@ -297,7 +308,7 @@ def main():
             t_other = time.time()
             c_va, p_va = vanswers(net, val, query["val"], args.node_batch)
             tp = part("answers", t_other)
-            after_val = vsplit_mse(val, *st_va, c_va)
+            after_val = vsplit_mse(val, *st_va[:2], c_va)
             after: dict[str, float | None] = dict(val=after_val)
             gains.append(before["val"] - after_val)
             n_best = best_count(gains, args.lloyd_threshold, args.lloyd_discount)
@@ -308,13 +319,16 @@ def main():
             # depth's last step, which is rarely kept, needs neither, so its train mse goes unmeasured)
             c_tr = p_tr = None
             after["train"] = None
+            if best_n == t + 1:
+                best_split = None  # (the step it beat: freed before this one's train answers are made)
             if best_n == t + 1 or not last:
                 tp = time.time()
                 c_tr, p_tr = vanswers(net, train, query["train"], args.node_batch)
                 tp = part("answers", tp)
-                after["train"] = vsplit_mse(train, *st_tr, c_tr)
+                after["train"] = vsplit_mse(train, *st_tr[:2], c_tr)
             if best_n == t + 1:
-                best_split = dict(train=(query["train"], c_tr, p_tr, st_tr[0]), val=(query["val"], c_va, p_va))
+                # (the split's cells rather than the query that made them: the query, [nodes, V, D], can go)
+                best_split = dict(train=(st_tr[2], c_tr, p_tr, st_tr[0]), val=(st_va[2], c_va, p_va))
             state = {k: v.detach().clone() for k, v in net.state_dict().items()}
             states[t] = state
             recent = state
@@ -352,17 +366,16 @@ def main():
             if t + 1 < best_n:
                 q_te = c_te
         tp = part("test answers", t_other)
-        splits = dict(train=best_split["train"][:3], val=best_split["val"], test=(q_te, c_te, p_te))
+        splits = dict(train=best_split["train"][:3], val=best_split["val"], test=(cells_of(test, q_te), c_te, p_te))
         nodes, empty_after = {}, empty_share(cell_stats(train, best_split["train"][1])[0])
         tp = part("cells", tp)
-        for s, (q, c, pr) in splits.items():
+        for s, (cells, c, pr) in splits.items():
             g = groups[s]
             nodes[s] = g.nodes
-            cells = cells_of(g, q)
             kept = vdescend(g, cells, c, pr, budget, args.table_bits)
             atomic_save(dict(V=V, c=c.half().cpu() if args.store_centroids else None, start=start.cpu(), **kept),
                         os.path.join(out, "tree", s, f"d{d:03d}.pt"))
-        del splits, best_split, q, c, pr, cells, q_te, c_te, p_te
+        del splits, best_split, c, pr, cells, q_te, c_te, p_te
         tp = part("split", tp)
         chosen_steps.append(best_n)
         prev_depth = states
@@ -380,11 +393,13 @@ def main():
         timing_depth["other"] += time.time() - t_other
         elapsed = time.time() - began
         busy = util.mean(depth_began)
+        peak = torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None
         records["depths"].append(dict(d=d, steps=best_n, tried=len(gains), gains=gains, **now,
                                       gain=depth_gains[-1] - (depth_gains[-2] if d > 0 else 0.0), nodes=nodes,
                                       bits=(d + 1) * math.log2(V), empty=empty_best,
                                       empty_after=empty_after, seconds=elapsed, wall=time.time() - depth_began,
-                                      timing=timing_depth, other=dict(parts), util=busy))
+                                      timing=timing_depth, other=dict(parts), util=busy,
+                                      peak_gib=peak))
         records["kept"] = k_best
         atomic_json(records, os.path.join(out, "records.json"))
         plot()
@@ -398,7 +413,8 @@ def main():
             f"{nodes['train']} train, {nodes['val']} val; {wall:.0f}s: {timing_depth['train']:.0f} train, "
             f"{timing_depth['val']:.0f} val, {timing_depth['other']:.0f} other ("
             + ", ".join(f"{k} {v:.1f}" for k, v in parts.items()) + ")"
-            + (f"; GPU {busy:.0f}% busy" if busy is not None else "") + f"; {elapsed / 3600:.2f} h in all")
+            + (f"; GPU {busy:.0f}% busy" if busy is not None else "")
+            + (f", peak {peak:.1f} GiB" if peak is not None else "") + f"; {elapsed / 3600:.2f} h in all")
         if d + 1 - k_best >= args.depth_patience:
             log(f"no depth past {k_best} paid {args.depth_threshold:.1e} for {args.depth_patience} depths: done")
             break

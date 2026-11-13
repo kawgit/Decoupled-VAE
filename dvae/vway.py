@@ -93,11 +93,12 @@ class CellSums:
         return self.rows[self.row[nodes]]
 
 
-def cell_stats(g: Group, q: Tensor, chunk=8192) -> tuple[Tensor, CellSums]:
+def cell_stats(g: Group, q: Tensor, chunk=8192) -> tuple[Tensor, CellSums, Tensor]:
     """Each node's cells' image counts [Nn, V] and remainder sums (CellSums, [Nn, V, D] as read) under
-    centroids q."""
+    centroids q, and each image's cell [N] (int8)."""
     Nn, V, D = q.shape
-    at = g.node * V + cells_of(g, q, chunk)  # (each image's cell)
+    cells = cells_of(g, q, chunk)
+    at = g.node * V + cells  # (each image's cell among all nodes')
     count = g.R.new_zeros(Nn * V).index_add_(0, at, g.R.new_ones(len(at)))
     cell, k = torch.unique(at, return_inverse=True)
     rows = g.R.new_zeros(len(cell) + 1, D)
@@ -105,7 +106,7 @@ def cell_stats(g: Group, q: Tensor, chunk=8192) -> tuple[Tensor, CellSums]:
         rows.index_add_(0, k[i:i + chunk], g.R[i:i + chunk])
     row = torch.full((Nn * V,), len(cell), dtype=torch.long, device=g.R.device)
     row[cell] = torch.arange(len(cell), device=g.R.device)
-    return count.view(Nn, V), CellSums(rows, row.view(Nn, V))
+    return count.view(Nn, V), CellSums(rows, row.view(Nn, V)), cells.to(torch.int8)
 
 
 def vsplit_sse(c: Tensor, count: Tensor, total: Tensor) -> Tensor:
