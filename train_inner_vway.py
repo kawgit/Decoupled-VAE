@@ -134,10 +134,18 @@ def main():
                         "val and test are --outer's")
     p.add_argument("--buffer", type=int, default=100000, help="training images the tree trains on at once (--pool)")
     p.add_argument("--rotate-share", type=float, default=0.1,
-                   help="before each depth the buffer's oldest images leave and new ones from the pool, coded by every "
-                        "network so far, come in: as many as take about this share of the run's time (at most the "
-                        "whole buffer)")
-    p.add_argument("--rotate-chunk", type=int, default=10000, help="new images coded at once")
+                   help="the share of the run's time spent coding new images from the pool into the buffer (its oldest "
+                        "leave): each depth earns this share of its time, spent before a later depth a chunk at a time")
+    p.add_argument("--rotate-chunk", type=int, default=8192,
+                   help="new images coded at once, the fewest a rotation brings (coding costs a fixed time per depth "
+                        "coded through, whatever the images: few images per pass spend most of it on that)")
+    p.add_argument("--gpu-nets", type=float, default=0.85,
+                   help="(--pool) the kept networks stay on the GPU while the last depth's peak memory and they fit in "
+                        "this share of it, else in host memory")
+    p.add_argument("--resume", default=None, metavar="RUN",
+                   help="continue a train_inner_vway.py run that saved its networks (same settings): its networks and "
+                        "tree files are linked into this run's folder, its records carried on, and every image (a "
+                        "new buffer with --pool) coded through its depths before the next one trains")
     p.add_argument("--limit-train", type=int, default=None, help="(with --pool: the pool's first this many images)")
     p.add_argument("--limit-val", type=int, default=None)
     p.add_argument("--limit-test", type=int, default=None)
@@ -169,7 +177,8 @@ def main():
         log(f"loading the pool {args.pool}")
         pooled: torch.Tensor = torch.load(args.pool, map_location="cpu", weights_only=False)["train"]
         pool = pooled[:args.limit_train].flatten(1)
-        pool_stream = ImageStream(len(pool), torch.Generator().manual_seed(args.seed + 7))
+        # (a resumed run draws another order: its buffer is new images, not the first run's first ones)
+        pool_stream = ImageStream(len(pool), torch.Generator().manual_seed(args.seed + 7 + (1 if args.resume else 0)))
         del pooled
         limits = limits[1:]
     if lat is not None:
@@ -223,12 +232,27 @@ def main():
         torch._dynamo.config.recompile_limit = 64
         setattr(net, "memory_q", torch.compile(net.memory_q, dynamic=True))
         setattr(net, "query", torch.compile(net.query, dynamic=True))
-    # (with --pool: every kept network, in host memory, to code the pool's new images through the tree so far. They
-    # are loaded into net, between depths: each step loads the weights it starts from)
+    # (with --pool or --resume: every kept network, to code images through the tree so far: on the GPU while they
+    # fit, else in host memory. They are loaded into net between depths: each step loads the weights it starts from)
     coded: list[tuple[torch.Tensor, list[dict]]] = []  # (each depth's start and its kept steps' networks)
-    coded_bytes = 0
-    rotate_k = N  # (images to rotate before the next depth: steered toward --rotate-share of the time)
+    coded_bytes = {"gpu": 0, "cpu": 0}
+    credit = 0.0  # (seconds of coding new images into the buffer earned and not yet spent)
     entered = torch.zeros(N, dtype=torch.long)  # (each buffer image's depth on entering it; oldest first)
+    # (the last depth's peak GPU memory, which counts the networks then on the GPU, and the bytes of networks put
+    # there since: bytes)
+    last_peak = [0.0, 0.0]
+
+    def keep_nets(start_d, states_d):
+        """Keep a depth's start and its kept steps' networks (bfloat16 with --bf16) for code_fresh."""
+        size = sum(v.numel() * (2 if args.bf16 and v.is_floating_point() else v.element_size())
+                   for st in states_d for v in st.values())
+        where = "gpu" if device.type == "cuda" and sum(last_peak) + size < args.gpu_nets * total_memory else "cpu"
+        at = device if where == "gpu" else torch.device("cpu")
+        coded.append((start_d.to(device), [{k: v.to(at, dtype=torch.bfloat16 if args.bf16 and v.is_floating_point()
+                                                    else v.dtype) for k, v in st.items()} for st in states_d]))
+        coded_bytes[where] += size
+        if where == "gpu":
+            last_peak[1] += size
 
     def code_fresh(X):
         """New images X [n, D] (on the device) coded by the tree so far, as test is: a group at its depth."""
@@ -272,6 +296,56 @@ def main():
     gen = torch.Generator().manual_seed(args.seed)
     stream = ImageStream(N, gen)
     epoch_steps = max(1, round(args.images_per_epoch / args.batch))
+    start_depth, seconds_before = 0, 0.0
+    if args.resume:
+        # (the run's networks, tree files and records carried on; every image coded through its depths)
+        with open(os.path.join(args.resume, "records.json")) as f:
+            old = json.load(f)
+        start_depth, seconds_before = len(old["depths"]), old["depths"][-1]["seconds"]
+        t0 = time.time()
+        for sub in ("models", "tree/train", "tree/val", "tree/test"):
+            src = os.path.join(args.resume, sub)
+            for name in sorted(os.listdir(src)) if os.path.isdir(src) else []:
+                if int(name[1:].split("_")[0].split(".")[0]) < start_depth and not os.path.exists(os.path.join(out, sub, name)):
+                    os.link(os.path.join(src, name), os.path.join(out, sub, name))
+
+        def saved(dd, t):
+            return torch.load(os.path.join(args.resume, "models", f"d{dd:03d}_s{t:02d}.pt"), map_location=device,
+                              weights_only=False)
+        last_peak[0] = (old["depths"][-1].get("peak_gib") or 0.0) * 2**30  # (until this run measures its own)
+        first = saved(0, 0)
+        assert first["config"] == net.config, f"--resume {args.resume}: its networks are {first['config']}, not {net.config}"
+        for dd, rec in enumerate(old["depths"]):
+            steps = [saved(dd, t) for t in range(rec["steps"])]
+            keep_nets(steps[0]["start"], [st["state_dict"] for st in steps])
+        last = old["depths"][-1]
+        prev_depth = {t: saved(start_depth - 1, t)["state_dict"] for t in range(last["tried"])}
+        recent = prev_depth[last["tried"] - 1]
+        chosen_steps = [rec["steps"] for rec in old["depths"]]
+        root_val = old["root"]["val"]
+        depth_gains = [root_val - rec["val"] for rec in old["depths"]]
+        old["args"] = vars(args)
+        records = old
+        log(f"resuming {args.resume} at depth {start_depth} ({seconds_before / 3600:.2f} h): its networks loaded in "
+            f"{time.time() - t0:.0f}s ({coded_bytes['gpu'] / 2**30:.1f} GB on the GPU, {coded_bytes['cpu'] / 2**30:.1f} "
+            f"in host memory)")
+        for name, g in list(groups.items()):
+            t0 = time.time()
+            X, coded_g = g.R + mean, None
+            for i in range(0, len(X), args.rotate_chunk):
+                h = code_fresh(X[i:i + args.rotate_chunk])
+                if coded_g is None:
+                    coded_g = h
+                else:
+                    append_group(coded_g, h)
+            assert coded_g is not None
+            coded_g.name = name
+            groups[name] = coded_g
+            log(f"{name}: {len(X)} images coded through {start_depth} depths in {time.time() - t0:.0f}s; mse "
+                f"{mse_now(coded_g):.6f} (the run's: {old['depths'][-1].get(name, float('nan')):.6f})")
+        del X, coded_g, h
+        train, val, test = groups["train"], groups["val"], groups["test"]
+        entered = torch.full((N,), start_depth, dtype=torch.long)
     split_sse = torch.compile(vsplit_sse, dynamic=True) if args.compile else vsplit_sse
 
     def val_mse(model, st_va: tuple[torch.Tensor, CellSums, torch.Tensor], q_va):
@@ -341,7 +415,7 @@ def main():
         mem(name)
         return t1
 
-    for d in range(args.max_depths):
+    for d in range(start_depth, args.max_depths):
         depth_began = time.time()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
@@ -349,22 +423,30 @@ def main():
         parts.clear()
         peaks.clear()
         rotated = None
-        if pool is not None and pool_stream is not None and d > 0:
-            # (the buffer's oldest images leave; new ones, coded by every network so far, come in at its end)
+        if pool is not None and pool_stream is not None and d > start_depth and credit > 0:
+            # (the buffer's oldest images leave and new ones, coded by every network so far, come in at its end, a
+            # chunk at a time while the earned time lasts; the last chunk may overdraw it, repaid by later depths)
             t_rot = time.time()
-            k = min(rotate_k, N)
-            keep_images(train, torch.arange(k, N, device=device))
-            fresh_sq = 0.0
-            for c0 in range(0, k, args.rotate_chunk):
-                h = code_fresh(pool[pool_stream.take(min(args.rotate_chunk, k - c0))].to(device).float())
+            k, fresh_sq = 0, 0.0
+            while credit > 0 and k < N:
+                t_chunk = time.time()
+                n = min(args.rotate_chunk, N - k)
+                keep_images(train, torch.arange(n, N, device=device))
+                h = code_fresh(pool[pool_stream.take(n)].to(device).float())
                 fresh_sq += mse_now(h) * len(h.R)
                 append_group(train, h)
                 del h
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                credit -= time.time() - t_chunk
+                k += n
+            if k == N:
+                credit = min(credit, 0.0)  # (the whole buffer is new: no more to buy, so none is banked)
             entered = torch.cat([entered[k:], torch.full((k,), d)])
             seconds = part("rotate", t_rot) - t_rot
             timing_depth["other"] += seconds
             rotated = dict(images=k, seconds=seconds, fresh=fresh_sq / k, age=float(d - entered.float().mean()),
-                           nets_gb=coded_bytes / 2**30)
+                           nets_gpu_gb=coded_bytes["gpu"] / 2**30, nets_cpu_gb=coded_bytes["cpu"] / 2**30)
         t_other = time.time()
         start = pca_start(train.R, V)
         tp = part("start", t_other)
@@ -514,10 +596,7 @@ def main():
         tp = part("split", tp)
         chosen_steps.append(best_n)
         if pool is not None:
-            nets = [{k: v.to("cpu", dtype=torch.bfloat16 if args.bf16 and v.is_floating_point() else v.dtype)
-                     for k, v in states[t].items()} for t in range(best_n)]
-            coded.append((start, nets))
-            coded_bytes += sum(v.numel() * v.element_size() for net_state in nets for v in net_state.values())
+            keep_nets(start, [states[t] for t in range(best_n)])
         prev_depth = states
         now = dict(train=mse_now(train), val=mse_now(val), test=mse_now(test))
         tp = part("depth mse", tp)
@@ -531,7 +610,7 @@ def main():
         depth_gains.append(root_val - now["val"])
         k_best = best_count(depth_gains, args.depth_threshold)
         timing_depth["other"] += time.time() - t_other
-        elapsed = time.time() - began
+        elapsed = time.time() - began + seconds_before
         busy = util.mean(depth_began)
         mem("rest")
         peak = max(peaks.values()) if peaks else None
@@ -559,12 +638,13 @@ def main():
             + (f", peak {peak:.1f} GiB ({peak_in})" if peak is not None else "")
             + (f"; buffer: {rotated['images']} new in {rotated['seconds']:.1f}s (their mse {rotated['fresh']:.6f} on "
                f"entering, val's {before['val']:.6f}), mean age {rotated['age']:.1f} depths, networks "
-               f"{rotated['nets_gb']:.1f} GB" if rotated is not None else "") + f"; {elapsed / 3600:.2f} h in all")
-        if rotated is not None:
-            # (the next depth's rotation: scaled toward --rotate-share of the depth's time, at most doubling or
-            # halving at once)
-            target = args.rotate_share / (1 - args.rotate_share) * (wall - rotated["seconds"])
-            rotate_k = int(min(N, max(64, rotated["images"] * min(2.0, max(0.5, target / max(rotated["seconds"], 1e-3))))))
+               f"{rotated['nets_gpu_gb']:.1f} GB on the GPU, {rotated['nets_cpu_gb']:.1f} in host memory"
+               if rotated is not None else "") + f"; {elapsed / 3600:.2f} h in all")
+        if pool is not None:
+            # (this depth earns --rotate-share of its time, less what it spent rotating, for the next rotations)
+            credit += args.rotate_share / (1 - args.rotate_share) * (wall - (rotated or {}).get("seconds", 0.0))
+        if device.type == "cuda":
+            last_peak[:] = [max(peaks.values(), default=0.0) * 2**30, 0.0]
         if d + 1 - k_best >= args.depth_patience:
             log(f"no depth past {k_best} paid {args.depth_threshold:.1e} for {args.depth_patience} depths: done")
             break
