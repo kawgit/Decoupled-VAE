@@ -134,6 +134,7 @@ def main():
     device = get_device(args.device)
     torch.backends.cuda.matmul.allow_tf32 = args.tf32
     torch.backends.cudnn.allow_tf32 = args.tf32
+    torch.backends.cudnn.benchmark = True  # (the image head's convolutions: the fastest algorithm for each shape)
     log = RunLog(os.path.join(out, "run.log"), device)
     util = Utilization(device)
     log(f"=== train_inner_vway.py {time.strftime('%Y-%m-%d')} {vars(args)}")
