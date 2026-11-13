@@ -108,7 +108,7 @@ def main():
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--fp16", action="store_true", help="float16 autocast with a gradient scaler (V100s)")
     p.add_argument("--compile", action="store_true",
-                   help="torch.compile the network's memory and query (fewer, fused kernels: the training loop is "
+                   help="torch.compile the network's memory_q and query (fewer, fused kernels: the training loop is "
                         "otherwise bound by the CPU launching small ones)")
     p.add_argument("--profile-depth", type=int, default=None,
                    help="profile this depth's first step's training (torch.profiler: profile.txt, the kernels by GPU "
@@ -183,7 +183,7 @@ def main():
         # (each function compiles a few times at the first depths, for grad mode, batches of one node and the
         # history's alignment; past the limit it would run eagerly without saying so)
         torch._dynamo.config.recompile_limit = 64
-        setattr(net, "memory", torch.compile(net.memory, dynamic=True))
+        setattr(net, "memory_q", torch.compile(net.memory_q, dynamic=True))
         setattr(net, "query", torch.compile(net.query, dynamic=True))
     log(f"{N} train, {len(val.R)} val, {len(test.R)} test images of {D} numbers; V = {V} ({math.log2(V):.2f} bits a "
         f"token); each network {sum(q.numel() for q in net.parameters()) / 1e6:.2f}M parameters")
@@ -231,7 +231,7 @@ def main():
             for pieces, B in epoch_batches(train, stream.take(epoch_steps * args.batch), args.batch, max_nodes):
                 opt.zero_grad(set_to_none=True)
                 for nodes, w in pieces:
-                    c, _ = model.query(model.memory(*train.history(nodes)), q_tr[nodes])
+                    c, _ = model.query(model.memory_q(*train.history_q(nodes)), q_tr[nodes])
                     sse = split_sse(c, count[nodes], total[nodes])
                     if args.attraction > 0:
                         sse = sse + args.attraction * attraction_sse(c, train.stats.count[nodes], train.stats.total[nodes])

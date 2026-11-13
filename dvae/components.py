@@ -74,6 +74,9 @@ class Group:
     node_cpu: Tensor | None = None  # node on the CPU (the train group's, for building batches)
     window: int = 0  # > 0: histories hold the last window deltas and one token for the sum of those before
     sums: Tensor | None = None  # [Nn, D] each node's sum of deltas (its predicted mean less the training mean)
+    # [Nn, D] (V-way: vdescend keeps it instead of sums) sums less the window's deltas as its tables keep them:
+    # history_q's early token
+    early: Tensor | None = None
 
     @property
     def depth(self):
@@ -82,6 +85,31 @@ class Group:
     @property
     def nodes(self):
         return len(self.keys)
+
+    def history_q(self, nodes: Tensor):
+        """history's histories with the window as its tables keep it, for HistoryReader.memory_q: rows [B, k, D]
+        (int8, or float16), their scales [B, k] (ones for float16 tables), the early token [B, D] (the deltas
+        before the window, summed: None while there are none) and sides and ms [B, k, or k + 1 with the early
+        token first]. Reads early, which vdescend keeps."""
+        device, B, D = self.R.device, len(nodes), self.R.shape[1]
+        if self.depth == 0:
+            z = self.R.new_zeros(B, 0)
+            return self.R.new_zeros(B, 0, D), z, None, z, z
+        rows = self.anc[nodes]
+        first = max(0, self.depth - self.window) if self.window > 0 else 0
+        window = range(first, self.depth)
+        raw = torch.stack([self.deltas[j][rows[:, j].to(self.deltas[j].device)].to(device, non_blocking=True)
+                           for j in window], 1)
+        scales = torch.stack([self.R.new_ones(B) if s is None else s[rows[:, j]]
+                              for j, s in ((j, self.scales[j]) for j in window)], 1)
+        sides = torch.stack([self.sides[j][rows[:, j]] for j in window], 1)
+        ms = torch.stack([self.ms[j][rows[:, j]] for j in window], 1)
+        early = None
+        if first > 0:
+            assert self.early is not None, "history_q reads early, which vdescend keeps"
+            early = self.early[nodes]
+            sides, ms = F.pad(sides, (1, 0)), F.pad(ms, (1, 0))
+        return raw, scales, early, sides, ms
 
     def history(self, nodes: Tensor):
         """The histories (deltas [B, depth, D] float32, sides and ms [B, depth]) of nodes [B] (GPU)."""

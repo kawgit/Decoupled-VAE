@@ -149,7 +149,7 @@ def vanswers(net: VStepNet, g: Group, q: Tensor, batch=1024, out: Tensor | None 
     p = torch.empty(q.shape[:2], device=q.device)
     for i in range(0, g.nodes, batch):
         nodes = torch.arange(i, min(i + batch, g.nodes), device=g.R.device)
-        cn, p[nodes] = net.query(net.memory(*g.history(nodes)), q[nodes])
+        cn, p[nodes] = net.query(net.memory_q(*g.history_q(nodes)), q[nodes])
         c[nodes] = cn.to(c.dtype)
     return c, p
 
@@ -196,11 +196,17 @@ def vdescend(g: Group, cells: Tensor, c: Tensor, p: Tensor, gpu_budget: float, t
     g.ms.append(p[parent, token].clone())
     g.anc = torch.cat([g.anc[parent], torch.arange(len(children), device=device)[:, None]], 1)
     if g.window > 0:
-        assert g.sums is not None
-        g.sums = g.sums[parent] + delta
+        # (early: each node's sum of deltas less its window's as the tables keep them, history_q's early token.
+        # A child's is its parent's, plus what its own table entry rounds off, plus the delta leaving the window)
+        kept = table.float() * scale[:, None] if table_bits == 8 else table.float()
+        early = delta - kept if g.early is None else g.early[parent] + (delta - kept)
         old = g.depth - g.window - 1
         if old >= 0:
-            g.deltas[old] = g.deltas[old].new_zeros(0, delta.shape[1])
+            t_old, s_old, at = g.deltas[old], g.scales[old], g.anc[:, old]
+            row = t_old[at.to(t_old.device)].to(device).float()
+            early = early + (row if s_old is None else row * s_old[at, None])
+            g.deltas[old] = t_old.new_zeros(0, delta.shape[1])
+        g.early, g.sums = early, None  # (history_q reads early; sums is history's)
     g.keys = splitmix64(g.keys[parent.cpu()] * V + token.cpu())
     g.node = node
     refresh_stats(g)

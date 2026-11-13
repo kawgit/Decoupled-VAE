@@ -182,6 +182,38 @@ class HistoryReader(nn.Module):
         with self.amp():
             return self._memory(deltas, sides, ms)
 
+    def memory_q(self, raw, scales, early, sides, ms):
+        """memory, from Group.history_q's window as its tables keep it (int8 or float16 rows and their scales)
+        and its early token. No float copy of the window is made: a delta's direction is its row's, and its
+        length its row's times its scale."""
+        with self.amp():
+            return self._memory_q(raw, scales, early, sides, ms)
+
+    def _memory_q(self, raw, scales, early, sides, ms):
+        assert self.mean_in is None, "memory_q has no sum of the deltas for the node's mean image"
+        B, k = sides.shape
+        if self.plain:
+            sides, ms = torch.zeros_like(sides), torch.zeros_like(ms)
+        w, D = self.delta_in.weight, raw.shape[-1]
+        # (int8 rows are exact in bfloat16 and float16, which the product takes)
+        x = raw.to(torch.bfloat16 if self.bf16 else torch.float16 if self.fp16 else torch.float32)
+        norm = x.float().square().sum(-1).sqrt()
+        h = F.linear(x, w[:, :D]) / norm.clamp_min(EPS)[..., None]
+        length = scales * norm
+        if early is not None:
+            norm_e = early.norm(dim=-1).clamp_min(EPS)
+            h = torch.cat([(F.linear(early, w[:, :D]) / norm_e[:, None])[:, None], h], 1)
+            length = torch.cat([norm_e[:, None], length], 1)
+        h = h + F.linear(torch.stack([length.clamp_min(EPS).log(), sides, ms], -1), w[:, D:], self.delta_in.bias)
+        h = h + self.position[:k]
+        if h.shape[1] == 0:
+            return [raw.new_zeros(B, 0, self.width, dtype=torch.float32) for _ in self.blocks]
+        mems = []
+        for blk in self.blocks:
+            h, x = blk(h)
+            mems.append(x)
+        return mems
+
     def _memory(self, deltas, sides, ms):
         B, k = sides.shape
         if self.plain:
