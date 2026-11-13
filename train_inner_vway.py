@@ -87,8 +87,10 @@ def main():
     p.add_argument("--head-hidden", type=int, default=1, help="multiplies the image head's convolutions' channels")
     p.add_argument("--side-m-history", action="store_true", help="history tokens also read each step's token and share")
     p.add_argument("--batch", type=int, default=1024)
-    p.add_argument("--max-nodes", type=int, default=0, help="nodes per forward pass while training (0: as "
-                                                            "train_inner_components.py's, divided by V / 2)")
+    p.add_argument("--max-nodes", type=int, default=0,
+                   help="nodes per forward pass while training (0: a batch's, in one pass; fewer passes launch fewer "
+                        "small kernels, which bound the loop: 256 took 2.1 times as long per epoch on ImageNet "
+                        "latents)")
     p.add_argument("--node-batch", type=int, default=1024)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
@@ -108,6 +110,9 @@ def main():
     p.add_argument("--compile", action="store_true",
                    help="torch.compile the network's memory and query (fewer, fused kernels: the training loop is "
                         "otherwise bound by the CPU launching small ones)")
+    p.add_argument("--profile-depth", type=int, default=None,
+                   help="profile this depth's first step's training (torch.profiler: profile.txt, the kernels by GPU "
+                        "time) and stop")
     p.add_argument("--hours", type=float, default=0.0)
     p.add_argument("--outer", default=None, metavar="RUN", help="a train_outer.py run: code its latents")
     p.add_argument("--px-images", type=int, default=2000)
@@ -145,7 +150,7 @@ def main():
     groups = {s: root_group(s, X, mean, args.history_window) for s, X in data.items()}
     train, val, test = groups["train"], groups["val"], groups["test"]
     N, D = train.R.shape
-    max_nodes = args.max_nodes or max(256, 512 * 3072 // D * 2 // V)
+    max_nodes = args.max_nodes or args.batch
     total_memory = torch.cuda.get_device_properties(device).total_memory if device.type == "cuda" else 0
     budget = args.gpu_tables * total_memory
     shape = tuple(lat["shape"]) if lat is not None else SHAPES[args.dataset]
@@ -174,6 +179,9 @@ def main():
                    args.head, args.head_hidden).to(device)
     net.bf16, net.fp16 = args.bf16, args.fp16
     if args.compile:  # (dynamic: the batch's nodes and the history's length vary)
+        # (each function compiles a few times at the first depths, for grad mode, batches of one node and the
+        # history's alignment; past the limit it would run eagerly without saying so)
+        torch._dynamo.config.recompile_limit = 64
         setattr(net, "memory", torch.compile(net.memory, dynamic=True))
         setattr(net, "query", torch.compile(net.query, dynamic=True))
     log(f"{N} train, {len(val.R)} val, {len(test.R)} test images of {D} numbers; V = {V} ({math.log2(V):.2f} bits a "
@@ -304,6 +312,15 @@ def main():
                 v0, start_label, state = min(scored, key=lambda x: x[0])
                 net.load_state_dict(state)
             timing["val"] += time.time() - t_val
+            if d == args.profile_depth and t == 0:
+                from torch.profiler import ProfilerActivity, profile
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                    train_net(net, st_tr, st_va, query["train"], query["val"], v0, timing, f"d{d}s{t}")
+                table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=60, max_name_column_width=90)
+                with open(os.path.join(out, "profile.txt"), "w") as f:
+                    f.write(table)
+                log(f"profiled d{d}s{t}'s training: {os.path.join(out, 'profile.txt')}")
+                return
             epochs, kept_epoch = train_net(net, st_tr, st_va, query["train"], query["val"], v0, timing, f"d{d}s{t}")
             t_other = time.time()
             c_va, p_va = vanswers(net, val, query["val"], args.node_batch)
