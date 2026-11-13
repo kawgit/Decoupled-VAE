@@ -275,17 +275,34 @@ class ImageStream:
         self.perm, self.pos = state["perm"], state["pos"]
 
 
-def epoch_batches(g: Group, images: Tensor, batch: int, max_nodes: int):
+def _pad_pieces(nodes: Tensor, w: Tensor, max_nodes: int, pad_to: int) -> tuple[Tensor, Tensor]:
+    """nodes and their weights, each max_nodes piece padded to a multiple of pad_to with its last node at weight 0
+    (so that cutting the result at max_nodes gives the padded pieces; max_nodes a multiple of pad_to)."""
+    assert max_nodes % pad_to == 0, "max_nodes must be a multiple of pad_to"
+    out_n, out_w = [], []
+    for i in range(0, len(nodes), max_nodes):
+        n, ww = nodes[i:i + max_nodes], w[i:i + max_nodes]
+        pad = -len(n) % pad_to
+        out_n += [n, n[-1:].expand(pad)]
+        out_w += [ww, ww.new_zeros(pad)]
+    return torch.cat(out_n), torch.cat(out_w)
+
+
+def epoch_batches(g: Group, images: Tensor, batch: int, max_nodes: int, pad_to: int = 1):
     """An epoch's batches over its images (indices into g's): each batch's B images as its distinct nodes, each
     weighted by the share of its images the batch holds, so that sum(weight * split_sse) / B is an unbiased
     estimate of the objective per image; cut into pieces of at most max_nodes nodes. Built on the CPU: a list of
-    batches, each a list of (nodes, weights) pieces, on g's device."""
+    batches, each a list of (nodes, weights) pieces, on g's device. pad_to: each piece's nodes padded to a
+    multiple of it with its last node, weighted 0 (fewer shapes for compiled code and cuDNN's algorithm search to
+    meet)."""
     assert g.node_cpu is not None and g.stats is not None
     count = g.stats.count.cpu()
     out = []
     for idx in images.split(batch):
         nodes, c = torch.unique(g.node_cpu[idx], return_counts=True)
         w = c.float() / count[nodes]
+        if pad_to > 1:
+            nodes, w = _pad_pieces(nodes, w, max_nodes, pad_to)
         pieces = [(nodes[i:i + max_nodes].to(g.R.device, non_blocking=True),
                    w[i:i + max_nodes].to(g.R.device, non_blocking=True)) for i in range(0, len(nodes), max_nodes)]
         out.append((pieces, len(idx)))

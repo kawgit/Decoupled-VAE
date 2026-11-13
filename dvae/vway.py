@@ -148,9 +148,11 @@ def vanswers(net: VStepNet, g: Group, q: Tensor, batch=1024, out: Tensor | None 
     c = out if out is not None else torch.empty(q.shape, dtype=q.dtype, device=q.device)
     p = torch.empty(q.shape[:2], device=q.device)
     for i in range(0, g.nodes, batch):
-        nodes = torch.arange(i, min(i + batch, g.nodes), device=g.R.device)
-        cn, p[nodes] = net.query(net.memory_q(*g.history_q(nodes)), q[nodes])
-        c[nodes] = cn.to(c.dtype)
+        n = min(batch, g.nodes - i)
+        # (the last batch padded to a multiple of 64 with its last node: fewer shapes for compiled code and cuDNN)
+        nodes = torch.arange(i, i + n + (-n % 64), device=g.R.device).clamp_max(g.nodes - 1)
+        cn, pn = net.query(net.memory_q(*g.history_q(nodes)), q[nodes])
+        c[i:i + n], p[i:i + n] = cn[:n].to(c.dtype), pn[:n]
     return c, p
 
 
@@ -181,11 +183,11 @@ def vdescend(g: Group, cells: Tensor, c: Tensor, p: Tensor, gpu_budget: float, t
     children, node = torch.unique(g.node * V + cells, return_inverse=True)
     parent, token = children // V, children % V
     delta = c[parent, token].float()
-    g.R = g.R - delta[node]
+    g.R.sub_(delta[node])  # (in place, as below: at V = 16 the GPU is nearly full when a depth splits)
     device = g.R.device
     if table_bits == 8:
         scale = delta.abs().amax(-1).clamp_min(1e-12) / 127
-        table, size = (delta / scale[:, None]).round().to(torch.int8), 1
+        table, size = (delta / scale[:, None]).round_().to(torch.int8), 1
         g.scales.append(scale)
     else:
         table, size = delta.half(), 2
@@ -198,14 +200,18 @@ def vdescend(g: Group, cells: Tensor, c: Tensor, p: Tensor, gpu_budget: float, t
     if g.window > 0:
         # (early: each node's sum of deltas less its window's as the tables keep them, history_q's early token.
         # A child's is its parent's, plus what its own table entry rounds off, plus the delta leaving the window)
-        kept = table.float() * scale[:, None] if table_bits == 8 else table.float()
-        early = delta - kept if g.early is None else g.early[parent] + (delta - kept)
+        kept = table.float().mul_(scale[:, None]) if table_bits == 8 else table.float()
+        early = delta.sub_(kept)  # (delta's last use)
+        del kept
+        if g.early is not None:
+            early = g.early[parent].add_(early)
         old = g.depth - g.window - 1
         if old >= 0:
             t_old, s_old, at = g.deltas[old], g.scales[old], g.anc[:, old]
             row = t_old[at.to(t_old.device)].to(device).float()
-            early = early + (row if s_old is None else row * s_old[at, None])
-            g.deltas[old] = t_old.new_zeros(0, delta.shape[1])
+            early.add_(row if s_old is None else row.mul_(s_old[at, None]))
+            del row
+            g.deltas[old] = t_old.new_zeros(0, early.shape[1])
         g.early, g.sums = early, None  # (history_q reads early; sums is history's)
     g.keys = splitmix64(g.keys[parent.cpu()] * V + token.cpu())
     g.node = node

@@ -88,9 +88,10 @@ def main():
     p.add_argument("--side-m-history", action="store_true", help="history tokens also read each step's token and share")
     p.add_argument("--batch", type=int, default=1024)
     p.add_argument("--max-nodes", type=int, default=0,
-                   help="nodes per forward pass while training (0: a batch's, in one pass; fewer passes launch fewer "
-                        "small kernels, which bound the loop: 256 took 2.1 times as long per epoch on ImageNet "
-                        "latents)")
+                   help="nodes per forward pass while training, a multiple of 64 (0: batch * 4 / V, a batch's in one "
+                        "pass at V = 4; fewer passes launch fewer small kernels, which bound the loop: 256 took 2.1 "
+                        "times as long per epoch on ImageNet latents at V = 4, while at V = 16 a batch in one pass "
+                        "ran the GPU out of memory)")
     p.add_argument("--node-batch", type=int, default=1024)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
@@ -151,7 +152,7 @@ def main():
     groups = {s: root_group(s, X, mean, args.history_window) for s, X in data.items()}
     train, val, test = groups["train"], groups["val"], groups["test"]
     N, D = train.R.shape
-    max_nodes = args.max_nodes or args.batch
+    max_nodes = args.max_nodes or max(64, args.batch * 4 // V // 64 * 64)
     total_memory = torch.cuda.get_device_properties(device).total_memory if device.type == "cuda" else 0
     budget = args.gpu_tables * total_memory
     shape = tuple(lat["shape"]) if lat is not None else SHAPES[args.dataset]
@@ -228,7 +229,7 @@ def main():
         while True:
             t0 = time.time()
             model.train()
-            for pieces, B in epoch_batches(train, stream.take(epoch_steps * args.batch), args.batch, max_nodes):
+            for pieces, B in epoch_batches(train, stream.take(epoch_steps * args.batch), args.batch, max_nodes, 64):
                 opt.zero_grad(set_to_none=True)
                 for nodes, w in pieces:
                     c, _ = model.query(model.memory_q(*train.history_q(nodes)), q_tr[nodes])
@@ -263,6 +264,13 @@ def main():
         return (count[big] == 0).float().mean().item() if big.any() else 0.0
 
     parts: dict[str, float] = {}  # (what a depth's "other" seconds went to, logged with it)
+    peaks: dict[str, float] = {}  # (the most GPU memory each part of a depth held, GiB)
+
+    def mem(name):
+        """Note the most GPU memory held since the last note as name's."""
+        if device.type == "cuda":
+            peaks[name] = max(peaks.get(name, 0.0), torch.cuda.max_memory_allocated(device) / 2**30)
+            torch.cuda.reset_peak_memory_stats(device)
 
     def part(name, t0):
         """Add the seconds since t0 (after the GPU's queued work) to parts[name]; returns now."""
@@ -270,6 +278,7 @@ def main():
             torch.cuda.synchronize(device)
         t1 = time.time()
         parts[name] = parts.get(name, 0.0) + t1 - t0
+        mem(name)
         return t1
 
     for d in range(args.max_depths):
@@ -278,6 +287,7 @@ def main():
             torch.cuda.reset_peak_memory_stats(device)
         timing_depth = dict(train=0.0, val=0.0, other=0.0)
         parts.clear()
+        peaks.clear()
         t_other = time.time()
         start = pca_start(train.R, V)
         tp = part("start", t_other)
@@ -316,6 +326,7 @@ def main():
                 v0, start_label, state = min(scored, key=lambda x: x[0])
                 net.load_state_dict(state)
             timing["val"] += time.time() - t_val
+            mem("val")
             if d == args.profile_depth and t == 0:
                 from torch.profiler import ProfilerActivity, profile
                 activities = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if device.type == "cuda" else [])
@@ -346,6 +357,7 @@ def main():
                 log(f"profiled d{d}s{t}'s training: {os.path.join(out, 'profile.txt')}")
                 return
             epochs, kept_epoch = train_net(net, st_tr, st_va, query["train"], query["val"], v0, timing, f"d{d}s{t}")
+            mem("train")
             t_other = time.time()
             c_va, p_va = vanswers(net, val, query["val"], args.node_batch)
             tp = part("answers", t_other)
@@ -428,7 +440,9 @@ def main():
         splits = dict(train=best_split["train"][:3], val=best_split["val"], test=(cells_of(test, q_te), c_te, p_te))
         nodes, empty_after = {}, empty_share(cell_stats(train, best_split["train"][1])[0])
         tp = part("cells", tp)
-        for s, (cells, c, pr) in splits.items():
+        best_split = None
+        for s in ("train", "val", "test"):  # (each split's [nodes, V, D] answers freed once it's made)
+            cells, c, pr = splits.pop(s)
             g = groups[s]
             nodes[s] = g.nodes
             kept = vdescend(g, cells, c, pr, budget, args.table_bits)
@@ -452,13 +466,15 @@ def main():
         timing_depth["other"] += time.time() - t_other
         elapsed = time.time() - began
         busy = util.mean(depth_began)
-        peak = torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None
+        mem("rest")
+        peak = max(peaks.values()) if peaks else None
+        peak_in = max(peaks, key=lambda k: peaks[k]) if peaks else ""
         records["depths"].append(dict(d=d, steps=best_n, tried=len(gains), gains=gains, **now,
                                       gain=depth_gains[-1] - (depth_gains[-2] if d > 0 else 0.0), nodes=nodes,
                                       bits=(d + 1) * math.log2(V), empty=empty_best,
                                       empty_after=empty_after, seconds=elapsed, wall=time.time() - depth_began,
                                       timing=timing_depth, other=dict(parts), util=busy,
-                                      peak_gib=peak))
+                                      peak_gib=peak, peaks=dict(peaks)))
         records["kept"] = k_best
         atomic_json(records, os.path.join(out, "records.json"))
         plot()
@@ -473,7 +489,7 @@ def main():
             f"{timing_depth['val']:.0f} val, {timing_depth['other']:.0f} other ("
             + ", ".join(f"{k} {v:.1f}" for k, v in parts.items()) + ")"
             + (f"; GPU {busy:.0f}% busy" if busy is not None else "")
-            + (f", peak {peak:.1f} GiB" if peak is not None else "") + f"; {elapsed / 3600:.2f} h in all")
+            + (f", peak {peak:.1f} GiB ({peak_in})" if peak is not None else "") + f"; {elapsed / 3600:.2f} h in all")
         if d + 1 - k_best >= args.depth_patience:
             log(f"no depth past {k_best} paid {args.depth_threshold:.1e} for {args.depth_patience} depths: done")
             break
