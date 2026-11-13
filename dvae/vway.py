@@ -174,15 +174,27 @@ def pca_start(R: Tensor, V: int, chunk=8192) -> Tensor:
 
 
 @torch.no_grad()
-def vdescend(g: Group, cells: Tensor, c: Tensor, p: Tensor, gpu_budget: float, table_bits: int = 8):
-    """Split every node of g into the cells (each image's [N]) with predicted means c [Nn, V, D] and shares p:
-    g moves to the next depth. The history tables keep each child's delta, its token as its side and its share
-    as its m (a plain history reads neither). Returns what the run keeps of the split."""
-    from dvae.components import refresh_stats
+def split_rows(g: Group, cells: Tensor, c: Tensor, p: Tensor, keep_c: bool = False) -> dict:
+    """What vdescend needs of the answers c [Nn, V, D] and shares p [Nn, V] that split g's nodes into the cells
+    (each image's [N]): the children (node * V + cell, the non-empty cells, in order), each image's child, each
+    child's predicted mean [children, D] (in c's dtype) and p; and c itself (a copy) with keep_c. Taken while c
+    is on the GPU, so that a step's answers need not be kept until the depth splits (at V = 16 on ImageNet
+    latents they are 12 GiB, the children's means 0.8)."""
     V = c.shape[1]
     children, node = torch.unique(g.node * V + cells, return_inverse=True)
+    return dict(V=V, children=children, node=node, delta=c[children // V, children % V], p=p,
+                c=c.clone() if keep_c else None)
+
+
+@torch.no_grad()
+def vdescend(g: Group, cells: Tensor, rows: dict, gpu_budget: float, table_bits: int = 8):
+    """Split every node of g into the cells (each image's [N]) with split_rows' children, their predicted means
+    and the shares: g moves to the next depth. The history tables keep each child's delta, its token as its side
+    and its share as its m (a plain history reads neither). Returns what the run keeps of the split."""
+    from dvae.components import refresh_stats
+    V, children, node, p = rows["V"], rows["children"], rows["node"], rows["p"]
     parent, token = children // V, children % V
-    delta = c[parent, token].float()
+    delta = rows["delta"].float()
     g.R.sub_(delta[node])  # (in place, as below: at V = 16 the GPU is nearly full when a depth splits)
     device = g.R.device
     if table_bits == 8:
@@ -220,5 +232,5 @@ def vdescend(g: Group, cells: Tensor, c: Tensor, p: Tensor, gpu_budget: float, t
                 child=token.to(torch.int8).cpu(), share=p.half().cpu())
 
 
-__all__ = ["VStepNet", "CellSums", "cells_of", "cell_stats", "vsplit_sse", "attraction_sse", "vsplit_mse", "vanswers",
+__all__ = ["VStepNet", "CellSums", "split_rows", "cells_of", "cell_stats", "vsplit_sse", "attraction_sse", "vsplit_mse", "vanswers",
            "pca_start", "vdescend"]

@@ -42,8 +42,8 @@ from dvae.data import SHAPES, get_device, load_images  # noqa: E402
 from dvae.deltatree import pixels  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
 from dvae.outer import decode_latents, load_outer  # noqa: E402
-from dvae.vway import (CellSums, VStepNet, attraction_sse, cell_stats, cells_of, pca_start, vanswers, vdescend,  # noqa: E402
-                       vsplit_mse, vsplit_sse)
+from dvae.vway import (CellSums, VStepNet, attraction_sse, cell_stats, cells_of, pca_start, split_rows,  # noqa: E402
+                       vanswers, vdescend, vsplit_mse, vsplit_sse)
 
 
 def atomic_save(obj, path):
@@ -372,30 +372,24 @@ def main():
             # depth's last step, which is rarely kept, needs neither, so its train mse goes unmeasured)
             c_tr = p_tr = None
             after["train"] = None
-            if best_n == t + 1:
-                best_split = None  # (the step it beat: freed before this one's train answers are made)
             if best_n == t + 1 or not last:
                 tp = time.time()
-                # (the answers are written over the question, which the step no longer needs (its cells are in
-                # st_tr), so one [nodes, V, D] tensor is on the GPU rather than two; unless the question is the
-                # best step's answers, which the split needs: those go to host memory first when the GPU is short)
-                q_tr, into = query["train"], None
-                if q_tr.stride(0) != 0:
-                    if best_split is not None and best_split["train"][1] is q_tr:
-                        need = torch.cuda.memory_allocated(device) + 2 * q_tr.nbytes if device.type == "cuda" else 0
-                        if need > 0.85 * total_memory:
-                            kept = best_split["train"]
-                            best_split["train"] = (kept[0], q_tr.to("cpu", copy=True), *kept[2:])
-                            into = q_tr
-                    else:
-                        into = q_tr
-                c_tr, p_tr = vanswers(net, train, q_tr, args.node_batch, out=into)
-                del q_tr, into
+                # (written over the question, which the step no longer needs: its cells are in st_tr, and the split
+                # keeps only split_rows of the best step's answers; so one [nodes, V, D] tensor is on the GPU)
+                q_tr = query["train"]
+                c_tr, p_tr = vanswers(net, train, q_tr, args.node_batch, out=q_tr if q_tr.stride(0) != 0 else None)
+                del q_tr
                 tp = part("answers", tp)
                 after["train"] = vsplit_mse(train, *st_tr[:2], c_tr)
             if best_n == t + 1:
-                # (the split's cells rather than the query that made them: the query, [nodes, V, D], can go)
-                best_split = dict(train=(st_tr[2], c_tr, p_tr, st_tr[0]), val=(st_va[2], c_va, p_va))
+                assert c_tr is not None and p_tr is not None
+                # (empty cells after the split: the cells the best answers themselves would make)
+                after_cells = train.node * V + cells_of(train, c_tr)
+                count_after = torch.bincount(after_cells, minlength=train.nodes * V).view(train.nodes, V)
+                best_split = dict(train=(st_tr[2], split_rows(train, st_tr[2], c_tr, p_tr, args.store_centroids)),
+                                  val=(st_va[2], split_rows(val, st_va[2], c_va, p_va, args.store_centroids)),
+                                  count=st_tr[0], empty_after=empty_share(count_after))
+                del after_cells, count_after
             state = {k: v.detach().clone() for k, v in net.state_dict().items()}
             states[t] = state
             recent = state
@@ -421,7 +415,7 @@ def main():
             assert c_tr is not None
             query = dict(train=c_tr, val=c_va)
         assert best_split is not None
-        empty_best = empty_share(best_split["train"][3])
+        empty_best, empty_after = empty_share(best_split["count"]), best_split["empty_after"]
         # (the steps' [nodes, V, D] tensors that the split doesn't use: on ImageNet each is gigabytes)
         del query, st_tr, st_va, c_tr, c_va, p_tr, p_va
         t_other = time.time()
@@ -433,22 +427,22 @@ def main():
             if t + 1 < best_n:
                 q_te = c_te
         tp = part("test answers", t_other)
-        best_tr = best_split["train"]
-        if best_tr[1].device != device:  # (the best step's train answers went to host memory: back, now there's room)
-            best_split["train"] = (best_tr[0], best_tr[1].to(device), *best_tr[2:])
-        del best_tr
-        splits = dict(train=best_split["train"][:3], val=best_split["val"], test=(cells_of(test, q_te), c_te, p_te))
-        nodes, empty_after = {}, empty_share(cell_stats(train, best_split["train"][1])[0])
+        cells_te = cells_of(test, q_te)
+        splits = dict(train=best_split["train"], val=best_split["val"],
+                      test=(cells_te, split_rows(test, cells_te, c_te, p_te, args.store_centroids)))
+        del q_te, c_te, p_te, cells_te
         tp = part("cells", tp)
         best_split = None
-        for s in ("train", "val", "test"):  # (each split's [nodes, V, D] answers freed once it's made)
-            cells, c, pr = splits.pop(s)
+        nodes = {}
+        for s in ("train", "val", "test"):
+            cells, rows = splits.pop(s)
             g = groups[s]
             nodes[s] = g.nodes
-            kept = vdescend(g, cells, c, pr, budget, args.table_bits)
-            atomic_save(dict(V=V, c=c.half().cpu() if args.store_centroids else None, start=start.cpu(), **kept),
+            kept = vdescend(g, cells, rows, budget, args.table_bits)
+            c = rows["c"]
+            atomic_save(dict(V=V, c=c.half().cpu() if c is not None else None, start=start.cpu(), **kept),
                         os.path.join(out, "tree", s, f"d{d:03d}.pt"))
-        del splits, best_split, c, pr, cells, q_te, c_te, p_te
+        del splits, best_split, cells, rows, c
         tp = part("split", tp)
         chosen_steps.append(best_n)
         prev_depth = states
