@@ -363,9 +363,10 @@ def main():
             if best_n == t + 1 or not last:
                 tp = time.time()
                 # (written over the question, which the step no longer needs: its cells are in st_tr, and the split
-                # keeps only split_rows of the best step's answers; so one [nodes, V, D] tensor is on the GPU)
+                # keeps only split_rows of the best step's answers; so one [nodes, V, D] tensor is on the GPU. Not at
+                # step 0, whose question is the depth's start expanded: with one node that is start itself)
                 q_tr = query["train"]
-                c_tr, p_tr = vanswers(net, train, q_tr, args.node_batch, out=q_tr if q_tr.stride(0) != 0 else None)
+                c_tr, p_tr = vanswers(net, train, q_tr, args.node_batch, out=q_tr if t > 0 else None)
                 del q_tr
                 tp = part("answers", tp)
                 after["train"] = vsplit_mse(train, *st_tr[:2], c_tr)
