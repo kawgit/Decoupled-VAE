@@ -141,7 +141,7 @@ def vanswers(net: VStepNet, g: Group, q: Tensor, batch=1024) -> tuple[Tensor, Te
     c, p = torch.empty_like(q), torch.empty(q.shape[:2], device=q.device)
     for i in range(0, g.nodes, batch):
         nodes = torch.arange(i, min(i + batch, g.nodes), device=g.R.device)
-        cn, p[nodes] = net.query(net.memory(*g.history(nodes)), q[nodes])
+        cn, p[nodes] = net.query(net.memory_raw(*g.history_raw(nodes)), q[nodes])
         c[nodes] = cn.to(c.dtype)
     return c, p
 
