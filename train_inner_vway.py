@@ -318,11 +318,31 @@ def main():
             timing["val"] += time.time() - t_val
             if d == args.profile_depth and t == 0:
                 from torch.profiler import ProfilerActivity, profile
-                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                activities = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if device.type == "cuda" else [])
+                with profile(activities=activities, record_shapes=True, with_stack=True) as prof:
                     train_net(net, st_tr, st_va, query["train"], query["val"], v0, timing, f"d{d}s{t}")
-                table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=60, max_name_column_width=90)
+                key = "cuda_time_total" if device.type == "cuda" else "cpu_time_total"
                 with open(os.path.join(out, "profile.txt"), "w") as f:
-                    f.write(table)
+                    f.write(prof.key_averages().table(sort_by=key, row_limit=60, max_name_column_width=90))
+                    # (each op's own time by the innermost line of this repository's code that called it)
+                    ours = ("dvae/", os.path.basename(__file__))  # (the profiler names frames by relative path)
+                    sites: dict[tuple[str, str], list[float]] = {}
+                    for e in prof.events() or []:
+                        if not e.name.startswith("aten::"):
+                            continue
+                        parent, frame = e.cpu_parent, "?"
+                        while parent is not None:
+                            if parent.name.startswith(ours):
+                                frame = parent.name
+                                break
+                            parent = parent.cpu_parent
+                        own = (e.self_device_time_total if device.type == "cuda" else e.self_cpu_time_total) / 1e3
+                        site = sites.setdefault((e.name, frame), [0.0, 0])
+                        site[0] += own
+                        site[1] += 1
+                    f.write("\n\nown ms and calls by op and call site:\n")
+                    for (name, frame), (ms, n) in sorted(sites.items(), key=lambda x: -x[1][0])[:80]:
+                        f.write(f"{ms:10.2f} {n:7d}  {name[:60]:60}  {frame}\n")
                 log(f"profiled d{d}s{t}'s training: {os.path.join(out, 'profile.txt')}")
                 return
             epochs, kept_epoch = train_net(net, st_tr, st_va, query["train"], query["val"], v0, timing, f"d{d}s{t}")
