@@ -187,7 +187,12 @@ class HistoryReader(nn.Module):
         if self.plain:
             sides, ms = torch.zeros_like(sides), torch.zeros_like(ms)
         length = deltas.norm(dim=-1, keepdim=True).clamp_min(EPS)
-        h = self.delta_in(torch.cat([deltas / length, length.log(), sides[..., None], ms[..., None]], -1))
+        # (delta_in of [direction, log length, side, m], as two products: the direction's, made from the delta and
+        # divided by its length after, and the three numbers': no copy of the window made, and a product over D
+        # rather than D + 3, which tensor cores take whole)
+        w, D = self.delta_in.weight, deltas.shape[-1]
+        h = (F.linear(deltas, w[:, :D]) / length
+             + F.linear(torch.cat([length.log(), sides[..., None], ms[..., None]], -1), w[:, D:], self.delta_in.bias))
         h = h + self.position[:k]
         if self.mean_in is not None:
             h = torch.cat([(self.mean_in(self.mean + deltas.sum(1)) + self.mean_token)[:, None], h], 1)
