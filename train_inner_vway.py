@@ -401,12 +401,15 @@ def main():
             if t + 1 < best_n:
                 q_te = c_te
         tp = part("test answers", t_other)
+        best_tr = best_split["train"]
+        if best_tr[1].device != device:  # (the best step's train answers went to host memory: back, now there's room)
+            best_split["train"] = (best_tr[0], best_tr[1].to(device), *best_tr[2:])
+        del best_tr
         splits = dict(train=best_split["train"][:3], val=best_split["val"], test=(cells_of(test, q_te), c_te, p_te))
         nodes, empty_after = {}, empty_share(cell_stats(train, best_split["train"][1])[0])
         tp = part("cells", tp)
         for s, (cells, c, pr) in splits.items():
             g = groups[s]
-            c = c.to(device)  # (the best step's train answers may be in host memory)
             nodes[s] = g.nodes
             kept = vdescend(g, cells, c, pr, budget, args.table_bits)
             atomic_save(dict(V=V, c=c.half().cpu() if args.store_centroids else None, start=start.cpu(), **kept),
