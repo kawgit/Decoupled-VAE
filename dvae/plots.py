@@ -50,11 +50,12 @@ PRIOR = "#a8a8ad"  # the rest of a depth's seconds
 COMPONENT_COLORS = dict(train="#e8743b", val="#2a78d6", test="#3aa57a")
 
 
-def _bars(ax, xs, ys, color, label, bottom=None, log=False):
+def _bars(ax, xs, ys, color, label, bottom=None, log=False, floor=None):
     """A bar per x, drawn as one stepped area: with more bars than pixels, separate bars round to zero width in
-    stretches and vanish. log: from just under the smallest value up (0 has no place on a log axis)."""
+    stretches and vanish. log: from floor (default just under the smallest value) up (0 has no place on a log
+    axis)."""
     if log:
-        lo = [min(ys) / 2] * len(ys)
+        lo = [floor if floor is not None else min(ys) / 2] * len(ys)
         ax.fill_between(xs, lo, ys, step="mid", color=color, linewidth=0, label=label)
         return
     lo = bottom if bottom is not None else [0.0] * len(ys)
@@ -151,9 +152,12 @@ def plot_components(records, path, pairs=None):
 
     xs = [h["d"] for h in depths]
     trains = [root["train"]] + [h["train"] for h in depths]
-    _bars(gain_ax, xs, [max(h["gain"], 1e-12) for h in depths], COMPONENT_COLORS["val"], "val", log=True)
-    gain_ax.plot(xs, [max(trains[i] - trains[i + 1], 1e-12) for i in range(K)], "o", color=COMPONENT_COLORS["train"],
-                 markersize=3, label="train")
+    # (the train gain's bar behind the val gain's: it shows above it where train gains more, as it should)
+    val_gain = [max(h["gain"], 1e-12) for h in depths]
+    train_gain = [max(trains[i] - trains[i + 1], 1e-12) for i in range(K)]
+    floor = min(val_gain + train_gain) / 2
+    _bars(gain_ax, xs, train_gain, COMPONENT_COLORS["train"], "train", log=True, floor=floor)
+    _bars(gain_ax, xs, val_gain, COMPONENT_COLORS["val"], "val", log=True, floor=floor)
     if args["depth_threshold"] > 0:  # (0, the default, has no place on a log axis)
         gain_ax.axhline(args["depth_threshold"], color=INK, linestyle=":", linewidth=1.2, label="depth threshold")
     _log_y(gain_ax)
