@@ -7,13 +7,18 @@ depth's position; causal attention lets depth k see its own inputs and everythin
 head gives V logits per depth. As the prior they are p(token k | the code before it); as the discriminator, each
 token's trust logit: how likely that token, after that code, came from real codes rather than the prior. The head
 starts at zero, so an untrained prior is uniform and an untrained discriminator trusts everything one half.
+
+CodeQA decodes codes sampled from a prior into images (the tree replayed with the sampled tokens), for the run's plot.
 """
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
+from dvae.data import load_images
 from dvae.deltatree import Block
+from dvae.outer import load_outer
+from dvae.vreplay import VTree
 
 
 class CodeNet(nn.Module):
@@ -42,4 +47,57 @@ class CodeNet(nn.Module):
         return self.head(self.out_norm(h))
 
 
-__all__ = ["CodeNet"]
+class CodeQA:
+    """Images for judging a prior by eye: a few test images, their reconstructions by the tree's first K depths, and
+    codes sampled from a prior and from the tree's own shares, each decoded by the tree (dvae/vreplay.py) and the
+    outer decoder of the latents the tree coded."""
+
+    def __init__(self, tree_run: str, device: torch.device, K: int, n: int = 10, fp16: bool = False,
+                 data_root: str = "data", seed: int = 0):
+        self.tree = VTree(tree_run, device, K, fp16=fp16)
+        self.K, self.n, self.device, self.seed = self.tree.K, n, device, seed
+        self.model, self.lat = load_outer(self.tree.args["outer"], device)
+        test = self.lat["test"]
+        idx = torch.randperm(len(test), generator=torch.Generator().manual_seed(seed))[:n]
+        Z = test[idx].float().flatten(1).to(device)
+        self.real = (load_images(self.lat["dataset"], "test", data_root)[idx].float() + 0.5) / 256
+        g, _ = self.tree.code(Z, self.K)
+        self.recon = self.decode(Z - g.R)
+
+    @torch.no_grad()
+    def decode(self, z: Tensor) -> Tensor:
+        """Scaled latents [n, D] -> images [n, C, H, W] in [0, 1] on the host."""
+        C, h, w = self.lat["shape"]
+        mean = self.lat["mean"].to(z.device)[None, :, None, None]
+        std = self.lat["std"].to(z.device)[None, :, None, None]
+        self.model.decoder.eval()
+        return self.model.decoder(z.float().view(-1, C, h, w) / self.lat["scale"] * std + mean).clamp(0, 1).cpu()
+
+    @torch.no_grad()
+    def samples(self, prior: CodeNet) -> dict:
+        """n codes sampled from prior (each token from its distribution given the code before it and the tree's
+        shares there) and n from the tree's shares alone, decoded; with the test images and their reconstructions
+        (the same seed every call, so that calls compare)."""
+        was = prior.training
+        prior.eval()
+        gen = torch.Generator(self.device).manual_seed(self.seed + 1)
+        V = prior.V
+        log_shares = torch.zeros(self.n, self.K, V, device=self.device)
+
+        def by_prior(d, tokens, shares):
+            log_shares[:, d] = shares.float().clamp_min(1e-6).log()
+            full = torch.cat([tokens, tokens.new_zeros(self.n, self.K - d)], 1)  # (causal: the rest is unread)
+            logits = prior(full, log_shares)[:, d].float()
+            return torch.multinomial(logits.softmax(-1), 1, generator=gen)[:, 0]
+
+        def by_shares(d, tokens, shares):
+            return torch.multinomial(shares.float().clamp_min(0) + 1e-12, 1, generator=gen)[:, 0]
+
+        _, z_prior = self.tree.sample(self.n, by_prior, self.K)
+        _, z_shares = self.tree.sample(self.n, by_shares, self.K)
+        prior.train(was)
+        return dict(real=self.real, recon=self.recon, prior=self.decode(z_prior), shares=self.decode(z_shares),
+                    K=self.K)
+
+
+__all__ = ["CodeNet", "CodeQA"]

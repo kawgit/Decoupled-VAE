@@ -76,5 +76,29 @@ class VTree:
                 shots[d + 1] = (X - g.R).half().cpu()
         return g, shots
 
+    @torch.no_grad()
+    def sample(self, n: int, choose, depths: int | None = None) -> tuple[Tensor, Tensor]:
+        """n codes chosen a token at a time, and their reconstructions: at each depth d, choose(d, tokens [n, d]
+        (long, the tokens so far), shares [n, V] (the tree's at each code's node)) gives each code's token [n]
+        (long) and the code moves to that cell, by its predicted mean (the networks read only the codes' past
+        tokens and means, never an image). Returns the tokens [n, K] and the reconstructions [n, D] (the tree's
+        mean plus the cells' means), on the device."""
+        K = self.K if depths is None else min(depths, self.K)
+        g = root_group("sample", self.mean.new_zeros(n, len(self.mean)), self.mean, self.window)
+        tokens = torch.zeros(n, K, dtype=torch.long, device=self.device)
+        for d in range(K):
+            q = self.starts[d].to(self.cdtype).expand(g.nodes, -1, -1)
+            c, p = q, None
+            for t, state in enumerate(self.nets[d]):
+                self.net.load_state_dict(state)
+                c, p = vanswers(self.net, g, q, self.node_batch)
+                if t + 1 < len(self.nets[d]):
+                    q = c
+            assert p is not None
+            cells = choose(d, tokens[:, :d], p[g.node]).long()
+            tokens[:, d] = cells
+            vdescend(g, cells, split_rows(g, cells, c, p), self.budget, self.bits)
+        return tokens, -g.R  # (R started at -mean and lost each cell's mean)
+
 
 __all__ = ["VTree"]

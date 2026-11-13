@@ -11,10 +11,16 @@ baselines, the tree's shares and the best constant share of each token per depth
 fresh discriminator, with the same settings, trains against the kept prior frozen (early-stopped on its val loss):
 its negative log trust on val and test is the run's score.
 
+run.png (redrawn every epoch) plots val's negative log trust, bits per image and the discriminator's loss by epoch,
+the kept prior's bits saved per token by depth, and QA images (dvae/vprior.py's CodeQA, every --qa-every epochs and
+for the kept prior): test images, their reconstructions by the tree, and codes sampled from the prior and from the
+tree's shares, each decoded by the tree's networks and the outer decoder.
+
 What the run keeps (artifacts/<job>/): run.log (and run.full.log, with progress within epochs), records.json,
-prior.pt (the kept prior), disc.pt (the fresh discriminator).
+run.png, prior.pt (the kept prior), disc.pt (the fresh discriminator).
 
 Run from the repo: python train_vprior.py --tree artifacts/<inner job> --lam 1
+(--replot artifacts/<vprior job>: a finished run's run.png redrawn, with QA images of its kept prior)
 """
 
 import argparse
@@ -30,7 +36,8 @@ import torch.nn.functional as F
 from dvae.artifacts import artifact
 from dvae.data import get_device
 from dvae.logs import RunLog
-from dvae.vprior import CodeNet
+from dvae.plots import plot_vprior
+from dvae.vprior import CodeNet, CodeQA
 
 LN2 = math.log(2)
 
@@ -67,6 +74,10 @@ def main():
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--limit-train", type=int, default=None)
+    p.add_argument("--qa-n", type=int, default=10, help="QA images of each kind in run.png")
+    p.add_argument("--qa-every", type=int, default=5, help="epochs between QA samples (and the kept prior's at the end)")
+    p.add_argument("--replot", default=None, metavar="RUN", help="only redraw a finished run's run.png, with QA images")
+    p.add_argument("--data-root", default="data")
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default=None)
@@ -78,6 +89,9 @@ def main():
     log(f"=== train_vprior.py {time.strftime('%Y-%m-%d')} {vars(args)}")
     torch.manual_seed(args.seed)
     began = time.time()
+    if args.replot:
+        replot(args, device, log)
+        return
 
     with open(os.path.join(args.tree, "records.json")) as f:
         rec = json.load(f)
@@ -100,10 +114,12 @@ def main():
 
     def baseline_bits(s):
         tok, ls = codes[s]
-        tree = -ls.float().gather(-1, tok[..., None])[..., 0].sum(1).mean().item() / LN2
-        const = -constant[torch.arange(K, device=device), tok].sum(1).mean().item() / LN2
-        return dict(tree=tree, constant=const)
-    baselines = {s: baseline_bits(s) for s in ("val", "test")}
+        tree = -ls.float().gather(-1, tok[..., None])[..., 0].mean(0) / LN2
+        const = -constant[torch.arange(K, device=device), tok].mean(0) / LN2
+        return dict(tree=tree.sum().item(), constant=const.sum().item()), dict(tree=tree.tolist(), constant=const.tolist())
+    baselines, base_depth = {}, {}
+    for s in ("val", "test"):
+        baselines[s], base_depth[s] = baseline_bits(s)
     log(f"baselines, bits per image: tree's shares val {baselines['val']['tree']:.2f}, test "
         f"{baselines['test']['tree']:.2f}; constant per depth val {baselines['val']['constant']:.2f}, test "
         f"{baselines['test']['constant']:.2f} (uniform: {K * math.log2(V):.0f})")
@@ -134,18 +150,20 @@ def main():
         net_p.eval()
         net_d.eval()
         tok, ls = codes[s]
-        ce = nlt = dl = 0.0
+        ce = torch.zeros(K, device=device)
+        nlt = dl = 0.0
         for i in range(0, len(tok), batch):
             t, l = tok[i:i + batch], ls[i:i + batch]
             with amp():
                 lp, sd = net_p(t, l).float(), net_d(t, l).float()
             logp = lp.log_softmax(-1)
             pp = logp.exp()
-            ce -= logp.gather(-1, t[..., None]).sum().item()
+            ce -= logp.gather(-1, t[..., None])[..., 0].sum(0)
             nlt -= (pp * F.logsigmoid(sd)).sum().item()
             dl += disc_loss(sd, pp, t).sum().item()
         n = len(tok)
-        return dict(bits=ce / n / LN2, nlt=nlt / (n * K), disc=dl / (n * K))
+        by_depth = (ce / n / LN2).tolist()
+        return dict(bits=sum(by_depth), nlt=nlt / (n * K), disc=dl / (n * K)), by_depth
 
     def train_epochs(net_p, net_d, opt_p, opt_d, train_prior, label, history):
         """Epochs until the selection metric (train_prior: val negative log trust; else the discriminator's val
@@ -192,28 +210,44 @@ def main():
                                f"{sums['ce'] / (b + 1) * K / LN2:.2f} bits per image, -E_p[log trust] "
                                f"{sums['ns'] / (b + 1):.4f}, disc loss {sums['dl'] / (b + 1):.4f}; {rate:.1f} batches/s, "
                                f"{(steps - b - 1) / rate:.0f}s left")
-            v = evaluate("val", net_p, net_d)
+            v, v_depth = evaluate("val", net_p, net_d)
             metric = v["nlt"] if train_prior else v["disc"]
             if metric < best[0]:
                 best = (metric, e, copy.deepcopy(net_p.state_dict()), copy.deepcopy(net_d.state_dict()))
+                if train_prior:
+                    records["by_depth"] = dict(epoch=e, prior=v_depth, **base_depth["val"])
             history.append(dict(epoch=e, train_bits=sums["ce"] / steps * K / LN2, train_nlt=sums["ns"] / steps,
                                 train_disc=sums["dl"] / steps, val=v, seconds=time.time() - t0,
                                 hours=(time.time() - began) / 3600))
             log(f"{label} epoch {e}: val -E_p[log trust] {v['nlt']:.4f} (ln 2 = {LN2:.4f}), bits per image "
                 f"{v['bits']:.2f} (tree's shares {baselines['val']['tree']:.2f}), disc loss {v['disc']:.4f}; train "
                 f"bits {history[-1]['train_bits']:.2f}; best epoch {best[1]}; {time.time() - t0:.0f}s")
-            atomic_json(dict(args=vars(args), K=K, V=V, baselines=baselines, history=records["history"],
-                             fresh=records["fresh"], final=records.get("final")), os.path.join(out, "records.json"))
+            if train_prior and (e == 1 or e % args.qa_every == 0):
+                t1 = time.time()
+                samples.update(qa.samples(net_p), epoch=e)
+                log.detail(f"    QA samples of epoch {e} in {time.time() - t1:.0f}s")
+            save()
             if e - best[1] >= args.patience:
                 break
         return best
 
-    records: dict = dict(history=[], fresh=[])
+    records: dict = dict(args=vars(args), K=K, V=V, baselines=baselines, history=[], fresh=[], final=None)
+    samples: dict = {}
+
+    def save():
+        atomic_json(records, os.path.join(out, "records.json"))
+        plot_vprior(records, os.path.join(out, "run.png"), samples or None)
+
+    t0 = time.time()
+    qa = CodeQA(args.tree, device, K, args.qa_n, fp16=args.fp16, data_root=args.data_root, seed=args.seed)
+    log(f"QA: {args.qa_n} test images, the tree's {qa.K} depths replayed (reconstructions and sampled codes decoded "
+        f"by {qa.tree.args['outer']}) in {time.time() - t0:.0f}s")
     best = train_epochs(prior, disc, optimizer(prior), optimizer(disc), True, "prior", records["history"])
     assert best[2] is not None, "no epoch ran"
     prior.load_state_dict(best[2])
     log(f"kept the prior of epoch {best[1]} (val -E_p[log trust] {best[0]:.4f}); a fresh discriminator now trains "
         f"against it, frozen")
+    samples.update(qa.samples(prior), epoch=best[1])
     torch.save(dict(config=prior.config, state_dict=prior.state_dict(), epoch=best[1], args=vars(args)),
                os.path.join(out, "prior.pt"))
     judge = make()
@@ -221,14 +255,32 @@ def main():
     assert best_j[3] is not None, "no epoch ran"
     judge.load_state_dict(best_j[3])
     torch.save(dict(config=judge.config, state_dict=judge.state_dict(), epoch=best_j[1]), os.path.join(out, "disc.pt"))
-    final = {s: evaluate(s, prior, judge) for s in ("val", "test")}
+    final = {s: evaluate(s, prior, judge)[0] for s in ("val", "test")}
     records["final"] = final
     log(f"score (the fresh discriminator, epoch {best_j[1]}): -E_p[log trust] val {final['val']['nlt']:.4f}, test "
         f"{final['test']['nlt']:.4f}; bits per image val {final['val']['bits']:.2f}, test {final['test']['bits']:.2f} "
         f"(tree's shares {baselines['test']['tree']:.2f}, constant {baselines['test']['constant']:.2f})")
-    atomic_json(dict(args=vars(args), K=K, V=V, baselines=baselines, history=records["history"],
-                     fresh=records["fresh"], final=final), os.path.join(out, "records.json"))
+    save()
     log(f"done in {(time.time() - began) / 60:.1f} min; {out}")
+
+
+def replot(args, device, log):
+    """A finished run's run.png redrawn (its records as they are) with QA images of its kept prior (prior.pt)."""
+    run = args.replot
+    with open(os.path.join(run, "records.json")) as f:
+        records = json.load(f)
+    saved = torch.load(os.path.join(run, "prior.pt"), map_location=device, weights_only=False)
+    prior = CodeNet(**saved["config"]).to(device)
+    prior.load_state_dict(saved["state_dict"])
+    t0 = time.time()
+    qa = CodeQA(records["args"]["tree"], device, records["K"], args.qa_n, fp16=records["args"]["fp16"],
+                data_root=args.data_root, seed=args.seed)
+    log(f"{run}: QA set up in {time.time() - t0:.0f}s ({qa.K} depths of {records['args']['tree']})")
+    t0 = time.time()
+    samples = dict(qa.samples(prior), epoch=saved["epoch"])
+    log(f"sampled in {time.time() - t0:.0f}s")
+    plot_vprior(records, os.path.join(run, "run.png"), samples)
+    log(f"drew {os.path.join(run, 'run.png')}")
 
 
 def atomic_json(obj, path):

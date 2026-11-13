@@ -1,4 +1,4 @@
-"""Training progress plots: the inner encoder's (redrawn every depth) and the prior's (every epoch)."""
+"""Training progress plots: the inner encoder's (redrawn every depth) and the priors' (every epoch)."""
 
 import math
 import os
@@ -298,6 +298,109 @@ def plot_prior(records, path, samples=None):
                   interpolation="nearest")
         ax.set_axis_off()
         ax.set_title(f"Sampled codes: the prior (top), the encoder's own shares (bottom); epoch {samples.get('epoch', history[-1]['epoch'])}",
+                     loc="left", fontsize=11, color=INK)
+    _save(fig, path)
+
+
+def _rows_grid(rows, gap=4, between=2):
+    """Rows of [n, C, H, W] images, one row each, [rows H + gaps, n W + gaps, C]."""
+    n, C, H, W = rows[0].shape
+    grid = np.ones((len(rows) * H + (len(rows) - 1) * gap, n * W + (n - 1) * between, C))
+    for r, images in enumerate(rows):
+        for i in range(n):
+            y, x = r * (H + gap), i * (W + between)
+            grid[y:y + H, x:x + W] = images[i].transpose(1, 2, 0)
+    return grid.clip(0, 1)
+
+
+def plot_vprior(records, path, samples=None):
+    """Save a V-way prior run's progress (train_vprior.py): per epoch, val's negative log trust (the prior's
+    training, then the fresh discriminator's against the kept prior), bits per image (train and val, beside the
+    tree's shares, the constant share per depth and uniform), the discriminator's val loss; the kept prior's bits
+    saved per token by depth against uniform, beside the baselines; and, given samples (CodeQA.samples), test images,
+    their reconstructions, and codes sampled from the prior and from the tree's shares, decoded."""
+    history, fresh = records["history"], records.get("fresh", [])
+    if not history:
+        return
+    K, V, base = records["K"], records["V"], records["baselines"]["val"]
+    uniform = K * math.log2(V)
+    fig = plt.figure(figsize=(19, 12))
+    grid = fig.add_gridspec(2, 3, height_ratios=[1, 1])
+    nlt_ax, bits_ax, disc_ax = (fig.add_subplot(grid[0, i]) for i in range(3))
+    depth_ax = fig.add_subplot(grid[1, 0])
+    prior_c, fresh_c, train_c = COMPONENT_COLORS["val"], COMPONENT_COLORS["train"], PRIOR
+
+    ep = [h["epoch"] for h in history]
+    ep_f = [len(history) + h["epoch"] for h in fresh]
+    best = min(history, key=lambda h: h["val"]["nlt"])
+    nlt_ax.plot(ep, [h["val"]["nlt"] for h in history], color=prior_c, marker="o", markersize=3, linewidth=1.6,
+                label="val, prior training")
+    nlt_ax.plot(ep, [h["train_nlt"] for h in history], color=train_c, marker="o", markersize=3, linewidth=1.2,
+                label="train, prior training")
+    if fresh:
+        nlt_ax.plot(ep_f, [h["val"]["nlt"] for h in fresh], color=fresh_c, marker="o", markersize=3, linewidth=1.6,
+                    label="val, fresh discriminator vs the kept prior")
+    nlt_ax.axhline(math.log(2), color=MUTED, linewidth=1.2, linestyle="--", label="ln 2 (no tell)")
+    nlt_ax.plot([best["epoch"]], [best["val"]["nlt"]], "o", color=prior_c, markersize=9, markerfacecolor="none",
+                markeredgewidth=1.6, label="kept epoch")
+    final = records.get("final")
+    title = "-E_p[log trust], nats per token" + (f" (score: val {final['val']['nlt']:.4f})" if final else "")
+    nlt_ax.legend(frameon=False, labelcolor=INK, fontsize=8)
+    _style(nlt_ax, title, "epoch (then the fresh discriminator's)", "nats per token")
+
+    bits_ax.plot(ep, [h["val"]["bits"] for h in history], color=prior_c, marker="o", markersize=3, linewidth=1.6,
+                 label="val")
+    bits_ax.plot(ep, [h["train_bits"] for h in history], color=train_c, marker="o", markersize=3, linewidth=1.2,
+                 label="train")
+    bits_ax.axhline(base["tree"], color=MUTED, linewidth=1.2, linestyle="--", label="val, tree's shares")
+    bits_ax.axhline(base["constant"], color=INK, linewidth=1.2, linestyle=":", label="val, constant per depth")
+    bits_ax.axhline(uniform, color=MUTED, linewidth=1.0, linestyle="-.", label=f"uniform ({uniform:.0f})")
+    bits_ax.ticklabel_format(axis="y", useOffset=False)
+    bits_ax.legend(frameon=False, labelcolor=INK, fontsize=8)
+    _style(bits_ax, f"Bits per image (kept: val {best['val']['bits']:.2f}; {K} tokens)", "epoch", "bits per image")
+
+    disc_ax.plot(ep, [h["val"]["disc"] for h in history], color=prior_c, marker="o", markersize=3, linewidth=1.6,
+                 label="val, prior training")
+    if fresh:
+        disc_ax.plot(ep_f, [h["val"]["disc"] for h in fresh], color=fresh_c, marker="o", markersize=3,
+                     linewidth=1.6, label="val, fresh discriminator")
+    disc_ax.axhline(2 * math.log(2), color=MUTED, linewidth=1.2, linestyle="--", label="2 ln 2 (chance)")
+    disc_ax.ticklabel_format(axis="y", useOffset=False)
+    nlt_ax.ticklabel_format(axis="y", useOffset=False)
+    disc_ax.legend(frameon=False, labelcolor=INK, fontsize=8)
+    _style(disc_ax, "Discriminator loss per token", "epoch (then the fresh discriminator's)", "nats per token")
+
+    by_depth = records.get("by_depth")
+    if by_depth:
+        window, xs = max(1, K // 50), np.arange(1, K + 1)
+        top = math.log2(V)
+        for key, name, color, style in (("prior", f"val, kept prior (epoch {by_depth['epoch']})", prior_c, "-"),
+                                        ("tree", "val, tree's shares", MUTED, "--"),
+                                        ("constant", "val, constant per depth", INK, ":")):
+            depth_ax.plot(xs, _smooth(top - np.asarray(by_depth[key]), window), color=color, linewidth=1.4,
+                          linestyle=style, label=name)
+        depth_ax.axhline(0, color=GRID, linewidth=1.0)
+        depth_ax.legend(frameon=False, labelcolor=INK, fontsize=8)
+        _style(depth_ax, f"Bits saved per token against uniform, by depth ({window}-depth average)", "depth",
+               "bits saved")
+    else:
+        depth_ax.set_axis_off()
+        depth_ax.set_title("(no per-depth record in this run)", loc="left", fontsize=11, color=MUTED)
+
+    if samples is not None:
+        ax = fig.add_subplot(grid[1, 1:])
+        rows = [samples[k].numpy() for k in ("real", "recon", "prior", "shares")]
+        shown = _rows_grid(rows)
+        ax.imshow(shown[..., 0] if shown.shape[-1] == 1 else shown, cmap="gray", vmin=0, vmax=1,
+                  interpolation="nearest")
+        H = rows[0].shape[2]
+        ax.set_yticks([r * (H + 4) + H / 2 for r in range(4)])
+        ax.set_yticklabels(["test", f"tree, {samples['K']} depths", "prior samples", "tree's shares samples"],
+                           color=INK)
+        ax.set_xticks([])
+        for side in ax.spines.values():
+            side.set_visible(False)
+        ax.set_title(f"Test images and sampled codes, decoded (prior of epoch {samples.get('epoch', '?')})",
                      loc="left", fontsize=11, color=INK)
     _save(fig, path)
 
