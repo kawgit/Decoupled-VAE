@@ -330,8 +330,11 @@ def main():
             if d == args.profile_depth and t == 0:
                 from torch.profiler import ProfilerActivity, profile
                 activities = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if device.type == "cuda" else [])
+                # (two epochs: with stacks recorded, a whole network's training is millions of events to sort)
+                max_epochs, args.max_epochs = args.max_epochs, 2
                 with profile(activities=activities, record_shapes=True, with_stack=True) as prof:
                     train_net(net, st_tr, st_va, query["train"], query["val"], v0, timing, f"d{d}s{t}")
+                args.max_epochs = max_epochs
                 key = "cuda_time_total" if device.type == "cuda" else "cpu_time_total"
                 with open(os.path.join(out, "profile.txt"), "w") as f:
                     f.write(prof.key_averages().table(sort_by=key, row_limit=60, max_name_column_width=90))
