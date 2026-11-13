@@ -93,21 +93,24 @@ class Group:
         first = max(0, self.depth - self.window) if self.window > 0 else 0
         window = range(first, self.depth)
         raw = [self.deltas[j][rows[:, j].to(self.deltas[j].device)].to(device, non_blocking=True) for j in window]
+        # (the deltas before the window, summed into one token with no side or m, go first: the window is written
+        # after it, so no copy of the window is made to put it there)
+        early = int(first > 0)
+        deltas = self.R.new_empty(B, early + len(window), self.R.shape[1])
         scaled = [(scale, j) for scale, j in ((self.scales[j], j) for j in window) if scale is not None]
         if len(scaled) == len(window):
             # (stacked as int8 and made float once: a float copy per depth and a float stack of them cost more
             # than the network that reads them)
             scales = torch.stack([scale[rows[:, j]] for scale, j in scaled], 1)
-            deltas = torch.stack(raw, 1).float() * scales[..., None]
+            torch.mul(torch.stack(raw, 1), scales[..., None], out=deltas[:, early:])
         else:
-            deltas = torch.stack([r if s is None else r.float() * s[rows[:, j], None]
-                                  for r, j, s in zip(raw, window, (self.scales[j] for j in window))], 1).float()
-        sides = torch.stack([self.sides[j][rows[:, j]] for j in range(first, self.depth)], 1)
-        ms = torch.stack([self.ms[j][rows[:, j]] for j in range(first, self.depth)], 1)
-        if first > 0:  # the deltas before the window, summed into one token (no side or m)
+            deltas[:, early:] = torch.stack([r if s is None else r.float() * s[rows[:, j], None]
+                                             for r, j, s in zip(raw, window, (self.scales[j] for j in window))], 1)
+        sides = torch.stack([self.sides[j][rows[:, j]] for j in window], 1)
+        ms = torch.stack([self.ms[j][rows[:, j]] for j in window], 1)
+        if early:
             assert self.sums is not None
-            early = self.sums[nodes] - deltas.sum(1)
-            deltas = torch.cat([early[:, None], deltas], 1)
+            deltas[:, 0] = self.sums[nodes] - deltas[:, 1:].sum(1)
             sides, ms = F.pad(sides, (1, 0)), F.pad(ms, (1, 0))
         return deltas, sides, ms
 
