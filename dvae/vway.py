@@ -69,9 +69,15 @@ class VStepNet(HistoryReader):
         return o - (p[..., None] * o).sum(1, keepdim=True), p
 
 
+def rows_per_chunk(V: int, D: int, chunk: int) -> int:
+    """At most chunk rows of [V, D] float32 at a time, and at most 512 MiB of them (large V and D)."""
+    return max(64, min(chunk, 2**29 // (V * D * 4)))
+
+
 def cells_of(g: Group, q: Tensor, chunk=8192) -> Tensor:
     """Each image's cell [N] (long): its nearest of its node's centroids q [Nn, V, D] (a chunk of images at a time,
     so nothing of q's size is made)."""
+    chunk = rows_per_chunk(q.shape[1], q.shape[2], chunk)
     cells = []
     for i in range(0, len(g.R), chunk):
         qi = q[g.node[i:i + chunk]].float()
@@ -127,6 +133,7 @@ def vsplit_mse(g: Group, count: Tensor, total: CellSums, c: Tensor, chunk=8192) 
     each node's sum of squared remainders less sum over cells of (2 c . sum - n |c|^2) (a chunk of nodes at a time)."""
     assert g.stats is not None
     sse = g.stats.sq.sum()
+    chunk = rows_per_chunk(c.shape[1], c.shape[2], chunk)
     for i in range(0, len(c), chunk):
         ci = c[i:i + chunk].float()
         sse = sse - (2 * (ci * total[i:i + chunk]).sum(-1) - count[i:i + chunk] * ci.square().sum(-1)).sum()
@@ -134,11 +141,12 @@ def vsplit_mse(g: Group, count: Tensor, total: CellSums, c: Tensor, chunk=8192) 
 
 
 @torch.no_grad()
-def vanswers(net: VStepNet, g: Group, q: Tensor, batch=1024) -> tuple[Tensor, Tensor]:
+def vanswers(net: VStepNet, g: Group, q: Tensor, batch=1024, out: Tensor | None = None) -> tuple[Tensor, Tensor]:
     """The network's predicted means c [Nn, V, D] (in q's dtype) and shares p [Nn, V] at every node of g, asked
-    about q."""
+    about q. out: c's tensor (q itself may be: each batch of nodes is read before it is written)."""
     net.eval()
-    c, p = torch.empty_like(q), torch.empty(q.shape[:2], device=q.device)
+    c = out if out is not None else torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    p = torch.empty(q.shape[:2], device=q.device)
     for i in range(0, g.nodes, batch):
         nodes = torch.arange(i, min(i + batch, g.nodes), device=g.R.device)
         cn, p[nodes] = net.query(net.memory(*g.history(nodes)), q[nodes])

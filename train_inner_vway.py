@@ -283,7 +283,8 @@ def main():
         tp = part("start", t_other)
         before = dict(train=mse_now(train), val=mse_now(val))
         lineage = ",".join(map(str, chosen_steps))
-        query = {s: start.to(cdtype).expand(groups[s].nodes, -1, -1).contiguous() for s in ("train", "val")}
+        # (every node's step-0 centroids are the same: expanded, not copied, which at V = 16 is 12 GiB)
+        query = {s: start.to(cdtype).expand(groups[s].nodes, -1, -1) for s in ("train", "val")}
         part("start", tp)
         timing_depth["other"] += time.time() - t_other
         gains: list[float] = []
@@ -343,7 +344,21 @@ def main():
                 best_split = None  # (the step it beat: freed before this one's train answers are made)
             if best_n == t + 1 or not last:
                 tp = time.time()
-                c_tr, p_tr = vanswers(net, train, query["train"], args.node_batch)
+                # (the answers are written over the question, which the step no longer needs (its cells are in
+                # st_tr), so one [nodes, V, D] tensor is on the GPU rather than two; unless the question is the
+                # best step's answers, which the split needs: those go to host memory first when the GPU is short)
+                q_tr, into = query["train"], None
+                if q_tr.stride(0) != 0:
+                    if best_split is not None and best_split["train"][1] is q_tr:
+                        need = torch.cuda.memory_allocated(device) + 2 * q_tr.nbytes if device.type == "cuda" else 0
+                        if need > 0.85 * total_memory:
+                            kept = best_split["train"]
+                            best_split["train"] = (kept[0], q_tr.to("cpu", copy=True), *kept[2:])
+                            into = q_tr
+                    else:
+                        into = q_tr
+                c_tr, p_tr = vanswers(net, train, q_tr, args.node_batch, out=into)
+                del q_tr, into
                 tp = part("answers", tp)
                 after["train"] = vsplit_mse(train, *st_tr[:2], c_tr)
             if best_n == t + 1:
@@ -378,7 +393,7 @@ def main():
         # (the steps' [nodes, V, D] tensors that the split doesn't use: on ImageNet each is gigabytes)
         del query, st_tr, st_va, c_tr, c_va, p_tr, p_va
         t_other = time.time()
-        q_te = start.to(cdtype).expand(test.nodes, -1, -1).contiguous()
+        q_te = start.to(cdtype).expand(test.nodes, -1, -1)
         c_te = p_te = q_te
         for t in range(best_n):
             net.load_state_dict(states[t])
@@ -391,6 +406,7 @@ def main():
         tp = part("cells", tp)
         for s, (cells, c, pr) in splits.items():
             g = groups[s]
+            c = c.to(device)  # (the best step's train answers may be in host memory)
             nodes[s] = g.nodes
             kept = vdescend(g, cells, c, pr, budget, args.table_bits)
             atomic_save(dict(V=V, c=c.half().cpu() if args.store_centroids else None, start=start.cpu(), **kept),
