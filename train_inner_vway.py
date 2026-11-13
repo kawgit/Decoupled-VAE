@@ -42,7 +42,7 @@ from dvae.data import SHAPES, get_device, load_images  # noqa: E402
 from dvae.deltatree import pixels  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
 from dvae.outer import decode_latents, load_outer  # noqa: E402
-from dvae.vway import (VStepNet, attraction_sse, cell_stats, cells_of, pca_start, vanswers, vdescend,  # noqa: E402
+from dvae.vway import (CellSums, VStepNet, attraction_sse, cell_stats, cells_of, pca_start, vanswers, vdescend,  # noqa: E402
                        vsplit_mse, vsplit_sse)
 
 
@@ -194,7 +194,7 @@ def main():
     stream = ImageStream(N, gen)
     epoch_steps = max(1, round(args.images_per_epoch / args.batch))
 
-    def val_mse(model, st_va: tuple[torch.Tensor, torch.Tensor], q_va):
+    def val_mse(model, st_va: tuple[torch.Tensor, CellSums], q_va):
         return vsplit_mse(val, st_va[0], st_va[1], vanswers(model, val, q_va, args.node_batch)[0])
 
     def train_net(model, st_tr, st_va, q_tr, q_va, v0, timing, label):

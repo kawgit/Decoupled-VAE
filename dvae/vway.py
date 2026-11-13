@@ -79,16 +79,33 @@ def cells_of(g: Group, q: Tensor, chunk=8192) -> Tensor:
     return torch.cat(cells)
 
 
-def cell_stats(g: Group, q: Tensor, chunk=8192) -> tuple[Tensor, Tensor]:
-    """Each node's cells' image counts [Nn, V] and remainder sums [Nn, V, D] under centroids q."""
+class CellSums:
+    """Each node's cells' remainder sums, as a [Nn, V, D] tensor reads, but held only for the cells some image is in
+    (at most one per image, where the dense tensor has Nn V rows, mostly empty once most nodes hold an image or
+    two): sums[nodes] (an index tensor or a slice of nodes) is that part of the dense tensor, an empty cell's
+    row zeros."""
+
+    def __init__(self, rows: Tensor, row: Tensor):
+        self.rows = rows  # [K + 1, D]: the K non-empty cells' sums, then a row of zeros
+        self.row = row  # [Nn, V]: each cell's row in rows (an empty cell's the zeros)
+
+    def __getitem__(self, nodes) -> Tensor:
+        return self.rows[self.row[nodes]]
+
+
+def cell_stats(g: Group, q: Tensor, chunk=8192) -> tuple[Tensor, CellSums]:
+    """Each node's cells' image counts [Nn, V] and remainder sums (CellSums, [Nn, V, D] as read) under
+    centroids q."""
     Nn, V, D = q.shape
-    count, total = g.R.new_zeros(Nn * V), g.R.new_zeros(Nn * V, D)
-    cells = cells_of(g, q, chunk)
+    at = g.node * V + cells_of(g, q, chunk)  # (each image's cell)
+    count = g.R.new_zeros(Nn * V).index_add_(0, at, g.R.new_ones(len(at)))
+    cell, k = torch.unique(at, return_inverse=True)
+    rows = g.R.new_zeros(len(cell) + 1, D)
     for i in range(0, len(g.R), chunk):
-        at = g.node[i:i + chunk] * V + cells[i:i + chunk]
-        count.index_add_(0, at, g.R.new_ones(len(at)))
-        total.index_add_(0, at, g.R[i:i + chunk])
-    return count.view(Nn, V), total.view(Nn, V, D)
+        rows.index_add_(0, k[i:i + chunk], g.R[i:i + chunk])
+    row = torch.full((Nn * V,), len(cell), dtype=torch.long, device=g.R.device)
+    row[cell] = torch.arange(len(cell), device=g.R.device)
+    return count.view(Nn, V), CellSums(rows, row.view(Nn, V))
 
 
 def vsplit_sse(c: Tensor, count: Tensor, total: Tensor) -> Tensor:
@@ -104,7 +121,7 @@ def attraction_sse(c: Tensor, n: Tensor, total: Tensor) -> Tensor:
     return (n[:, None] * c.square().sum(-1) - 2 * (c * total[:, None]).sum(-1)).sum(-1)
 
 
-def vsplit_mse(g: Group, count: Tensor, total: Tensor, c: Tensor, chunk=8192) -> float:
+def vsplit_mse(g: Group, count: Tensor, total: CellSums, c: Tensor, chunk=8192) -> float:
     """The mse per number after splitting g's nodes into the cells (count, total) with predicted means c, exactly:
     each node's sum of squared remainders less sum over cells of (2 c . sum - n |c|^2) (a chunk of nodes at a time)."""
     assert g.stats is not None
@@ -182,5 +199,5 @@ def vdescend(g: Group, cells: Tensor, c: Tensor, p: Tensor, gpu_budget: float, t
                 child=token.to(torch.int8).cpu(), share=p.half().cpu())
 
 
-__all__ = ["VStepNet", "cells_of", "cell_stats", "vsplit_sse", "attraction_sse", "vsplit_mse", "vanswers",
+__all__ = ["VStepNet", "CellSums", "cells_of", "cell_stats", "vsplit_sse", "attraction_sse", "vsplit_mse", "vanswers",
            "pca_start", "vdescend"]
