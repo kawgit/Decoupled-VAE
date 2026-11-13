@@ -91,12 +91,17 @@ class Group:
             return self.R.new_zeros(B, 0, self.R.shape[1]), z, z
         rows = self.anc[nodes]
         first = max(0, self.depth - self.window) if self.window > 0 else 0
-        out = []
-        for j in range(first, self.depth):
-            table, scale, at = self.deltas[j], self.scales[j], rows[:, j]
-            row = table[at.to(table.device)].to(device, non_blocking=True)
-            out.append(row if scale is None else row.float() * scale[at, None])
-        deltas = torch.stack(out, 1).float()
+        window = range(first, self.depth)
+        raw = [self.deltas[j][rows[:, j].to(self.deltas[j].device)].to(device, non_blocking=True) for j in window]
+        scaled = [(scale, j) for scale, j in ((self.scales[j], j) for j in window) if scale is not None]
+        if len(scaled) == len(window):
+            # (stacked as int8 and made float once: a float copy per depth and a float stack of them cost more
+            # than the network that reads them)
+            scales = torch.stack([scale[rows[:, j]] for scale, j in scaled], 1)
+            deltas = torch.stack(raw, 1).float() * scales[..., None]
+        else:
+            deltas = torch.stack([r if s is None else r.float() * s[rows[:, j], None]
+                                  for r, j, s in zip(raw, window, (self.scales[j] for j in window))], 1).float()
         sides = torch.stack([self.sides[j][rows[:, j]] for j in range(first, self.depth)], 1)
         ms = torch.stack([self.ms[j][rows[:, j]] for j in range(first, self.depth)], 1)
         if first > 0:  # the deltas before the window, summed into one token (no side or m)

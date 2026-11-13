@@ -210,12 +210,14 @@ def main():
     gen = torch.Generator().manual_seed(args.seed)
     stream = ImageStream(N, gen)
     epoch_steps = max(1, round(args.images_per_epoch / args.batch))
+    split_sse = torch.compile(vsplit_sse, dynamic=True) if args.compile else vsplit_sse
 
     def val_mse(model, st_va: tuple[torch.Tensor, CellSums, torch.Tensor], q_va):
         return vsplit_mse(val, st_va[0], st_va[1], vanswers(model, val, q_va, args.node_batch)[0])
 
     def train_net(model, st_tr, st_va, q_tr, q_va, v0, timing, label):
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+                                fused=device.type == "cuda")
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / args.warmup_steps))
         best = (0.0, 0, v0, copy.deepcopy(model.state_dict()))
         scaler = torch.amp.GradScaler(device.type, enabled=args.fp16)
@@ -229,7 +231,7 @@ def main():
                 opt.zero_grad(set_to_none=True)
                 for nodes, w in pieces:
                     c, _ = model.query(model.memory(*train.history(nodes)), q_tr[nodes])
-                    sse = vsplit_sse(c, count[nodes], total[nodes])
+                    sse = split_sse(c, count[nodes], total[nodes])
                     if args.attraction > 0:
                         sse = sse + args.attraction * attraction_sse(c, train.stats.count[nodes], train.stats.total[nodes])
                     scaler.scale((sse * w).sum() / (B * D)).backward()
