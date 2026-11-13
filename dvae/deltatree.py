@@ -182,16 +182,6 @@ class HistoryReader(nn.Module):
         with self.amp():
             return self._memory(deltas, sides, ms)
 
-    def memory_raw(self, raw, scales, sums, sides, ms):
-        """memory, from Group.history_raw's rows as stored, their scales and the nodes' sums (made float here,
-        so that a compiled network fuses it with what reads them)."""
-        deltas = raw.float() * scales[..., None]
-        if sums is not None:  # (the deltas before the window, summed into one token: no side or m)
-            deltas = torch.cat([(sums - deltas.sum(1))[:, None], deltas], 1)
-            sides, ms = F.pad(sides, (1, 0)), F.pad(ms, (1, 0))
-        with self.amp():
-            return self._memory(deltas, sides, ms)
-
     def _memory(self, deltas, sides, ms):
         B, k = sides.shape
         if self.plain:

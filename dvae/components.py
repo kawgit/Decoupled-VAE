@@ -83,32 +83,6 @@ class Group:
     def nodes(self):
         return len(self.keys)
 
-    def history_raw(self, nodes: Tensor):
-        """history's inputs before they are made float (HistoryReader.memory_raw makes them history's): the window's
-        rows [B, k, D] as stored (int8, or float16 without scales), their scales [B, k] (ones for float16 tables),
-        the nodes' sums of all their deltas [B, D] when some are before the window (else None), sides and ms
-        [B, k]. A compiled network then reads the int8 rows itself, with no float copy of the window between."""
-        device, B, D = self.R.device, len(nodes), self.R.shape[1]
-        if self.depth == 0:
-            z = self.R.new_zeros(B, 0)
-            return self.R.new_zeros(B, 0, D), z, None, z, z
-        rows = self.anc[nodes]
-        first = max(0, self.depth - self.window) if self.window > 0 else 0
-        window = range(first, self.depth)
-        raw = torch.stack([self.deltas[j][rows[:, j].to(self.deltas[j].device)].to(device, non_blocking=True)
-                           for j in window], 1)
-        scales = []
-        for j in window:
-            scale = self.scales[j]
-            scales.append(self.R.new_ones(B) if scale is None else scale[rows[:, j]])
-        sides = torch.stack([self.sides[j][rows[:, j]] for j in window], 1)
-        ms = torch.stack([self.ms[j][rows[:, j]] for j in window], 1)
-        sums = None
-        if first > 0:
-            assert self.sums is not None
-            sums = self.sums[nodes]
-        return raw, torch.stack(scales, 1), sums, sides, ms
-
     def history(self, nodes: Tensor):
         """The histories (deltas [B, depth, D] float32, sides and ms [B, depth]) of nodes [B] (GPU)."""
         device, B = self.R.device, len(nodes)
