@@ -23,8 +23,9 @@ should match val's. Then there is no train pixel mse and no tree/train.
 
 What the run keeps (artifacts/<job>/): records.json (the plot's, as train_inner_components.py's, plus each depth's
 empty cells), run.png, tree/<split>/dDDD.pt (each image's token, its next node, each next node's parent, child and
-every node's shares; with --store-centroids each node's predicted means too) and with --save-models every network
-(models/dDDD_sSS.pt; step 0's also holds the depth's start). The project's disk is tight: neither is on by default.
+every node's shares; with --store-centroids each node's predicted means too) and every network (models/dDDD_sSS.pt;
+step 0's also holds the depth's start), unless --no-save-models: the networks are the tree (without them no code can
+be decoded, no new image coded, no prior trained on its splits), ~12 MB each at V = 8 on ImageNet latents.
 
 Run from the repo: python train_inner_vway.py --V 4 --outer artifacts/<outer job> --tf32 --bf16
 """
@@ -109,7 +110,8 @@ def main():
     p.add_argument("--centroid-dtype", choices=("float32", "bfloat16"), default="float32",
                    help="the dtype of every node's V centroids (the steps' queries and answers, [nodes, V, D] each): "
                         "bfloat16 halves them, for large D (the split codes the rounded centroids)")
-    p.add_argument("--save-models", action="store_true", help="keep every network in models/")
+    p.add_argument("--save-models", action=argparse.BooleanOptionalAction, default=True,
+                   help="keep every network in models/ (the tree: without them its codes can't be decoded)")
     p.add_argument("--store-centroids", action="store_true", help="keep every node's predicted means in tree/")
     p.add_argument("--plot-pairs", type=int, default=12)
     p.add_argument("--tf32", action="store_true")
