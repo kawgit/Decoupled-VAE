@@ -315,9 +315,9 @@ def _rows_grid(rows, gap=4, between=2):
 
 def plot_vprior(records, path, samples=None):
     """Save a V-way prior run's progress (train_vprior.py): per epoch, val's negative log trust (the prior's
-    training, then the fresh discriminator's against the kept prior), bits per image (train and val, beside the
-    tree's shares, the constant share per depth and uniform), the discriminator's val loss; the kept prior's bits
-    saved per token by depth against uniform, beside the baselines; and, given samples (CodeQA.samples), test images,
+    training, then the fresh discriminator's against the kept prior), bits per image (train, incoming and val,
+    beside the tree's shares, the constant share per depth and uniform), the discriminator's val loss; the kept
+    prior's bits saved per token by depth against uniform, beside the baselines; and, given samples (CodeQA.samples), test images,
     their reconstructions, and codes sampled from the prior and from the tree's shares, decoded."""
     history, fresh = records["history"], records.get("fresh", [])
     if not history:
@@ -352,6 +352,10 @@ def plot_vprior(records, path, samples=None):
                  label="val")
     bits_ax.plot(ep, [h["train_bits"] for h in history], color=train_c, marker="o", markersize=3, linewidth=1.2,
                  label="train")
+    seen = [(h["epoch"], h["incoming"]["bits"]) for h in history if h.get("incoming")]
+    if seen:
+        bits_ax.plot(*zip(*seen), color=COMPONENT_COLORS["test"], marker="o", markersize=3, linewidth=1.2,
+                     label="incoming (unseen train)")
     bits_ax.axhline(base["tree"], color=MUTED, linewidth=1.2, linestyle="--", label="val, tree's shares")
     bits_ax.axhline(base["constant"], color=INK, linewidth=1.2, linestyle=":", label="val, constant per depth")
     bits_ax.axhline(uniform, color=MUTED, linewidth=1.0, linestyle="-.", label=f"uniform ({uniform:.0f})")

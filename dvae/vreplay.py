@@ -52,10 +52,12 @@ class VTree:
         self.net.eval()
 
     @torch.no_grad()
-    def code(self, X: Tensor, depths: int | None = None, snapshots=()) -> tuple[Group, dict[int, Tensor]]:
+    def code(self, X: Tensor, depths: int | None = None, snapshots=(),
+             visit=None) -> tuple[Group, dict[int, Tensor]]:
         """Images X [n, D] (on the device) coded through the first depths depths: their group there (its R the
         remainders), and at each depth in snapshots (the number of depths coded so far) the reconstructions X - R
-        then, in float16 on the host."""
+        then, in float16 on the host. visit(d, cands [n, V, D], tokens [n], shares [n, V]), if given, sees each
+        depth's candidates (the cells' predicted means at each image's node), cells and the tree's shares."""
         K = self.K if depths is None else min(depths, self.K)
         g = root_group("replay", X, self.mean, self.window)
         shots = {}
@@ -71,6 +73,8 @@ class VTree:
                     q = c
             assert p is not None
             cells = cells_of(g, q)
+            if visit is not None:
+                visit(d, c[g.node], cells, p[g.node])
             vdescend(g, cells, split_rows(g, cells, c, p), self.budget, self.bits)
             if d + 1 in snapshots:
                 shots[d + 1] = (X - g.R).half().cpu()
@@ -78,10 +82,10 @@ class VTree:
 
     @torch.no_grad()
     def sample(self, n: int, choose, depths: int | None = None) -> tuple[Tensor, Tensor]:
-        """n codes chosen a token at a time, and their reconstructions: at each depth d, choose(d, tokens [n, d]
-        (long, the tokens so far), shares [n, V] (the tree's at each code's node)) gives each code's token [n]
-        (long) and the code moves to that cell, by its predicted mean (the networks read only the codes' past
-        tokens and means, never an image). Returns the tokens [n, K] and the reconstructions [n, D] (the tree's
+        """n codes chosen a token at a time, and their reconstructions: at each depth d, choose(d, cands [n, V, D]
+        (the candidates: the cells' predicted means at each code's node), shares [n, V] (the tree's there)) gives
+        each code's token [n] (long) and the code moves to that cell, by its predicted mean (the networks read only
+        the codes' past means, never an image). Returns the tokens [n, K] and the reconstructions [n, D] (the tree's
         mean plus the cells' means), on the device."""
         K = self.K if depths is None else min(depths, self.K)
         g = root_group("sample", self.mean.new_zeros(n, len(self.mean)), self.mean, self.window)
@@ -95,7 +99,7 @@ class VTree:
                 if t + 1 < len(self.nets[d]):
                     q = c
             assert p is not None
-            cells = choose(d, tokens[:, :d], p[g.node]).long()
+            cells = choose(d, c[g.node], p[g.node]).long()
             tokens[:, d] = cells
             vdescend(g, cells, split_rows(g, cells, c, p), self.budget, self.bits)
         return tokens, -g.R  # (R started at -mean and lost each cell's mean)
