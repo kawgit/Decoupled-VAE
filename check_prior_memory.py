@@ -29,7 +29,7 @@ from dvae.data import get_device  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
 from dvae.plots import COMPONENT_COLORS, _style  # noqa: E402
 from dvae.viz import save_grid  # noqa: E402
-from dvae.vprior import CandNet, CandStore, CodeQA  # noqa: E402
+from dvae.vprior import CandStore, CodeQA, make_net  # noqa: E402
 from dvae.vreplay import VTree  # noqa: E402
 
 LN2 = math.log(2)
@@ -56,7 +56,7 @@ def main():
     tree = VTree(ra["tree"], device, ra["depths"], fp16=ra["fp16"], node_batch=ra["node_batch"])
     K, V = tree.K, tree.args["V"]
     saved = torch.load(os.path.join(args.run, "prior.pt"), map_location=device, weights_only=False)
-    prior = CandNet(**saved["config"]).to(device).eval()
+    prior = make_net(saved["config"]).to(device).eval()
     prior.load_state_dict(saved["state_dict"])
     W = prior.window
 
@@ -69,7 +69,7 @@ def main():
     order = torch.randperm(len(pool), generator=torch.Generator().manual_seed(ra["seed"] + 2))
     n_buf = ra["buffer"]
     Z = pool[order[:n_buf]].to(device).float()
-    buf = CandStore(n_buf, K, V, Z.shape[1], device)
+    buf = CandStore(n_buf, K, V, Z.shape[1], device, tree.mean)
     rows = torch.arange(n_buf, device=device)
     g, _ = tree.code(Z, K, visit=buf.writer(rows))
     buf_img = qa.decode(Z - g.R)
@@ -82,7 +82,7 @@ def main():
         for d in range(K):
             dd = torch.full((n_buf,), d, dtype=torch.long, device=device)
             with amp():
-                lp = prior(*buf.inputs(rows, dd, W)).float().log_softmax(-1)
+                lp = prior(buf.inputs(rows, dd, W)).float().log_softmax(-1)
             t = buf.tok[:, d].long()
             bits[:, d] = -lp.gather(-1, t[:, None])[:, 0] / LN2
             hit[:, d] = (lp.argmax(-1) == t).float()
@@ -93,11 +93,12 @@ def main():
         f"every depth")
     for lo, hi in ((0, 8), (8, 32), (32, 128), (128, 256), (256, K)):
         log(f"  depths {lo}-{hi - 1}: {bits[:, lo:hi].sum(1).mean():.2f} bits per image, "
-            f"{bits[:, lo:hi].mean() * 1000:.2f} millibits per token; most likely right {hit[:, lo:hi].mean() * 100:.3f}%")
+            f"{bits[:, lo:hi].mean() * 1000:.2f} millibits per token; most likely right "
+            f"{hit[:, lo:hi].mean() * 100:.3f}%")
 
     def sample(n, temp, lead_codes=None):
         """n codes from the prior at temperature temp (0: greedy), each given lead_codes' first --lead tokens."""
-        store = CandStore(n, K, V, Z.shape[1], device)
+        store = CandStore(n, K, V, Z.shape[1], device, tree.mean)
         r = torch.arange(n, device=device)
         put = store.writer(r)
         gen = torch.Generator(device).manual_seed(ra["seed"] + 7)
@@ -108,7 +109,7 @@ def main():
             else:
                 dd = torch.full((n,), d, dtype=torch.long, device=device)
                 with amp():
-                    logits = prior(*store.inputs(r, dd, W, cands.float())).float()
+                    logits = prior(store.inputs(r, dd, W, cands.float())).float()
                 token = logits.argmax(-1) if temp == 0 else \
                     torch.multinomial((logits / temp).softmax(-1), 1, generator=gen)[:, 0]
             put(d, cands, token, shares)

@@ -1,6 +1,7 @@
-"""A prior over a V-way tree's codes (dvae/vprior.py's CandNet: at each depth, an image's delta history as memory and
-the tree's V candidates there as queries, as the tree's own networks read them), trained with a discriminator of the
-same shape: the prior's loss is a * cross-entropy - lam * E_p[log trust], the discriminator's the usual one (the
+"""A prior over a V-way tree's codes (dvae/vprior.py's NodePrior: at each depth, the node the image's code is at, its
+current mean and recent deltas, read by a NodeEncoder, and the tree's V candidates there as queries), trained with a
+discriminator (NodeDisc: each candidate's child node read the same way, one trust logit each; --net cand: the earlier
+CandNet for both): the prior's loss is a * cross-entropy - lam * E_p[log trust], the discriminator's the usual one (the
 real token trusted, the prior's tokens weighted by p not), both updated on every batch. a = 1, lam = 0 is plain
 cross-entropy (the discriminator then only scores); a = 0 trains on expected log trust alone.
 
@@ -40,7 +41,7 @@ from dvae.artifacts import artifact
 from dvae.data import get_device
 from dvae.logs import RunLog
 from dvae.plots import plot_vprior
-from dvae.vprior import CandNet, CandStore, CodeQA
+from dvae.vprior import CandStore, CodeQA, make_net
 from dvae.vreplay import VTree
 
 LN2 = math.log(2)
@@ -52,6 +53,8 @@ def main():
     p.add_argument("--depths", type=int, default=None, help="K: the codes' first K depths (default: every depth saved)")
     p.add_argument("--a", type=float, default=1.0, help="the weight of cross-entropy in the prior's loss")
     p.add_argument("--lam", type=float, default=0.0, help="the weight of -E_p[log trust] in the prior's loss")
+    p.add_argument("--net", choices=("node", "cand"), default="node",
+                   help="node: NodePrior and NodeDisc; cand: CandNet for both (the earlier design)")
     p.add_argument("--window", type=int, default=None, help="history deltas read (default: the tree's window)")
     p.add_argument("--width", type=int, default=128)
     p.add_argument("--layers", type=int, default=4)
@@ -70,6 +73,8 @@ def main():
     p.add_argument("--max-epochs", type=int, default=200)
     p.add_argument("--fresh-epochs", type=int, default=None, help="the fresh discriminator's epoch limit (default: "
                    "--max-epochs)")
+    p.add_argument("--prior-only", action="store_true", help="no discriminator (its untrained trust, one half, is "
+                   "what is logged): cross-entropy alone (--lam 0), early-stopped on val bits, no fresh phase")
     p.add_argument("--keep-last", action="store_true", help="keep the last epoch's prior, not val's best (for "
                    "overfitting tests)")
     p.add_argument("--progress-every", type=int, default=200, help="batches between progress lines (run.full.log)")
@@ -128,7 +133,7 @@ def main():
 
     stores = {}
     for name, n, Z in (("buffer", args.buffer, None), ("val", args.val, lat["val"]), ("test", args.test, lat["test"])):
-        stores[name] = CandStore(n, K, V, D, device)
+        stores[name] = CandStore(n, K, V, D, device, tree.mean)
         Z = pool[take(n)] if Z is None else Z[:n].flatten(1)
         seconds = fill(stores[name], torch.arange(n, device=device), Z, name)
         log(f"{name}: {n} images replayed in {seconds:.0f}s ({stores[name].nbytes() / 2**30:.1f} GiB on the GPU)")
@@ -150,14 +155,16 @@ def main():
         f"{baselines['test']['tree']:.2f}; constant per depth val {baselines['val']['constant']:.2f}, test "
         f"{baselines['test']['constant']:.2f} (uniform: {K * math.log2(V):.0f})")
 
-    def make():
-        return CandNet(K, V, D, W, args.width, args.layers, args.heads, args.dropout).to(device)
+    def make(role):
+        kind = "cand" if args.net == "cand" else f"node_{role}"
+        return make_net(dict(kind=kind, depths=K, V=V, D=D, window=W, width=args.width, layers=args.layers,
+                             heads=args.heads, dropout=args.dropout)).to(device)
 
     def optimizer(net):
         return torch.optim.AdamW(net.parameters(), lr=args.lr, betas=(args.beta1, 0.999),
                                  weight_decay=args.weight_decay, fused=device.type == "cuda")
 
-    prior, disc = make(), make()
+    prior, disc = make("prior"), make("disc")
     log(f"prior and discriminator: {sum(q.numel() for q in prior.parameters()) / 1e6:.2f}M parameters each; prior "
         f"loss {args.a:g} * CE - {args.lam:g} * E_p[log trust]; {args.batch} (image, depth) pairs a batch, "
         f"{args.steps} batches an epoch")
@@ -181,7 +188,8 @@ def main():
             inp = store.inputs(i, d, W)
             t = store.tok[i, d].long()
             with amp():
-                lp, sd = net_p(*inp).float(), net_d(*inp).float()
+                lp = net_p(inp).float()
+                sd = torch.zeros_like(lp) if args.prior_only else net_d(inp).float()
             logp = lp.log_softmax(-1)
             pp = logp.exp()
             ce.index_add_(0, d, -logp.gather(-1, t[:, None])[:, 0])
@@ -227,15 +235,16 @@ def main():
                 t = buf.tok[i, d].long()
                 with amp():
                     with torch.set_grad_enabled(train_prior):  # (a frozen prior builds no graph)
-                        lp = net_p(*inp).float()
-                    sd = net_d(*inp).float()
+                        lp = net_p(inp).float()
+                    sd = torch.zeros_like(lp) if args.prior_only else net_d(inp).float()
                 logp = lp.log_softmax(-1)
                 pp = logp.exp()
                 ld = disc_loss(sd, pp.detach(), t).mean()
-                opt_d.zero_grad(set_to_none=True)
-                sc_d.scale(ld).backward()
-                sc_d.step(opt_d)
-                sc_d.update()
+                if not args.prior_only:
+                    opt_d.zero_grad(set_to_none=True)
+                    sc_d.scale(ld).backward()
+                    sc_d.step(opt_d)
+                    sc_d.update()
                 ce = -logp.gather(-1, t[:, None]).mean()
                 ns = -(pp * F.logsigmoid(sd.detach())).sum(-1).mean()
                 if train_prior:
@@ -258,7 +267,7 @@ def main():
             t1 = time.time()
             v, v_depth = evaluate(stores["val"], val_rows, net_p, net_d)
             timing["val"] = time.time() - t1
-            metric = v["nlt"] if train_prior else v["disc"]
+            metric = (v["bits"] if args.prior_only else v["nlt"]) if train_prior else v["disc"]
             if metric < best[0] or (train_prior and args.keep_last):
                 best = (metric, e, copy.deepcopy(net_p.state_dict()), copy.deepcopy(net_d.state_dict()))
                 if train_prior:
@@ -286,12 +295,21 @@ def main():
                         args.max_epochs)
     assert best[2] is not None, "no epoch ran"
     prior.load_state_dict(best[2])
-    log(f"kept the prior of epoch {best[1]} (val -E_p[log trust] {best[0]:.4f}); a fresh discriminator now trains "
-        f"against it, frozen")
+    log(f"kept the prior of epoch {best[1]} (val {'bits' if args.prior_only else '-E_p[log trust]'} {best[0]:.4f})"
+        + ("" if args.prior_only else "; a fresh discriminator now trains against it, frozen"))
     torch.save(dict(config=prior.config, state_dict=prior.state_dict(), epoch=best[1], args=vars(args)),
                os.path.join(out, "prior.pt"))
     samples.update(qa.samples(prior, amp), epoch=best[1])
-    judge = make()
+    if args.prior_only:
+        final = {s: evaluate(stores[s], torch.arange(stores[s].n, device=device), prior, disc)[0]
+                 for s in ("val", "test")}
+        records["final"] = final
+        log(f"bits per image val {final['val']['bits']:.2f}, test {final['test']['bits']:.2f} (tree's shares "
+            f"{baselines['test']['tree']:.2f}, constant {baselines['test']['constant']:.2f}); no discriminator")
+        save()
+        log(f"done in {(time.time() - began) / 60:.1f} min; {out}")
+        return
+    judge = make("disc")
     best_j = train_epochs(prior, judge, None, optimizer(judge), False, "fresh discriminator", records["fresh"],
                           args.fresh_epochs or args.max_epochs)
     assert best_j[3] is not None, "no epoch ran"
