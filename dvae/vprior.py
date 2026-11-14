@@ -33,7 +33,7 @@ from torch import Tensor
 
 from dvae.data import load_images
 from dvae.deltatree import EPS, Block
-from dvae.node import NodeEncoder, QueryReader, directions
+from dvae.node import GeoEncoder, NodeEncoder, QueryReader, directions
 from dvae.outer import load_outer
 from dvae.vreplay import VTree
 
@@ -172,6 +172,67 @@ class NodeDisc(nn.Module):
         return self.head(self.reader(self.query.expand(B * V, -1, -1), mems, summary))[:, 0, 0].view(B, V)
 
 
+class GeoPrior(nn.Module):
+    def __init__(self, depths, V=8, D=512, window=16, width=128, layers=4, heads=4, oracle=False):
+        """A prior on GeoEncoder: the node's mean and last `window` deltas, each slot's centroid (what made its
+        cell) and candidate (its predicted mean) as tokens; each slot's logit from its centroid's token. oracle: the
+        image's remainder is a token too (a check that the token is learnable from it, not a prior)."""
+        super().__init__()
+        self.config = dict(kind="geo_prior", depths=depths, V=V, D=D, window=window, width=width, layers=layers,
+                           heads=heads, oracle=oracle)
+        self.V, self.window, self.oracle = V, window, oracle
+        # (kinds: the mean, the window's positions, the remainder, the slots' centroids, the slots' candidates)
+        self.enc = GeoEncoder(depths, 2 + window + 2 * V, D, width, layers, heads)
+        kinds = torch.cat([torch.arange(1 + window + int(oracle)), 2 + window + torch.arange(2 * V)])
+        self.register_buffer("kinds", kinds, persistent=False)
+        self.first = 1 + window + int(oracle)  # (the first centroid's token)
+        self.head = nn.Linear(width, 1)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, x: NodeInputs) -> Tensor:
+        """Logits [B, V]."""
+        assert x.parts is not None, "GeoPrior reads the centroids that made the cells: a store that keeps them"
+        B = len(x.d)
+        vecs = [x.mean[:, None], x.win]
+        exists = [x.valid.new_ones(B, 1), x.valid]
+        if self.oracle:
+            assert x.rem is not None, "an oracle prior reads the remainder: a store that keeps images"
+            vecs.append(x.rem[:, None])
+            exists.append(x.valid.new_ones(B, 1))
+        vecs += [x.parts, x.cands]
+        exists.append(x.valid.new_ones(B, 2 * self.V))
+        h = self.enc(torch.cat(vecs, 1), torch.cat(exists, 1), self.kinds, x.d)
+        return self.head(h[:, self.first:self.first + self.V])[..., 0]
+
+
+class GeoDisc(nn.Module):
+    def __init__(self, depths, V=8, D=512, window=16, width=128, layers=4, heads=4):
+        """A discriminator on GeoEncoder: each candidate's child node (its mean and last `window` deltas, the
+        candidate the last), one trust logit from its mean's token."""
+        super().__init__()
+        self.config = dict(kind="geo_disc", depths=depths, V=V, D=D, window=window, width=width, layers=layers,
+                           heads=heads)
+        self.V, self.window = V, window
+        self.enc = GeoEncoder(depths, 1 + window, D, width, layers, heads)
+        self.register_buffer("kinds", torch.arange(1 + window), persistent=False)
+        self.head = nn.Linear(width, 1)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, x: NodeInputs) -> Tensor:
+        """Trust logits [B, V]: each candidate's child node's."""
+        B, V, D = x.cands.shape
+        c = x.cands.reshape(B * V, 1, D)
+        win = torch.cat([x.win.repeat_interleave(V, 0)[:, 1:], c], 1)
+        valid = torch.cat([x.valid.repeat_interleave(V, 0)[:, 1:], x.valid.new_ones(B * V, 1)], 1)
+        mean = x.mean.repeat_interleave(V, 0) + c[:, 0]
+        S = torch.cat([mean[:, None], win], 1)
+        exists = torch.cat([valid.new_ones(B * V, 1), valid], 1)
+        h = self.enc(S, exists, self.kinds, x.d.repeat_interleave(V, 0) + 1)
+        return self.head(h[:, 0])[:, 0].view(B, V)
+
+
 class CandNet(nn.Module):
     def __init__(self, depths, V=8, D=512, window=16, width=128, layers=4, heads=4, dropout=0.0):
         super().__init__()
@@ -203,14 +264,16 @@ class CandNet(nn.Module):
         return self.head(self.out_norm(h))[..., 0]
 
 
-PriorNet = NodePrior | NodeDisc | CandNet
+PriorNet = NodePrior | NodeDisc | GeoPrior | GeoDisc | CandNet
 
 
 def make_net(config: dict) -> PriorNet:
-    """A network from its config (a saved one's, or a new one's with kind node_prior, node_disc or cand)."""
+    """A network from its config (a saved one's, or a new one's with kind geo_prior, geo_disc, node_prior,
+    node_disc or cand)."""
     config = dict(config)
     kind = config.pop("kind", "cand")
-    return {"node_prior": NodePrior, "node_disc": NodeDisc, "cand": CandNet}[kind](**config)
+    return {"node_prior": NodePrior, "node_disc": NodeDisc, "geo_prior": GeoPrior, "geo_disc": GeoDisc,
+            "cand": CandNet}[kind](**config)
 
 
 class CodeQA:
@@ -267,4 +330,5 @@ class CodeQA:
                     K=self.K)
 
 
-__all__ = ["CandNet", "CandStore", "CodeQA", "NodeDisc", "NodeInputs", "NodePrior", "PriorNet", "make_net"]
+__all__ = ["CandNet", "CandStore", "CodeQA", "GeoDisc", "GeoPrior", "NodeDisc", "NodeInputs", "NodePrior", "PriorNet",
+           "make_net"]

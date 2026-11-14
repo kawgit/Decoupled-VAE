@@ -53,8 +53,9 @@ def main():
     p.add_argument("--depths", type=int, default=None, help="K: the codes' first K depths (default: every depth saved)")
     p.add_argument("--a", type=float, default=1.0, help="the weight of cross-entropy in the prior's loss")
     p.add_argument("--lam", type=float, default=0.0, help="the weight of -E_p[log trust] in the prior's loss")
-    p.add_argument("--net", choices=("node", "cand"), default="node",
-                   help="node: NodePrior and NodeDisc; cand: CandNet for both (the earlier design)")
+    p.add_argument("--net", choices=("geo", "node", "cand"), default="geo",
+                   help="geo: GeoPrior and GeoDisc (the node's vectors as tokens, attention biased by their geometry "
+                        "in their own dimension); node: NodePrior and NodeDisc; cand: CandNet for both (the earliest)")
     p.add_argument("--no-parts", action="store_true", help="--net node: the prior's queries read only the cells' "
                    "predicted means, not the centroids that made the cells (the token is its nearest of those)")
     p.add_argument("--oracle", action="store_true", help="--net node: the prior also reads the image's remainder "
@@ -136,8 +137,8 @@ def main():
                        f"{(len(rows) - done) * (time.time() - t0) / done:.0f}s left")
         return time.time() - t0
 
-    parts = args.net == "node" and not args.no_parts
-    assert not args.oracle or args.net == "node", "--oracle is NodePrior's"
+    parts = args.net == "geo" or (args.net == "node" and not args.no_parts)
+    assert not args.oracle or args.net in ("geo", "node"), "--oracle: GeoPrior or NodePrior"
     stores = {}
     for name, n, Z in (("buffer", args.buffer, None), ("val", args.val, lat["val"]), ("test", args.test, lat["test"])):
         stores[name] = CandStore(n, K, V, D, device, tree.mean, parts=parts, images=args.oracle)
@@ -163,8 +164,13 @@ def main():
         f"{baselines['test']['constant']:.2f} (uniform: {K * math.log2(V):.0f})")
 
     def make(role):
-        kind = "cand" if args.net == "cand" else f"node_{role}"
-        extra = dict(parts=parts, oracle=args.oracle) if kind == "node_prior" else {}
+        kind = "cand" if args.net == "cand" else f"{args.net}_{role}"
+        extra = {"node_prior": dict(parts=parts, oracle=args.oracle),
+                 "geo_prior": dict(oracle=args.oracle)}.get(kind, {})
+        if kind in ("geo_prior", "geo_disc"):
+            assert args.dropout == 0, "GeoEncoder has no dropout"
+            return make_net(dict(kind=kind, depths=K, V=V, D=D, window=W, width=args.width, layers=args.layers,
+                                 heads=args.heads, **extra)).to(device)
         return make_net(dict(kind=kind, depths=K, V=V, D=D, window=W, width=args.width, layers=args.layers,
                              heads=args.heads, dropout=args.dropout, **extra)).to(device)
 
