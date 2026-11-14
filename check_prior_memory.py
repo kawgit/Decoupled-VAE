@@ -69,9 +69,10 @@ def main():
     order = torch.randperm(len(pool), generator=torch.Generator().manual_seed(ra["seed"] + 2))
     n_buf = ra["buffer"]
     Z = pool[order[:n_buf]].to(device).float()
-    buf = CandStore(n_buf, K, V, Z.shape[1], device, tree.mean)
+    oracle = saved["config"].get("oracle", False)
+    buf = CandStore(n_buf, K, V, Z.shape[1], device, tree.mean, parts=True, images=oracle)
     rows = torch.arange(n_buf, device=device)
-    g, _ = tree.code(Z, K, visit=buf.writer(rows))
+    g, _ = tree.code(Z, K, visit=buf.writer(rows, Z))
     buf_img = qa.decode(Z - g.R)
     log(f"run {args.run}: prior of epoch {saved['epoch']}; buffer of {n_buf} train images rebuilt; {K} depths, V={V}")
 
@@ -103,16 +104,16 @@ def main():
         put = store.writer(r)
         gen = torch.Generator(device).manual_seed(ra["seed"] + 7)
 
-        def choose(d, cands, shares):
+        def choose(d, cands, shares, parts):
             if lead_codes is not None and d < args.lead:
                 token = lead_codes[:, d]
             else:
                 dd = torch.full((n,), d, dtype=torch.long, device=device)
                 with amp():
-                    logits = prior(store.inputs(r, dd, W, cands.float())).float()
+                    logits = prior(store.inputs(r, dd, W, cands.float(), parts.float())).float()
                 token = logits.argmax(-1) if temp == 0 else \
                     torch.multinomial((logits / temp).softmax(-1), 1, generator=gen)[:, 0]
-            put(d, cands, token, shares)
+            put(d, cands, token, shares, parts)
             return token
         toks, z = tree.sample(n, choose, K)
         return toks, z

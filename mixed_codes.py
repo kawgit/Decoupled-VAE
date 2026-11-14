@@ -71,7 +71,7 @@ def main():
             return model.decoder(z.float().view(-1, C, h, w) / lat["scale"] * std + mean).float().clamp(0, 1)
 
     toks = []
-    g, _ = tree.code(Z, K, visit=lambda d, c, t, s: toks.append(t.clone()))
+    g, _ = tree.code(Z, K, visit=lambda d, c, t, s, q: toks.append(t.clone()))
     T = torch.stack(toks, 1).long()  # [n, K]
     recon = Z - g.R
     y = decode(recon)
@@ -82,7 +82,7 @@ def main():
         gen = torch.Generator(device).manual_seed(args.seed + 1)
         cols, rows = [images[:args.n], y[:args.n]], []
         for k in ks:
-            def choose(d, cands, shares, k=k):
+            def choose(d, cands, shares, parts, k=k):
                 if d < k:
                     return T[:, d]
                 weights = torch.ones_like(shares, dtype=torch.float) if fill == "uniform" else \

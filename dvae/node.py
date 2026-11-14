@@ -33,11 +33,15 @@ class NodeEncoder(nn.Module):
         self.blocks = nn.ModuleList(Block(width, heads, dropout) for _ in range(layers))
         self.out_norm = nn.LayerNorm(width)
 
-    def forward(self, win: Tensor, valid: Tensor, mean: Tensor, d: Tensor) -> tuple[list[Tensor], Tensor]:
+    def forward(self, win: Tensor, valid: Tensor, mean: Tensor, d: Tensor,
+                extra: Tensor | None = None) -> tuple[list[Tensor], Tensor]:
+        """extra [B, E, W]: more tokens for the memory, already embedded (after the window's)."""
         u, lg = directions(win)
         e = valid.float()[..., None]
         deltas = self.delta_in(torch.cat([u, lg * e, e], -1))
         m = torch.cat([(self.mean_in(mean) + self.depth[d])[:, None], deltas], 1) + self.position
+        if extra is not None:
+            m = torch.cat([m, extra], 1)
         mems = []
         for blk in self.blocks:
             m, x = blk(m)

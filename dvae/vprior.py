@@ -47,11 +47,15 @@ class NodeInputs(NamedTuple):
     early_valid: Tensor  # [B] whether there are any
     mean: Tensor  # [B, D] the node's current mean: the tree's mean plus every delta taken
     d: Tensor  # [B] (long) the depth
+    parts: Tensor | None  # [B, V, D] the centroids that make the cells (each image's token is its nearest)
+    rem: Tensor | None  # [B, D] the image's remainder there (an oracle's: no prior can know it)
 
 
 class CandStore:
-    def __init__(self, n: int, K: int, V: int, D: int, device: torch.device, base: Tensor | None = None):
-        """base [D]: the tree's mean (every code's start)."""
+    def __init__(self, n: int, K: int, V: int, D: int, device: torch.device, base: Tensor | None = None,
+                 parts: bool = False, images: bool = False):
+        """base [D]: the tree's mean (every code's start). parts: also keep the centroids that make each depth's
+        cells (8 bits, a scale per image and depth); images: also each image (float16), for the remainder."""
         self.n, self.K, self.V, self.D = n, K, V, D
         self.base = base.float().to(device) if base is not None else torch.zeros(D, device=device)
         self.cand = torch.zeros(n, K, V, D, dtype=torch.int8, device=device)
@@ -59,16 +63,28 @@ class CandStore:
         self.tok = torch.zeros(n, K, dtype=torch.uint8, device=device)
         self.share = torch.zeros(n, K, V, dtype=torch.float16, device=device)
         self.cum = torch.zeros(n, K + 1, D, dtype=torch.float16, device=device)  # [:, j]: the deltas before j
+        self.part = torch.zeros(n, K, V, D, dtype=torch.int8, device=device) if parts else None
+        self.pscale = torch.zeros(n, K, device=device) if parts else None
+        self.x = torch.zeros(n, D, dtype=torch.float16, device=device) if images else None
 
     def nbytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in (self.cand, self.scale, self.tok, self.share, self.cum))
+        return sum(t.numel() * t.element_size() for t in (self.cand, self.scale, self.tok, self.share, self.cum,
+                                                          self.part, self.pscale, self.x) if t is not None)
 
-    def writer(self, rows: Tensor):
-        """A visit(d, cands [m, V, D], tokens [m], shares [m, V]) for VTree.code and VTree.sample that stores rows'
-        depths in order (its running sum of the deltas taken kept in float32)."""
+    def writer(self, rows: Tensor, X: Tensor | None = None):
+        """A visit(d, cands [m, V, D], tokens [m], shares [m, V], parts [m, V, D]) for VTree.code and VTree.sample
+        that stores rows' depths in order (its running sum of the deltas taken kept in float32); X [m, D]: the
+        images (kept if the store keeps images)."""
         running = torch.zeros(len(rows), self.D, device=self.cand.device)
+        if self.x is not None and X is not None:
+            self.x[rows] = X.half()
 
-        def visit(d, cands, tokens, shares):
+        def visit(d, cands, tokens, shares, parts):
+            if self.part is not None and self.pscale is not None:
+                parts = parts.float()
+                ps = parts.abs().amax((1, 2)).clamp_min(1e-12) / 127
+                self.part[rows, d] = (parts / ps[:, None, None]).round_().to(torch.int8)
+                self.pscale[rows, d] = ps
             cands = cands.float()
             s = cands.abs().amax((1, 2)).clamp_min(1e-12) / 127
             q = (cands / s[:, None, None]).round_().to(torch.int8)
@@ -79,10 +95,14 @@ class CandStore:
             self.cum[rows, d + 1] = running.half()
         return visit
 
-    def inputs(self, i: Tensor, d: Tensor, window: int, cands: Tensor | None = None) -> NodeInputs:
-        """The nodes of images i [B] at depths d [B] (long), with their stored candidates or cands [B, V, D]."""
+    def inputs(self, i: Tensor, d: Tensor, window: int, cands: Tensor | None = None,
+               parts: Tensor | None = None) -> NodeInputs:
+        """The nodes of images i [B] at depths d [B] (long), with their stored candidates and parts, or cands and
+        parts [B, V, D] (a code being sampled)."""
         if cands is None:
             cands = self.cand[i, d].float() * self.scale[i, d][:, None, None]
+        if parts is None and self.part is not None and self.pscale is not None:
+            parts = self.part[i, d].float() * self.pscale[i, d][:, None, None]
         j = d[:, None] - window + torch.arange(window, device=d.device)
         valid = j >= 0
         j = j.clamp_min(0)
@@ -90,18 +110,25 @@ class CandStore:
         win = self.cand[ii, j, self.tok[ii, j].long()].float() * (self.scale[ii, j] * valid)[..., None]
         early = self.cum[i, (d - window).clamp_min(0)].float()
         mean = self.base + self.cum[i, d].float()
-        return NodeInputs(cands, win, valid, early, d > window, mean, d)
+        rem = None if self.x is None else self.x[i].float() - mean
+        return NodeInputs(cands, win, valid, early, d > window, mean, d, None if parts is None else parts.float(), rem)
 
 
 class NodePrior(nn.Module):
-    def __init__(self, depths, V=8, D=512, window=16, width=128, layers=4, heads=4, dropout=0.0):
+    def __init__(self, depths, V=8, D=512, window=16, width=128, layers=4, heads=4, dropout=0.0, parts=False,
+                 oracle=False):
+        """parts: each query also reads its cell's centroid (the inputs' parts), what made the cell; oracle: the
+        node's memory also holds the image's remainder (the inputs' rem: a check that the token is learnable from
+        it, not a prior)."""
         super().__init__()
         self.config = dict(kind="node_prior", depths=depths, V=V, D=D, window=window, width=width, layers=layers,
-                           heads=heads, dropout=dropout)
+                           heads=heads, dropout=dropout, parts=parts, oracle=oracle)
         self.V, self.window = V, window
         self.node = NodeEncoder(depths, D, window, width, layers, heads, dropout)
         self.reader = QueryReader(width, layers, heads, dropout)
         self.centroid_in = nn.Linear(D + 1, width)
+        self.part_in = nn.Linear(D + 1, width) if parts else None
+        self.rem_in = nn.Linear(D + 1, width) if oracle else None
         self.slot = nn.Parameter(torch.randn(V, width) * 0.02)
         self.head = nn.Linear(width, 1)
         nn.init.zeros_(self.head.weight)
@@ -109,8 +136,15 @@ class NodePrior(nn.Module):
 
     def forward(self, x: NodeInputs) -> Tensor:
         """Logits [B, V]."""
-        mems, summary = self.node(x.win, x.valid, x.mean, x.d)
+        extra = None
+        if self.rem_in is not None:
+            assert x.rem is not None, "an oracle prior reads the remainder: a store that keeps images"
+            extra = self.rem_in(torch.cat(directions(x.rem), -1))[:, None]
+        mems, summary = self.node(x.win, x.valid, x.mean, x.d, extra)
         h = self.centroid_in(torch.cat(directions(x.cands), -1)) + self.slot
+        if self.part_in is not None:
+            assert x.parts is not None, "a prior that reads parts: a store that keeps them"
+            h = h + self.part_in(torch.cat(directions(x.parts), -1))
         return self.head(self.reader(h, mems, summary))[..., 0]
 
 
@@ -215,15 +249,15 @@ class CodeQA:
         rows = torch.arange(self.n, device=self.device)
         put = store.writer(rows)
 
-        def by_prior(d, cands, shares):
+        def by_prior(d, cands, shares, parts):
             dd = torch.full((self.n,), d, dtype=torch.long, device=self.device)
             with amp():
-                logits = prior(store.inputs(rows, dd, prior.window, cands.float())).float()
+                logits = prior(store.inputs(rows, dd, prior.window, cands.float(), parts.float())).float()
             token = torch.multinomial(logits.softmax(-1), 1, generator=gen)[:, 0]
-            put(d, cands, token, shares)
+            put(d, cands, token, shares, parts)
             return token
 
-        def by_shares(d, cands, shares):
+        def by_shares(d, cands, shares, parts):
             return torch.multinomial(shares.float().clamp_min(0) + 1e-12, 1, generator=gen)[:, 0]
 
         _, z_prior = self.tree.sample(self.n, by_prior, self.K)

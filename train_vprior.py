@@ -55,6 +55,10 @@ def main():
     p.add_argument("--lam", type=float, default=0.0, help="the weight of -E_p[log trust] in the prior's loss")
     p.add_argument("--net", choices=("node", "cand"), default="node",
                    help="node: NodePrior and NodeDisc; cand: CandNet for both (the earlier design)")
+    p.add_argument("--no-parts", action="store_true", help="--net node: the prior's queries read only the cells' "
+                   "predicted means, not the centroids that made the cells (the token is its nearest of those)")
+    p.add_argument("--oracle", action="store_true", help="--net node: the prior also reads the image's remainder "
+                   "at the node (a check that tokens are learnable from it; not a prior: no samples)")
     p.add_argument("--window", type=int, default=None, help="history deltas read (default: the tree's window)")
     p.add_argument("--width", type=int, default=128)
     p.add_argument("--layers", type=int, default=4)
@@ -125,15 +129,18 @@ def main():
     def fill(store, rows, Z, label):
         t0 = time.time()
         for i in range(0, len(rows), args.chunk):
-            tree.code(Z[i:i + args.chunk].to(device).float(), K, visit=store.writer(rows[i:i + args.chunk]))
+            Zi = Z[i:i + args.chunk].to(device).float()
+            tree.code(Zi, K, visit=store.writer(rows[i:i + args.chunk], Zi))
             done = min(i + args.chunk, len(rows))
             log.detail(f"    {label}: replayed {done} of {len(rows)} images; "
                        f"{(len(rows) - done) * (time.time() - t0) / done:.0f}s left")
         return time.time() - t0
 
+    parts = args.net == "node" and not args.no_parts
+    assert not args.oracle or args.net == "node", "--oracle is NodePrior's"
     stores = {}
     for name, n, Z in (("buffer", args.buffer, None), ("val", args.val, lat["val"]), ("test", args.test, lat["test"])):
-        stores[name] = CandStore(n, K, V, D, device, tree.mean)
+        stores[name] = CandStore(n, K, V, D, device, tree.mean, parts=parts, images=args.oracle)
         Z = pool[take(n)] if Z is None else Z[:n].flatten(1)
         seconds = fill(stores[name], torch.arange(n, device=device), Z, name)
         log(f"{name}: {n} images replayed in {seconds:.0f}s ({stores[name].nbytes() / 2**30:.1f} GiB on the GPU)")
@@ -157,8 +164,9 @@ def main():
 
     def make(role):
         kind = "cand" if args.net == "cand" else f"node_{role}"
+        extra = dict(parts=parts, oracle=args.oracle) if kind == "node_prior" else {}
         return make_net(dict(kind=kind, depths=K, V=V, D=D, window=W, width=args.width, layers=args.layers,
-                             heads=args.heads, dropout=args.dropout)).to(device)
+                             heads=args.heads, dropout=args.dropout, **extra)).to(device)
 
     def optimizer(net):
         return torch.optim.AdamW(net.parameters(), lr=args.lr, betas=(args.beta1, 0.999),
@@ -272,7 +280,7 @@ def main():
                 best = (metric, e, copy.deepcopy(net_p.state_dict()), copy.deepcopy(net_d.state_dict()))
                 if train_prior:
                     records["by_depth"] = dict(epoch=e, prior=v_depth, **base_depth["val"])
-            if train_prior and (e == 1 or e % args.qa_every == 0):
+            if train_prior and not args.oracle and (e == 1 or e % args.qa_every == 0):
                 t1 = time.time()
                 samples.update(qa.samples(net_p, amp), epoch=e)
                 timing["samples"] = time.time() - t1
@@ -299,7 +307,8 @@ def main():
         + ("" if args.prior_only else "; a fresh discriminator now trains against it, frozen"))
     torch.save(dict(config=prior.config, state_dict=prior.state_dict(), epoch=best[1], args=vars(args)),
                os.path.join(out, "prior.pt"))
-    samples.update(qa.samples(prior, amp), epoch=best[1])
+    if not args.oracle:
+        samples.update(qa.samples(prior, amp), epoch=best[1])
     if args.prior_only:
         final = {s: evaluate(stores[s], torch.arange(stores[s].n, device=device), prior, disc)[0]
                  for s in ("val", "test")}
