@@ -60,7 +60,7 @@ def main():
     p.add_argument("--batch", type=int, default=512, help="(image, depth) pairs")
     p.add_argument("--steps", type=int, default=1000, help="batches per epoch")
     p.add_argument("--buffer", type=int, default=4000, help="training images replayed and held on the GPU")
-    p.add_argument("--rotate", type=int, default=400, help="buffer images replaced each epoch")
+    p.add_argument("--rotate", type=int, default=400, help="buffer images replaced each epoch (0: a fixed buffer)")
     p.add_argument("--val", type=int, default=1000, help="val images scored")
     p.add_argument("--test", type=int, default=1000, help="test images scored at the end")
     p.add_argument("--lr", type=float, default=3e-4, help="both networks'")
@@ -206,7 +206,7 @@ def main():
             t0 = time.time()
             timing = {}
             incoming = None
-            if e > 1 or history is records["fresh"]:  # (the buffer's oldest make way, scored before training)
+            if args.rotate and (e > 1 or history is records["fresh"]):  # (the oldest make way, scored first)
                 rows = (oldest[0] + torch.arange(args.rotate, device=device)) % args.buffer
                 oldest[0] = (oldest[0] + args.rotate) % args.buffer
                 fill(buf, rows, pool[take(args.rotate)], "rotation")
