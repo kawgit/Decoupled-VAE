@@ -11,7 +11,7 @@ import torch
 from torch import Tensor
 
 from dvae.components import Group, root_group
-from dvae.vway import VStepNet, cells_of, split_rows, vanswers, vdescend
+from dvae.vway import cells_of, make_step_net, split_rows, vanswers, vdescend
 
 
 class VTree:
@@ -46,7 +46,7 @@ class VTree:
                 row.append({k: v.half() if v.is_floating_point() else v for k, v in saved["state_dict"].items()})
             self.nets.append(row)
         assert config is not None, f"{run} has no networks"
-        self.net = VStepNet(**config).to(device)
+        self.net = make_step_net(config).to(device)
         self.net.fp16 = fp16
         self.net.bf16 = not fp16 and self.args.get("bf16", False)
         self.net.eval()

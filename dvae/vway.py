@@ -20,12 +20,15 @@ the sum of their squared distances to it), so a centroid whose cell is empty sti
 lloyd-refine branch).
 """
 
+import contextlib
+
 import torch
 import torch.nn as nn
 from torch import Tensor
 
 from dvae.components import POSITIONS, Group
 from dvae.deltatree import EPS, Block, HistoryReader, ImageHead, splitmix64
+from dvae.node import NodeEncoder, QueryReader, directions
 
 
 class VStepNet(HistoryReader):
@@ -67,6 +70,74 @@ class VStepNet(HistoryReader):
             o, logits = o.float(), self.p_head(f)[..., 0].float()
         p = logits.softmax(-1)
         return o - (p[..., None] * o).sum(1, keepdim=True), p
+
+
+class VNodeStepNet(nn.Module):
+    """VStepNet's job (the same memory_q and query, so the same callers) with the node read by dvae/node.py's
+    NodeEncoder: its current mean (the deltas taken, summed: the history's early token plus its window; the tree's
+    mean is a constant, in the token's bias) and its last `window` deltas, the V centroids as queries reading it
+    (QueryReader). Sides and ms are not read (VStepNet's plain history)."""
+
+    def __init__(self, V=4, width=128, layers=4, heads=4, window=16, shape=(1, 28, 28), dropout=0.0, head="token",
+                 head_hidden=1):
+        super().__init__()
+        shape = tuple(shape)
+        assert head in ("token", "shared"), head
+        self.config = dict(kind="node", V=V, width=width, layers=layers, heads=heads, window=window, shape=shape,
+                           dropout=dropout, head=head, head_hidden=head_hidden)
+        self.V, self.window, self.shared = V, window, head == "shared"
+        self.D = shape[0] * shape[1] * shape[2]
+        self.bf16 = False  # (set by the trainer, as HistoryReader's)
+        self.fp16 = False
+        self.node = NodeEncoder(0, self.D, window, width, layers, heads, dropout)
+        self.reader = QueryReader(width, layers, heads, dropout)
+        self.centroid_in = nn.Linear(self.D + 1, width)
+        self.slot = nn.Parameter(torch.randn(V, width) * 0.02)
+        self.c_head = ImageHead(width * V, V, shape=shape, hidden=head_hidden) if self.shared \
+            else ImageHead(width, 1, shape=shape, hidden=head_hidden)
+        self.p_head = nn.Linear(width, 1)
+
+    def amp(self):
+        """As HistoryReader.amp."""
+        if self.fp16:
+            return torch.autocast(self.slot.device.type, dtype=torch.float16)
+        if not self.bf16:
+            return contextlib.nullcontext()
+        return torch.autocast(self.slot.device.type, dtype=torch.bfloat16)
+
+    def memory_q(self, raw, scales, early, sides, ms) -> tuple[list[Tensor], Tensor]:
+        """The node's memory and summary, from Group.history_q's window (int8 or float16 rows [B, k, D], scales
+        [B, k]; k < window at shallow depths: the window is padded before its oldest) and early token."""
+        B, k, D = raw.shape
+        win = raw.float() * scales[..., None]
+        mean = win.sum(1) if early is None else early.float() + win.sum(1)
+        pad = self.window - k
+        assert pad >= 0, f"a history of {k} deltas, more than the window's {self.window}"
+        win = torch.cat([win.new_zeros(B, pad, D), win], 1)
+        valid = torch.arange(self.window, device=raw.device).expand(B, -1) >= pad
+        with self.amp():
+            return self.node(win, valid, mean, torch.zeros(B, dtype=torch.long, device=raw.device))
+
+    def query(self, memory, q: Tensor) -> tuple[Tensor, Tensor]:
+        """As VStepNet.query, memory memory_q's (the node's memory and summary)."""
+        mems, summary = memory
+        with self.amp():
+            h = self.centroid_in(torch.cat(directions(q.float()), -1)) + self.slot
+            f = self.reader(h, mems, summary)
+            o = self.c_head(f.flatten(1)) if self.shared else self.c_head(f)[:, :, 0]
+            o, logits = o.float(), self.p_head(f)[..., 0].float()
+        p = logits.softmax(-1)
+        return o - (p[..., None] * o).sum(1, keepdim=True), p
+
+
+StepNet = VStepNet | VNodeStepNet
+
+
+def make_step_net(config: dict) -> StepNet:
+    """A V-way step network from its config (a saved one's: VStepNet's have no kind)."""
+    config = dict(config)
+    kind = config.pop("kind", "vstep")
+    return VNodeStepNet(**config) if kind == "node" else VStepNet(**config)
 
 
 def rows_per_chunk(V: int, D: int, chunk: int) -> int:
@@ -141,7 +212,7 @@ def vsplit_mse(g: Group, count: Tensor, total: CellSums, c: Tensor, chunk=8192) 
 
 
 @torch.no_grad()
-def vanswers(net: VStepNet, g: Group, q: Tensor, batch=1024, out: Tensor | None = None) -> tuple[Tensor, Tensor]:
+def vanswers(net: StepNet, g: Group, q: Tensor, batch=1024, out: Tensor | None = None) -> tuple[Tensor, Tensor]:
     """The network's predicted means c [Nn, V, D] (in q's dtype) and shares p [Nn, V] at every node of g, asked
     about q. out: c's tensor (q itself may be: each batch of nodes is read before it is written)."""
     net.eval()
@@ -304,5 +375,6 @@ def append_group(g: Group, h: Group):
     refresh_stats(g)
 
 
-__all__ = ["VStepNet", "CellSums", "split_rows", "cells_of", "cell_stats", "vsplit_sse", "attraction_sse", "vsplit_mse", "vanswers",
-           "pca_start", "vdescend", "keep_images", "append_group"]
+__all__ = ["VStepNet", "VNodeStepNet", "StepNet", "make_step_net", "CellSums", "split_rows", "cells_of", "cell_stats",
+           "vsplit_sse", "attraction_sse", "vsplit_mse", "vanswers", "pca_start", "vdescend", "keep_images",
+           "append_group"]

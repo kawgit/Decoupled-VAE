@@ -33,6 +33,7 @@ from torch import Tensor
 
 from dvae.data import load_images
 from dvae.deltatree import EPS, Block
+from dvae.node import NodeEncoder, QueryReader, directions
 from dvae.outer import load_outer
 from dvae.vreplay import VTree
 
@@ -92,54 +93,6 @@ class CandStore:
         return NodeInputs(cands, win, valid, early, d > window, mean, d)
 
 
-def _directions(x: Tensor) -> tuple[Tensor, Tensor]:
-    """Vectors x [..., D] as their directions and log lengths [..., 1]."""
-    n = x.norm(dim=-1, keepdim=True).clamp_min(EPS)
-    return x / n, n.log()
-
-
-class NodeEncoder(nn.Module):
-    """A node's memory (each layer's normalized tokens [B, 1 + window, W], the mean's first) and summary [B, W]."""
-
-    def __init__(self, depths, D=512, window=16, width=128, layers=4, heads=4, dropout=0.0):
-        super().__init__()
-        self.window = window
-        self.mean_in = nn.Linear(D, width)
-        self.delta_in = nn.Linear(D + 2, width)  # (direction, log length, exists)
-        self.position = nn.Parameter(torch.randn(window + 1, width) * 0.02)  # (the mean's first)
-        self.depth = nn.Parameter(torch.randn(depths + 1, width) * 0.02)  # (+ 1: a discriminator's child nodes)
-        self.blocks = nn.ModuleList(Block(width, heads, dropout) for _ in range(layers))
-        self.out_norm = nn.LayerNorm(width)
-
-    def forward(self, win: Tensor, valid: Tensor, mean: Tensor, d: Tensor) -> tuple[list[Tensor], Tensor]:
-        u, lg = _directions(win)
-        e = valid.float()[..., None]
-        deltas = self.delta_in(torch.cat([u, lg * e, e], -1))
-        m = torch.cat([(self.mean_in(mean) + self.depth[d])[:, None], deltas], 1) + self.position
-        mems = []
-        for blk in self.blocks:
-            m, x = blk(m)
-            mems.append(x)
-        return mems, self.out_norm(m[:, 0])
-
-
-class QueryReader(nn.Module):
-    """Queries h [B, Q, W] reading a node's memory at every layer (blocks of their own), the node's summary added
-    to their input; their final normalized states [B, Q, W]."""
-
-    def __init__(self, width=128, layers=4, heads=4, dropout=0.0):
-        super().__init__()
-        self.summary_in = nn.Linear(width, width)
-        self.blocks = nn.ModuleList(Block(width, heads, dropout) for _ in range(layers))
-        self.out_norm = nn.LayerNorm(width)
-
-    def forward(self, h: Tensor, mems: list[Tensor], summary: Tensor) -> Tensor:
-        h = h + self.summary_in(summary)[:, None]
-        for blk, mem in zip(self.blocks, mems):
-            h, _ = blk(h, mem)
-        return self.out_norm(h)
-
-
 class NodePrior(nn.Module):
     def __init__(self, depths, V=8, D=512, window=16, width=128, layers=4, heads=4, dropout=0.0):
         super().__init__()
@@ -157,7 +110,7 @@ class NodePrior(nn.Module):
     def forward(self, x: NodeInputs) -> Tensor:
         """Logits [B, V]."""
         mems, summary = self.node(x.win, x.valid, x.mean, x.d)
-        h = self.centroid_in(torch.cat(_directions(x.cands), -1)) + self.slot
+        h = self.centroid_in(torch.cat(directions(x.cands), -1)) + self.slot
         return self.head(self.reader(h, mems, summary))[..., 0]
 
 
@@ -280,5 +233,4 @@ class CodeQA:
                     K=self.K)
 
 
-__all__ = ["CandNet", "CandStore", "CodeQA", "NodeDisc", "NodeEncoder", "NodeInputs", "NodePrior", "PriorNet",
-           "QueryReader", "make_net"]
+__all__ = ["CandNet", "CandStore", "CodeQA", "NodeDisc", "NodeInputs", "NodePrior", "PriorNet", "make_net"]

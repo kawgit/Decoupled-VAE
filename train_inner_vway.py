@@ -50,8 +50,9 @@ from dvae.data import SHAPES, get_device, load_images  # noqa: E402
 from dvae.deltatree import pixels  # noqa: E402
 from dvae.logs import RunLog  # noqa: E402
 from dvae.outer import decode_latents, load_outer  # noqa: E402
-from dvae.vway import (CellSums, VStepNet, append_group, attraction_sse, cell_stats, cells_of, keep_images,  # noqa: E402
-                       pca_start, split_rows, vanswers, vdescend, vsplit_mse, vsplit_sse)
+from dvae.vway import (CellSums, StepNet, VNodeStepNet, VStepNet, append_group, attraction_sse,  # noqa: E402
+                       cell_stats, cells_of, keep_images, pca_start, split_rows, vanswers, vdescend, vsplit_mse,
+                       vsplit_sse)
 
 
 def atomic_save(obj, path):
@@ -86,6 +87,9 @@ def main():
     p.add_argument("--max-steps", type=int, default=64)
     p.add_argument("--max-epochs", type=int, default=200)
     p.add_argument("--images-per-epoch", type=int, default=22528)
+    p.add_argument("--net", choices=("vstep", "node"), default="vstep",
+                   help="vstep: VStepNet (the history's early token and window); node: VNodeStepNet (the node's "
+                        "current mean and its window, dvae/node.py's NodeEncoder)")
     p.add_argument("--width", type=int, default=128)
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--heads", type=int, default=4)
@@ -223,8 +227,13 @@ def main():
     def pixel_mse():
         return {f"{s}_px": (as_pixels(s, groups[s].R[:len(x)]) - x).square().mean().item() for s, x in images_px.items()}
 
-    net = VStepNet(V, args.width, args.layers, args.heads, not args.side_m_history, shape, args.dropout,
-                   args.head, args.head_hidden).to(device)
+    if args.net == "node":
+        assert not args.side_m_history, "--net node reads no sides or ms"
+        net: StepNet = VNodeStepNet(V, args.width, args.layers, args.heads, args.history_window, shape, args.dropout,
+                                    args.head, args.head_hidden).to(device)
+    else:
+        net = VStepNet(V, args.width, args.layers, args.heads, not args.side_m_history, shape, args.dropout,
+                       args.head, args.head_hidden).to(device)
     net.bf16, net.fp16 = args.bf16, args.fp16
     if args.compile:  # (dynamic: the batch's nodes and the history's length vary)
         # (each function compiles a few times at the first depths, for grad mode, batches of one node and the
