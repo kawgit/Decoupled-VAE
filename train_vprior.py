@@ -68,6 +68,10 @@ def main():
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--patience", type=int, default=5, help="epochs without a lower val negative log trust")
     p.add_argument("--max-epochs", type=int, default=200)
+    p.add_argument("--fresh-epochs", type=int, default=None, help="the fresh discriminator's epoch limit (default: "
+                   "--max-epochs)")
+    p.add_argument("--keep-last", action="store_true", help="keep the last epoch's prior, not val's best (for "
+                   "overfitting tests)")
     p.add_argument("--progress-every", type=int, default=200, help="batches between progress lines (run.full.log)")
     p.add_argument("--chunk", type=int, default=1000, help="images replayed at once")
     p.add_argument("--node-batch", type=int, default=2048)
@@ -195,14 +199,14 @@ def main():
         atomic_json(records, os.path.join(out, "records.json"))
         plot_vprior(records, os.path.join(out, "run.png"), samples or None)
 
-    def train_epochs(net_p, net_d, opt_p, opt_d, train_prior, label, history):
+    def train_epochs(net_p, net_d, opt_p, opt_d, train_prior, label, history, epochs):
         """Epochs until the selection metric (train_prior: val negative log trust; else the discriminator's val
         loss) passes --patience without a new low; returns the best (metric, epoch, prior state, disc state)."""
         sc_p = torch.amp.GradScaler(device.type, enabled=args.fp16)
         sc_d = torch.amp.GradScaler(device.type, enabled=args.fp16)
         val_rows = torch.arange(args.val, device=device)
         best = (float("inf"), 0, None, None)
-        for e in range(1, args.max_epochs + 1):
+        for e in range(1, epochs + 1):
             t0 = time.time()
             timing = {}
             incoming = None
@@ -255,7 +259,7 @@ def main():
             v, v_depth = evaluate(stores["val"], val_rows, net_p, net_d)
             timing["val"] = time.time() - t1
             metric = v["nlt"] if train_prior else v["disc"]
-            if metric < best[0]:
+            if metric < best[0] or (train_prior and args.keep_last):
                 best = (metric, e, copy.deepcopy(net_p.state_dict()), copy.deepcopy(net_d.state_dict()))
                 if train_prior:
                     records["by_depth"] = dict(epoch=e, prior=v_depth, **base_depth["val"])
@@ -278,7 +282,8 @@ def main():
                 break
         return best
 
-    best = train_epochs(prior, disc, optimizer(prior), optimizer(disc), True, "prior", records["history"])
+    best = train_epochs(prior, disc, optimizer(prior), optimizer(disc), True, "prior", records["history"],
+                        args.max_epochs)
     assert best[2] is not None, "no epoch ran"
     prior.load_state_dict(best[2])
     log(f"kept the prior of epoch {best[1]} (val -E_p[log trust] {best[0]:.4f}); a fresh discriminator now trains "
@@ -287,7 +292,8 @@ def main():
                os.path.join(out, "prior.pt"))
     samples.update(qa.samples(prior, amp), epoch=best[1])
     judge = make()
-    best_j = train_epochs(prior, judge, None, optimizer(judge), False, "fresh discriminator", records["fresh"])
+    best_j = train_epochs(prior, judge, None, optimizer(judge), False, "fresh discriminator", records["fresh"],
+                          args.fresh_epochs or args.max_epochs)
     assert best_j[3] is not None, "no epoch ran"
     judge.load_state_dict(best_j[3])
     torch.save(dict(config=judge.config, state_dict=judge.state_dict(), epoch=best_j[1]), os.path.join(out, "disc.pt"))
