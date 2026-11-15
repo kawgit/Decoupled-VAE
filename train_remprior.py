@@ -66,6 +66,8 @@ def main():
     p.add_argument("--patience", type=int, default=6, help="epochs without a lower val likelihood (the learning "
                    "rate halves after each 2)")
     p.add_argument("--max-epochs", type=int, default=100)
+    p.add_argument("--max-minutes", type=float, default=None, help="stop training once this many minutes have "
+                   "passed since the start (then calibrate, score and save: a run that must end before its slot does)")
     p.add_argument("--progress-every", type=int, default=200)
     p.add_argument("--chunk", type=int, default=1000, help="images replayed at once")
     p.add_argument("--node-batch", type=int, default=2048)
@@ -245,6 +247,9 @@ def main():
             f"{time.time() - t0:.0f}s (train {train_s:.0f})")
         save()
         if e - best[1] >= args.patience:
+            break
+        if args.max_minutes is not None and time.time() - began > 60 * args.max_minutes:
+            log(f"stopping: {args.max_minutes:g} minutes have passed")
             break
 
     prior.load_state_dict(best[2])
