@@ -90,6 +90,8 @@ def main():
     p.add_argument("--net", choices=("vstep", "node"), default="vstep",
                    help="vstep: VStepNet (the history's early token and window); node: VNodeStepNet (the node's "
                         "current mean and its window, dvae/node.py's NodeEncoder)")
+    p.add_argument("--no-tower", action="store_true", help="the step networks have no share head and do not center "
+                   "their predicted means (the tower property); every share is then 1 / V")
     p.add_argument("--width", type=int, default=128)
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--heads", type=int, default=4)
@@ -230,10 +232,10 @@ def main():
     if args.net == "node":
         assert not args.side_m_history, "--net node reads no sides or ms"
         net: StepNet = VNodeStepNet(V, args.width, args.layers, args.heads, args.history_window, shape, args.dropout,
-                                    args.head, args.head_hidden).to(device)
+                                    args.head, args.head_hidden, tower=not args.no_tower).to(device)
     else:
         net = VStepNet(V, args.width, args.layers, args.heads, not args.side_m_history, shape, args.dropout,
-                       args.head, args.head_hidden).to(device)
+                       args.head, args.head_hidden, tower=not args.no_tower).to(device)
     net.bf16, net.fp16 = args.bf16, args.fp16
     if args.compile:  # (dynamic: the batch's nodes and the history's length vary)
         # (each function compiles a few times at the first depths, for grad mode, batches of one node and the

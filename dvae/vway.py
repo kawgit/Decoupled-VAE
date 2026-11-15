@@ -35,12 +35,16 @@ class VStepNet(HistoryReader):
     """One (depth, Lloyd step)'s network for V-way splits (see the module's docstring)."""
 
     def __init__(self, V=4, width=128, layers=4, heads=4, plain_history=True, shape=(1, 28, 28), dropout=0.0,
-                 head="token", head_hidden=1):
+                 head="token", head_hidden=1, tower=True):
+        """tower=False: no share head; the predicted means are not centered (and every share is 1 / V)."""
         shape = tuple(shape)
         super().__init__(POSITIONS, width, layers, heads, False, plain_history, shape[0] * shape[1] * shape[2])
         assert head in ("token", "shared"), head
         self.config = dict(V=V, width=width, layers=layers, heads=heads, plain_history=plain_history, shape=shape,
                            dropout=dropout, head=head, head_hidden=head_hidden)
+        if not tower:  # (only then: the configs of runs saved before the option compare equal on --resume)
+            self.config["tower"] = False
+        self.tower = tower
         self.V, self.shared = V, head == "shared"
         self.centroid_in = nn.Linear(self.D + 1, width)
         self.slot = nn.Parameter(torch.randn(V, width) * 0.02)
@@ -49,7 +53,7 @@ class VStepNet(HistoryReader):
         # more than the blocks; shared: one call reading all V tokens' features, V channels out)
         self.c_head = ImageHead(width * V, V, shape=shape, hidden=head_hidden) if self.shared \
             else ImageHead(width, 1, shape=shape, hidden=head_hidden)
-        self.p_head = nn.Linear(width, 1)
+        self.p_head = nn.Linear(width, 1) if tower else None
         if dropout > 0:  # (as StepNet: attention weights, both branches' outputs)
             for blk in self.blocks:
                 assert isinstance(blk, Block) and isinstance(blk.ff, nn.Sequential)
@@ -58,7 +62,7 @@ class VStepNet(HistoryReader):
 
     def query(self, mems, q: Tensor) -> tuple[Tensor, Tensor]:
         """For V centroids q [B, V, D] at each of B nodes with memory mems: the cells' predicted means c [B, V, D]
-        (their share-weighted mean 0) and shares p [B, V]."""
+        (with the tower, their share-weighted mean 0) and shares p [B, V] (without it, 1 / V)."""
         q = q.float()  # (the run may keep its centroids in bfloat16)
         length = q.norm(dim=-1, keepdim=True).clamp_min(EPS)
         with self.amp():
@@ -67,7 +71,10 @@ class VStepNet(HistoryReader):
                 h, _ = blk(h, mem)
             f = self.out_norm(h)
             o = self.c_head(f.flatten(1)) if self.shared else self.c_head(f)[:, :, 0]
-            o, logits = o.float(), self.p_head(f)[..., 0].float()
+            o = o.float()
+            logits = self.p_head(f)[..., 0].float() if self.p_head is not None else None
+        if logits is None:
+            return o, o.new_full(o.shape[:2], 1 / self.V)
         p = logits.softmax(-1)
         return o - (p[..., None] * o).sum(1, keepdim=True), p
 
@@ -79,12 +86,15 @@ class VNodeStepNet(nn.Module):
     (QueryReader). Sides and ms are not read (VStepNet's plain history)."""
 
     def __init__(self, V=4, width=128, layers=4, heads=4, window=16, shape=(1, 28, 28), dropout=0.0, head="token",
-                 head_hidden=1):
+                 head_hidden=1, tower=True):
+        """tower: as VStepNet's."""
         super().__init__()
         shape = tuple(shape)
         assert head in ("token", "shared"), head
         self.config = dict(kind="node", V=V, width=width, layers=layers, heads=heads, window=window, shape=shape,
                            dropout=dropout, head=head, head_hidden=head_hidden)
+        if not tower:
+            self.config["tower"] = False
         self.V, self.window, self.shared = V, window, head == "shared"
         self.D = shape[0] * shape[1] * shape[2]
         self.bf16 = False  # (set by the trainer, as HistoryReader's)
@@ -95,7 +105,7 @@ class VNodeStepNet(nn.Module):
         self.slot = nn.Parameter(torch.randn(V, width) * 0.02)
         self.c_head = ImageHead(width * V, V, shape=shape, hidden=head_hidden) if self.shared \
             else ImageHead(width, 1, shape=shape, hidden=head_hidden)
-        self.p_head = nn.Linear(width, 1)
+        self.p_head = nn.Linear(width, 1) if tower else None
 
     def amp(self):
         """As HistoryReader.amp."""
@@ -125,7 +135,10 @@ class VNodeStepNet(nn.Module):
             h = self.centroid_in(torch.cat(directions(q.float()), -1)) + self.slot
             f = self.reader(h, mems, summary)
             o = self.c_head(f.flatten(1)) if self.shared else self.c_head(f)[:, :, 0]
-            o, logits = o.float(), self.p_head(f)[..., 0].float()
+            o = o.float()
+            logits = self.p_head(f)[..., 0].float() if self.p_head is not None else None
+        if logits is None:
+            return o, o.new_full(o.shape[:2], 1 / self.V)
         p = logits.softmax(-1)
         return o - (p[..., None] * o).sum(1, keepdim=True), p
 
