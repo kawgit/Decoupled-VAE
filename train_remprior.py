@@ -29,7 +29,7 @@ import time
 import torch
 
 from dvae.artifacts import artifact
-from dvae.data import get_device
+from dvae.data import get_device, load_images
 from dvae.logs import RunLog
 from dvae.plots import plot_remprior
 from dvae.remprior import RemPrior
@@ -54,6 +54,8 @@ def main():
     p.add_argument("--val", type=int, default=1000)
     p.add_argument("--test", type=int, default=1000)
     p.add_argument("--bits-images", type=int, default=100, help="val images whose bits are scored each epoch")
+    p.add_argument("--flip", action="store_true", help="the training pool also holds the latents of the training "
+                   "images mirrored left to right (encoded by the outer autoencoder: real latents of real images)")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--patience", type=int, default=5)
@@ -88,6 +90,8 @@ def main():
     shape = tuple(lat["shape"])
     D = lat["train"][0].numel()
     pool = lat["train"].flatten(1)
+    if args.flip:
+        pool = torch.cat([pool, flipped_latents(qa, lat, args.data_root, device, log)])
     order = torch.randperm(len(pool), generator=torch.Generator().manual_seed(args.seed + 2))
     drawn = [0]
 
@@ -245,6 +249,30 @@ def main():
         f"{final['test']['isotropic']:.2f}); uniform {K * math.log2(V):.0f}")
     save()
     log(f"done in {(time.time() - began) / 60:.1f} min; {out}")
+
+
+@torch.no_grad()
+def flipped_latents(qa: CodeQA, lat: dict, data_root: str, device, log, batch: int = 1000) -> torch.Tensor:
+    """The training images mirrored left to right, encoded and scaled as train_outer.py made latents.pt
+    (float16, flattened); first checked by re-encoding the unmirrored ones against the stored latents."""
+    images = load_images(lat["dataset"], "train", data_root)[:len(lat["train"])]
+    C, h, w = lat["shape"]
+    mean, std = lat["mean"].to(device)[None, :, None, None], lat["std"].to(device)[None, :, None, None]
+    qa.model.eval()
+
+    def encode(x):
+        z = qa.model.encoder(((x.to(device).float() + 0.5) / 256).view(len(x), *images.shape[1:])).float()
+        return ((z - mean) / std * lat["scale"]).flatten(1)
+
+    check = encode(images[:batch])
+    stored = lat["train"][:batch].float().flatten(1).to(device)
+    log(f"re-encoded {batch} training images: mse to the stored latents {(check - stored).square().mean():.3g} "
+        f"(their variance {stored.var():.3g})")
+    out = [encode(images[i:i + batch].flip(-1)).half().cpu() for i in range(0, len(images), batch)]
+    flipped = torch.cat(out)
+    log(f"{len(flipped)} mirrored training images encoded; mean square distance to their unmirrored latents mirrored "
+        f"{(flipped[:batch].float().view(-1, C, h, w) - lat['train'][:batch].float().flip(-1)).square().mean():.3g}")
+    return flipped
 
 
 def atomic_json(obj, path):
