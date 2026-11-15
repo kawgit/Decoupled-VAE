@@ -80,6 +80,8 @@ def main():
     p.add_argument("--prior", required=True, help="a prior.pt, or uniform")
     p.add_argument("--tree", default=None, help="the tree (default: the prior's run's)")
     p.add_argument("--depths", type=int, default=None, help="the codes' depths (default: the prior's run's)")
+    p.add_argument("--temp", type=float, default=1.0, help="sampling temperature: the prior's logits divided by it "
+                   "(below 1: its likelier tokens more often)")
     p.add_argument("--n", type=int, default=5000, help="real codes and fake codes each")
     p.add_argument("--held", type=float, default=0.2, help="the held-out share of each")
     p.add_argument("--chunk", type=int, default=500, help="codes sampled at once")
@@ -150,7 +152,7 @@ def main():
                 dd = torch.full((n,), d, dtype=torch.long, device=device)
                 with torch.no_grad(), amp():
                     logits = prior(store.inputs(rows, dd, window, cands.float(), parts.float())).float()
-                token = torch.multinomial(logits.softmax(-1), 1, generator=gen)[:, 0]
+                token = torch.multinomial((logits / args.temp).softmax(-1), 1, generator=gen)[:, 0]
                 put(d, cands, token, shares, parts)
                 return token
             choose = choose_prior
