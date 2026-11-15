@@ -69,7 +69,9 @@ def load_prior(path, device):
         prior = RemPrior(**config)
     else:
         prior = make_net(config)
-    prior.load_state_dict(saved["state_dict"])
+    missing, unexpected = prior.load_state_dict(saved["state_dict"], strict=False)
+    # (RemPriors saved before the soft assignment lack its temperature: unused by a hard-count prior)
+    assert not unexpected and set(missing) <= {"tau0", "log_tau"}, (missing, unexpected)
     return prior.to(device).eval(), saved.get("args", {})
 
 
