@@ -301,13 +301,13 @@ class CodeQA:
         return self.model.decoder(z.float().view(-1, C, h, w) / self.lat["scale"] * std + mean).clamp(0, 1).cpu()
 
     @torch.no_grad()
-    def samples(self, prior: PriorNet, amp) -> dict:
+    def samples(self, prior: nn.Module, amp) -> dict:
         """n codes sampled from prior and n from the tree's shares alone, decoded; with the test images and their
         reconstructions (the same seed every call, so that calls compare)."""
         was = prior.training
         prior.eval()
         gen = torch.Generator(self.device).manual_seed(self.seed + 1)
-        V, D = prior.V, len(self.tree.mean)
+        V, D, window = getattr(prior, "V"), len(self.tree.mean), getattr(prior, "window")
         store = CandStore(self.n, self.K, V, D, self.device, self.tree.mean)
         rows = torch.arange(self.n, device=self.device)
         put = store.writer(rows)
@@ -315,7 +315,7 @@ class CodeQA:
         def by_prior(d, cands, shares, parts):
             dd = torch.full((self.n,), d, dtype=torch.long, device=self.device)
             with amp():
-                logits = prior(store.inputs(rows, dd, prior.window, cands.float(), parts.float())).float()
+                logits = prior(store.inputs(rows, dd, window, cands.float(), parts.float())).float()
             token = torch.multinomial(logits.softmax(-1), 1, generator=gen)[:, 0]
             put(d, cands, token, shares, parts)
             return token

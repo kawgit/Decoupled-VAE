@@ -409,6 +409,80 @@ def plot_vprior(records, path, samples=None):
     _save(fig, path)
 
 
+
+def plot_remprior(records, path, samples=None):
+    """Save a remainder-model prior's progress (train_remprior.py): per epoch, the remainders' negative log
+    likelihood (train, incoming, val, beside the isotropic baseline's) and the bits per image of the scored val
+    images (beside the isotropic baseline's and uniform); the kept prior's bits saved per token by depth against
+    uniform (beside the baseline's); and, given samples (CodeQA.samples), test images, their reconstructions, and
+    codes sampled from the prior and from the tree's shares, decoded."""
+    history = records["history"]
+    if not history:
+        return
+    K, V = records["K"], records["V"]
+    uniform = K * math.log2(V)
+    fig = plt.figure(figsize=(19, 12))
+    grid = fig.add_gridspec(2, 3)
+    nll_ax, bits_ax, depth_ax = (fig.add_subplot(grid[0, i]) for i in range(3))
+    val_c, train_c = COMPONENT_COLORS["val"], COMPONENT_COLORS["train"]
+    ep = [h["epoch"] for h in history]
+    nll_ax.plot(ep, [h["val"] for h in history], color=val_c, marker="o", markersize=3, linewidth=1.6, label="val")
+    nll_ax.plot(ep, [h["train"] for h in history], color=train_c, linewidth=1.2, label="train")
+    inc = [(h["epoch"], h["incoming"]) for h in history if h.get("incoming") is not None]
+    if inc:
+        nll_ax.plot([x for x, _ in inc], [y for _, y in inc], color=PRIOR, linewidth=1.2, label="incoming")
+    nll_ax.plot(ep, [h["val_iso"] for h in history], color=INK, linestyle="--", linewidth=1.2,
+                label="val, isotropic baseline")
+    nll_ax.legend(frameon=False, labelcolor=INK, fontsize=8)
+    _style(nll_ax, "Remainder negative log likelihood", "epoch", "nats per latent number")
+    nll_ax.ticklabel_format(useOffset=False, axis="y")
+
+    bits_ax.plot(ep, [h["bits"] for h in history], color=val_c, marker="o", markersize=3, linewidth=1.6,
+                 label="val (scored images)")
+    bits_ax.axhline(records["baseline"]["bits"], color=INK, linestyle="--", linewidth=1.2, label="isotropic baseline")
+    bits_ax.axhline(uniform, color=MUTED, linestyle=":", linewidth=1.2, label=f"uniform ({uniform:.0f})")
+    if records.get("final"):
+        f = records["final"]
+        bits_ax.set_title(f"Bits per image (kept: val {f['val']['bits']:.1f}, test {f['test']['bits']:.1f})",
+                          loc="left", fontsize=11, color=INK)
+    bits_ax.legend(frameon=False, labelcolor=INK, fontsize=8)
+    _style(bits_ax, bits_ax.get_title(loc="left") or "Bits per image", "epoch", "bits per image")
+    bits_ax.ticklabel_format(useOffset=False, axis="y")
+
+    by_depth = records.get("by_depth")
+    if by_depth:
+        top = math.log2(V)
+        window = max(1, K // 50)
+        xs = list(range(K))
+        depth_ax.plot(xs, _smooth(top - np.asarray(by_depth["prior"]), window), color=val_c, linewidth=1.4,
+                      label=f"kept prior (epoch {by_depth['epoch']})")
+        depth_ax.plot(xs, _smooth(top - np.asarray(by_depth["baseline"]), window), color=INK, linewidth=1.2,
+                      linestyle="--", label="isotropic baseline")
+        depth_ax.axhline(0, color=GRID, linewidth=1.0)
+        depth_ax.legend(frameon=False, labelcolor=INK, fontsize=8)
+        _style(depth_ax, f"Bits saved per token against uniform, by depth ({window}-depth average)", "depth",
+               "bits saved")
+    else:
+        depth_ax.set_axis_off()
+
+    if samples is not None:
+        ax = fig.add_subplot(grid[1, :])
+        rows = [samples[k].numpy() for k in ("real", "recon", "prior", "shares")]
+        shown = _rows_grid(rows)
+        ax.imshow(shown[..., 0] if shown.shape[-1] == 1 else shown, cmap="gray", vmin=0, vmax=1,
+                  interpolation="nearest")
+        H = rows[0].shape[2]
+        ax.set_yticks([r * (H + 4) + H / 2 for r in range(4)])
+        ax.set_yticklabels(["test", f"tree, {samples['K']} depths", "prior samples", "tree's shares samples"],
+                           color=INK)
+        ax.set_xticks([])
+        for side in ax.spines.values():
+            side.set_visible(False)
+        ax.set_title(f"Test images and sampled codes, decoded (prior of epoch {samples.get('epoch', '?')})",
+                     loc="left", fontsize=11, color=INK)
+    _save(fig, path)
+
+
 if __name__ == "__main__":  # (python -m dvae.plots RECORDS PNG: a components run's redraw, in a process of its own
     import json  # so that it never holds the training process's interpreter lock; test_pairs.pt beside RECORDS
     import sys  # adds its sample test images)
