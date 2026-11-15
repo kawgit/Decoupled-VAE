@@ -47,6 +47,10 @@ def main():
     p.add_argument("--blocks", type=int, default=6)
     p.add_argument("--rank", type=int, default=0, help="shared directions of the remainder's covariance")
     p.add_argument("--history", type=int, default=4, help="the last deltas read beside the current mean")
+    p.add_argument("--token-weight", type=float, default=0.0, help="> 0: soft token assignment (dvae/remprior.py), "
+                   "the loss adds this times the tokens' cross-entropy (nats per token), and early stopping and the "
+                   "learning rate follow the scored val images' bits instead of the likelihood")
+    p.add_argument("--token-samples", type=int, default=16, help="remainders drawn per pair for the token loss")
     p.add_argument("--calib-images", type=int, default=1000,
                    help="images not trained on whose tokens fit the calibration (a temperature and bias per depth)")
     p.add_argument("--calib-steps", type=int, default=500)
@@ -132,9 +136,20 @@ def main():
     with torch.no_grad():
         rms = torch.stack([remainders(buf, torch.arange(buf.n, device=device), torch.full((buf.n,), d, device=device))
                            .square().mean().sqrt() for d in range(K)])
-    prior = RemPrior(K, V, shape, args.channels, args.blocks, args.rank, args.samples, args.history).to(device)
+    prior = RemPrior(K, V, shape, args.channels, args.blocks, args.rank, args.samples, args.history,
+                     soft=args.token_weight > 0).to(device)
     W = args.history
     prior.set_scales(rms)
+    with torch.no_grad():  # (each depth's gap between the nearest and second nearest centroid, squared distances)
+        gaps = []
+        for d in range(K):
+            r = torch.arange(buf.n, device=device)
+            dd = torch.full((buf.n,), d, device=device)
+            q = buf.part[r, d].float() * buf.pscale[r, d][:, None, None] if buf.part is not None else None
+            assert q is not None and buf.pscale is not None
+            d2 = (q.square().sum(-1) - 2 * torch.einsum("nd,nvd->nv", remainders(buf, r, dd), q)).sort(-1).values
+            gaps.append((d2[:, 1] - d2[:, 0]).mean())
+        prior.set_taus(torch.stack(gaps))
     size = sum(q.numel() for q in prior.parameters()) / 1e6
     log(f"tree {args.tree}: {K} depths, V = {V}, latents {shape}; rms remainder per number {rms[0]:.4g} at depth 0, "
         f"{rms[K // 2]:.4g} at {K // 2}, {rms[-1]:.4g} at {K - 1}; prior {size:.2f}M parameters, rank {args.rank}, "
@@ -170,14 +185,15 @@ def main():
         bits = torch.zeros(K, device=device)
         for i, d in pairs(n, 2048):
             with amp():
-                lp = net.token_logprobs(store.inputs(i, d, W), samples)
+                lp = raw_logprobs(net, store.inputs(i, d, W), samples)
             if calibrated:
                 lp = net.calibrate(lp, d)
             bits.index_add_(0, d, -lp.gather(-1, store.tok[i, d].long()[:, None])[:, 0] / LN2)
         by_depth = (bits / n).tolist()
         return sum(by_depth), by_depth
 
-    iso = copy.deepcopy(prior)  # (the untrained net: the isotropic baseline)
+    iso = copy.deepcopy(prior)  # (the untrained net: the isotropic baseline, hard counts)
+    iso.soft = False
     nb = min(args.bits_images, args.val)
     iso_bits, iso_depth = evaluate_bits(stores["val"], nb, iso)
     log(f"isotropic baseline: {iso_bits:.2f} bits per image on {nb} val images (uniform {K * math.log2(V):.0f})")
@@ -213,12 +229,17 @@ def main():
                 incoming = tot / (len(rows) * K)
         prior.train()
         t1 = time.time()
-        total = 0.0
+        total = total_ce = 0.0
         for b in range(args.steps):
             i = torch.randint(0, args.buffer, (args.batch,), device=device)
             d = torch.randint(0, K, (args.batch,), device=device)
             with amp():
-                loss = prior.nll(buf.inputs(i, d, W), remainders(buf, i, d)).mean()
+                x = buf.inputs(i, d, W)
+                loss = prior.nll(x, remainders(buf, i, d)).mean()
+                if args.token_weight > 0:
+                    ce = -prior.token_logprobs_soft(x, args.token_samples).gather(-1, buf.tok[i, d].long()[:, None])
+                    loss = loss + args.token_weight * ce.mean()
+                    total_ce += ce.mean().item()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
@@ -230,19 +251,22 @@ def main():
                            f"number; {rate:.1f} batches/s, {(args.steps - b - 1) / rate:.0f}s left")
         train_s = time.time() - t1
         val, val_iso = evaluate_nll(stores["val"], args.val)
-        plateau.step(val)
         bits, by_depth = evaluate_bits(stores["val"], nb, prior)
-        if val < best[0]:
-            best = (val, e, copy.deepcopy(prior.state_dict()))
+        metric = bits if args.token_weight > 0 else val
+        plateau.step(metric)
+        if metric < best[0]:
+            best = (metric, e, copy.deepcopy(prior.state_dict()))
             records["by_depth"] = dict(epoch=e, prior=by_depth, baseline=iso_depth)
         if e == 1 or e % args.qa_every == 0:
             samples.update(qa.samples(prior, amp), epoch=e)
-        records["history"].append(dict(epoch=e, train=total / args.steps, val=val, val_iso=val_iso, incoming=incoming,
-                                       bits=bits, seconds=time.time() - t0, train_seconds=train_s,
-                                       hours=(time.time() - began) / 3600))
+        records["history"].append(dict(epoch=e, train=total / args.steps, train_ce=total_ce / args.steps, val=val,
+                                       val_iso=val_iso, incoming=incoming, bits=bits, seconds=time.time() - t0,
+                                       train_seconds=train_s, hours=(time.time() - began) / 3600))
         seen = f"incoming {incoming:.5f}, " if incoming is not None else ""
         log(f"epoch {e}: val nll {val:.5f} nats per number (isotropic {val_iso:.5f}; {seen}train "
-            f"{total / args.steps:.5f}); bits per image on {nb} val images {bits:.2f} (isotropic {iso_bits:.2f}, "
+            f"{total / args.steps:.5f}" + (f", train token CE {total_ce / args.steps * K / LN2:.2f} bits per image"
+                                           if args.token_weight > 0 else "")
+            + f"); bits per image on {nb} val images {bits:.2f} (isotropic {iso_bits:.2f}, "
             f"uniform {K * math.log2(V):.0f}); best epoch {best[1]}; lr {opt.param_groups[0]['lr']:.2g}; "
             f"{time.time() - t0:.0f}s (train {train_s:.0f})")
         save()
@@ -261,7 +285,7 @@ def main():
     with torch.no_grad():
         for i, d in pairs(args.calib_images, 2048):
             with amp():
-                raws.append(prior.token_logprobs(cal.inputs(i, d, W)))
+                raws.append(raw_logprobs(prior, cal.inputs(i, d, W)))
             toks.append(cal.tok[i, d].long())
             ds.append(d)
     raw, tok, dd = torch.cat(raws), torch.cat(toks), torch.cat(ds)
@@ -288,7 +312,8 @@ def main():
         if s == "val":
             records["by_depth"] = dict(epoch=best[1], prior=b_depth, baseline=records["baseline"]["by_depth"])
     records["final"] = final
-    log(f"kept the prior of epoch {best[1]} (val nll {best[0]:.5f}), {args.final_samples} samples per node: bits per "
+    log(f"kept the prior of epoch {best[1]} (val {'bits' if args.token_weight > 0 else 'nll'} {best[0]:.5f}), "
+        f"{args.final_samples} samples per node: bits per "
         f"image val {final['val']['bits']:.2f} (uncalibrated {final['val']['uncalibrated']:.2f}, isotropic "
         f"{final['val']['isotropic']:.2f}), test {final['test']['bits']:.2f} (uncalibrated "
         f"{final['test']['uncalibrated']:.2f}, isotropic {final['test']['isotropic']:.2f}); uniform "
@@ -319,6 +344,14 @@ def flipped_latents(qa: CodeQA, lat: dict, data_root: str, device, log, batch: i
     log(f"{len(flipped)} mirrored training images encoded; mean square distance to their unmirrored latents mirrored "
         f"{(flipped[:batch].float().view(-1, C, h, w) - lat['train'][:batch].float().flip(-1)).square().mean():.3g}")
     return flipped
+
+
+@torch.no_grad()
+def raw_logprobs(net: RemPrior, x, samples=None):
+    """net's uncalibrated token log probabilities: its soft assignment's if it has one, else hard counts."""
+    if net.soft:
+        return net.token_logprobs_soft(x, samples or net.samples)
+    return net.token_logprobs(x, samples)
 
 
 def atomic_json(obj, path):

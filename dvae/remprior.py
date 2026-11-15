@@ -47,12 +47,19 @@ class FiLMBlock(nn.Module):
 class RemPrior(nn.Module):
     scale: Tensor  # [depths + 1] each depth's rms remainder per latent number (a buffer)
 
-    def __init__(self, depths, V=8, shape=(2, 16, 16), channels=64, blocks=6, rank=0, samples=256, history=1):
-        """history: the last deltas read beside the mean."""
+    tau0: Tensor  # [depths + 1] each depth's soft-assignment temperature scale (a buffer, set_taus)
+
+    def __init__(self, depths, V=8, shape=(2, 16, 16), channels=64, blocks=6, rank=0, samples=256, history=1,
+                 soft=False):
+        """history: the last deltas read beside the mean. soft: token probabilities from a soft assignment of the
+        drawn remainders to cells (each a softmax of minus its squared distances over a learned temperature per
+        depth), differentiable, so that the tokens' cross-entropy trains the net (token_logprobs_soft); otherwise
+        the hard nearest-centroid counts."""
         super().__init__()
         shape = tuple(shape)
         self.config = dict(kind="rem_prior", depths=depths, V=V, shape=shape, channels=channels, blocks=blocks,
-                           rank=rank, samples=samples, history=history)
+                           rank=rank, samples=samples, history=history, soft=soft)
+        self.soft = soft
         self.V, self.shape, self.rank, self.samples = V, shape, rank, samples
         self.window = history  # (CandStore.inputs' window)
         C = shape[0]
@@ -64,6 +71,8 @@ class RemPrior(nn.Module):
         # by cross-entropy on training tokens once the remainder model is trained; at first the identity)
         self.temp = nn.Parameter(torch.ones(depths + 1))
         self.bias = nn.Parameter(torch.zeros(depths + 1, V))
+        self.register_buffer("tau0", torch.ones(depths + 1))
+        self.log_tau = nn.Parameter(torch.zeros(depths + 1))
         self.blocks = nn.ModuleList(FiLMBlock(channels, 128) for _ in range(blocks))
         self.out_norm = nn.GroupNorm(8, channels)
         self.out = nn.Conv2d(channels, C * (2 + rank), 3, padding=1)
@@ -102,6 +111,27 @@ class RemPrior(nn.Module):
             g = torch.distributions.LowRankMultivariateNormal(mu.float(), L.float(), logvar.float().exp())
             return -g.log_prob(R.float()) / self.D
 
+    def set_taus(self, gap: Tensor):
+        """Each depth's typical gap [depths] between a remainder's nearest and second nearest centroid (squared
+        distances): the soft assignment's temperature starts at it."""
+        self.tau0[:len(gap)] = gap.to(self.tau0)
+        self.tau0[len(gap):] = gap[-1]
+
+    def token_logprobs_soft(self, x: NodeInputs, samples: int = 16) -> Tensor:
+        """Each token's log probability [B, V], differentiable: the mean over remainders drawn from the predicted
+        Gaussian of a softmax of minus their squared distances to the cells' centroids over the depth's
+        temperature."""
+        assert x.parts is not None, "RemPrior's tokens are cells of the partition centroids: a store that keeps them"
+        mu, logvar, L = self.dist(x)
+        B = len(mu)
+        Rs = mu[:, None] + (0.5 * logvar).exp()[:, None] * torch.randn(B, samples, self.D, device=mu.device)
+        if L is not None:
+            Rs = Rs + torch.einsum("bdr,bsr->bsd", L, torch.randn(B, samples, self.rank, device=mu.device))
+        q = x.parts.float()
+        d2 = q.square().sum(-1)[:, None] - 2 * torch.einsum("bsd,bvd->bsv", Rs, q)  # (|R|^2 left out: per draw)
+        tau = (self.tau0[x.d] * self.log_tau[x.d].exp())[:, None, None]
+        return (-d2 / tau).log_softmax(-1).logsumexp(1) - math.log(samples)
+
     def calibrate(self, raw: Tensor, d: Tensor) -> Tensor:
         """Sampled log probabilities raw [B, V] (token_logprobs') at depths d [B], calibrated: log softmax of
         temp[d] raw + bias[d]."""
@@ -131,6 +161,9 @@ class RemPrior(nn.Module):
 
     def forward(self, x: NodeInputs) -> Tensor:
         """Calibrated log probabilities [B, V] (as logits: a prior's interface, CodeQA.samples')."""
+        if self.soft:
+            with torch.no_grad():
+                return self.calibrate(self.token_logprobs_soft(x, self.samples), x.d)
         return self.calibrate(self.token_logprobs(x), x.d)
 
 
