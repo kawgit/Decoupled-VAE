@@ -47,18 +47,23 @@ class FiLMBlock(nn.Module):
 class RemPrior(nn.Module):
     scale: Tensor  # [depths + 1] each depth's rms remainder per latent number (a buffer)
 
-    def __init__(self, depths, V=8, shape=(2, 16, 16), channels=64, blocks=6, rank=0, samples=256):
+    def __init__(self, depths, V=8, shape=(2, 16, 16), channels=64, blocks=6, rank=0, samples=256, history=1):
+        """history: the last deltas read beside the mean."""
         super().__init__()
         shape = tuple(shape)
         self.config = dict(kind="rem_prior", depths=depths, V=V, shape=shape, channels=channels, blocks=blocks,
-                           rank=rank, samples=samples)
+                           rank=rank, samples=samples, history=history)
         self.V, self.shape, self.rank, self.samples = V, shape, rank, samples
-        self.window = 1  # (CandStore.inputs' window: the last delta is all it reads)
+        self.window = history  # (CandStore.inputs' window)
         C = shape[0]
         self.D = C * shape[1] * shape[2]
         self.register_buffer("scale", torch.ones(depths + 1))  # each depth's rms remainder (set_scales)
         self.depth = nn.Embedding(depths + 1, 128)
-        self.stem = nn.Conv2d(2 * C, channels, 3, padding=1)
+        self.stem = nn.Conv2d((1 + history) * C, channels, 3, padding=1)
+        # (calibration of the sampled token probabilities: a temperature and a bias per token at each depth, fit
+        # by cross-entropy on training tokens once the remainder model is trained; at first the identity)
+        self.temp = nn.Parameter(torch.ones(depths + 1))
+        self.bias = nn.Parameter(torch.zeros(depths + 1, V))
         self.blocks = nn.ModuleList(FiLMBlock(channels, 128) for _ in range(blocks))
         self.out_norm = nn.GroupNorm(8, channels)
         self.out = nn.Conv2d(channels, C * (2 + rank), 3, padding=1)
@@ -77,8 +82,8 @@ class RemPrior(nn.Module):
         B = len(x.d)
         C, H, W = self.shape
         s = self.scale[x.d]
-        last = x.win[:, -1] / s[:, None]
-        h = self.stem(torch.cat([x.mean, last], 1).view(B, 2 * C, H, W))
+        recent = (x.win / s[:, None, None]).flatten(1)
+        h = self.stem(torch.cat([x.mean, recent], 1).view(B, (1 + self.window) * C, H, W))
         e = self.depth(x.d)
         for blk in self.blocks:
             h = blk(h, e)
@@ -97,10 +102,15 @@ class RemPrior(nn.Module):
             g = torch.distributions.LowRankMultivariateNormal(mu.float(), L.float(), logvar.float().exp())
             return -g.log_prob(R.float()) / self.D
 
+    def calibrate(self, raw: Tensor, d: Tensor) -> Tensor:
+        """Sampled log probabilities raw [B, V] (token_logprobs') at depths d [B], calibrated: log softmax of
+        temp[d] raw + bias[d]."""
+        return (self.temp[d, None] * raw + self.bias[d]).log_softmax(-1)
+
     @torch.no_grad()
     def token_logprobs(self, x: NodeInputs, samples: int | None = None, chunk: int = 128) -> Tensor:
-        """Each token's log probability [B, V]: the share of remainders drawn from the predicted Gaussian that fall
-        in its cell (nearest of the inputs' parts), counts plus one half."""
+        """Each token's log probability [B, V], uncalibrated: the share of remainders drawn from the predicted
+        Gaussian that fall in its cell (nearest of the inputs' parts), counts plus one half."""
         assert x.parts is not None, "RemPrior's tokens are cells of the partition centroids: a store that keeps them"
         S = samples or self.samples
         mu, logvar, L = self.dist(x)
@@ -120,8 +130,8 @@ class RemPrior(nn.Module):
         return torch.cat(out)
 
     def forward(self, x: NodeInputs) -> Tensor:
-        """Log probabilities [B, V] (as logits: a prior's interface, CodeQA.samples')."""
-        return self.token_logprobs(x)
+        """Calibrated log probabilities [B, V] (as logits: a prior's interface, CodeQA.samples')."""
+        return self.calibrate(self.token_logprobs(x), x.d)
 
 
 __all__ = ["FiLMBlock", "RemPrior"]

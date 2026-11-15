@@ -46,6 +46,11 @@ def main():
     p.add_argument("--channels", type=int, default=64)
     p.add_argument("--blocks", type=int, default=6)
     p.add_argument("--rank", type=int, default=0, help="shared directions of the remainder's covariance")
+    p.add_argument("--history", type=int, default=4, help="the last deltas read beside the current mean")
+    p.add_argument("--calib-images", type=int, default=1000,
+                   help="images not trained on whose tokens fit the calibration (a temperature and bias per depth)")
+    p.add_argument("--calib-steps", type=int, default=500)
+    p.add_argument("--final-samples", type=int, default=1024, help="remainders drawn per node for the final scores")
     p.add_argument("--samples", type=int, default=256, help="remainders drawn per node for token probabilities")
     p.add_argument("--batch", type=int, default=256, help="(image, depth) pairs")
     p.add_argument("--steps", type=int, default=1000, help="batches per epoch")
@@ -58,7 +63,8 @@ def main():
                    "images mirrored left to right (encoded by the outer autoencoder: real latents of real images)")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument("--patience", type=int, default=5)
+    p.add_argument("--patience", type=int, default=6, help="epochs without a lower val likelihood (the learning "
+                   "rate halves after each 2)")
     p.add_argument("--max-epochs", type=int, default=100)
     p.add_argument("--progress-every", type=int, default=200)
     p.add_argument("--chunk", type=int, default=1000, help="images replayed at once")
@@ -124,7 +130,8 @@ def main():
     with torch.no_grad():
         rms = torch.stack([remainders(buf, torch.arange(buf.n, device=device), torch.full((buf.n,), d, device=device))
                            .square().mean().sqrt() for d in range(K)])
-    prior = RemPrior(K, V, shape, args.channels, args.blocks, args.rank, args.samples).to(device)
+    prior = RemPrior(K, V, shape, args.channels, args.blocks, args.rank, args.samples, args.history).to(device)
+    W = args.history
     prior.set_scales(rms)
     size = sum(q.numel() for q in prior.parameters()) / 1e6
     log(f"tree {args.tree}: {K} depths, V = {V}, latents {shape}; rms remainder per number {rms[0]:.4g} at depth 0, "
@@ -145,7 +152,7 @@ def main():
         tot = base = 0.0
         count = 0
         for i, d in pairs(n, 4096):
-            x = store.inputs(i, d, 1)
+            x = store.inputs(i, d, W)
             R = remainders(store, i, d)
             with amp():
                 tot += prior.nll(x, R).sum().item()
@@ -155,13 +162,15 @@ def main():
         return tot / count, base / count
 
     @torch.no_grad()
-    def evaluate_bits(store, n, net):
+    def evaluate_bits(store, n, net, calibrated=True, samples=None):
         """Bits per image of n images' codes under net (by depth too)."""
         net.eval()
         bits = torch.zeros(K, device=device)
         for i, d in pairs(n, 2048):
             with amp():
-                lp = net.token_logprobs(store.inputs(i, d, 1))
+                lp = net.token_logprobs(store.inputs(i, d, W), samples)
+            if calibrated:
+                lp = net.calibrate(lp, d)
             bits.index_add_(0, d, -lp.gather(-1, store.tok[i, d].long()[:, None])[:, 0] / LN2)
         by_depth = (bits / n).tolist()
         return sum(by_depth), by_depth
@@ -179,7 +188,9 @@ def main():
         atomic_json(records, os.path.join(out, "records.json"))
         plot_remprior(records, os.path.join(out, "run.png"), samples or None)
 
-    opt = torch.optim.AdamW(prior.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    model_params = [q for name, q in prior.named_parameters() if name not in ("temp", "bias")]
+    opt = torch.optim.AdamW(model_params, lr=args.lr, weight_decay=args.weight_decay)
+    plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=1)
     best = (float("inf"), 0, copy.deepcopy(prior.state_dict()))
     oldest = 0
     for e in range(1, args.max_epochs + 1):
@@ -196,7 +207,7 @@ def main():
                     r = rows[s:s + 8].repeat_interleave(K)
                     dd = torch.arange(K, device=device).repeat(len(rows[s:s + 8]))
                     with amp():
-                        tot += prior.nll(buf.inputs(r, dd, 1), remainders(buf, r, dd)).sum().item()
+                        tot += prior.nll(buf.inputs(r, dd, W), remainders(buf, r, dd)).sum().item()
                 incoming = tot / (len(rows) * K)
         prior.train()
         t1 = time.time()
@@ -205,7 +216,7 @@ def main():
             i = torch.randint(0, args.buffer, (args.batch,), device=device)
             d = torch.randint(0, K, (args.batch,), device=device)
             with amp():
-                loss = prior.nll(buf.inputs(i, d, 1), remainders(buf, i, d)).mean()
+                loss = prior.nll(buf.inputs(i, d, W), remainders(buf, i, d)).mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(prior.parameters(), 1.0)
@@ -217,6 +228,7 @@ def main():
                            f"number; {rate:.1f} batches/s, {(args.steps - b - 1) / rate:.0f}s left")
         train_s = time.time() - t1
         val, val_iso = evaluate_nll(stores["val"], args.val)
+        plateau.step(val)
         bits, by_depth = evaluate_bits(stores["val"], nb, prior)
         if val < best[0]:
             best = (val, e, copy.deepcopy(prior.state_dict()))
@@ -229,24 +241,53 @@ def main():
         seen = f"incoming {incoming:.5f}, " if incoming is not None else ""
         log(f"epoch {e}: val nll {val:.5f} nats per number (isotropic {val_iso:.5f}; {seen}train "
             f"{total / args.steps:.5f}); bits per image on {nb} val images {bits:.2f} (isotropic {iso_bits:.2f}, "
-            f"uniform {K * math.log2(V):.0f}); best epoch {best[1]}; {time.time() - t0:.0f}s (train {train_s:.0f})")
+            f"uniform {K * math.log2(V):.0f}); best epoch {best[1]}; lr {opt.param_groups[0]['lr']:.2g}; "
+            f"{time.time() - t0:.0f}s (train {train_s:.0f})")
         save()
         if e - best[1] >= args.patience:
             break
 
     prior.load_state_dict(best[2])
+    # (calibration: on images never trained on, the remainder model frozen and its sampled probabilities computed
+    # once; temp and bias by cross-entropy)
+    cal = CandStore(args.calib_images, K, V, D, device, tree.mean, parts=True, images=True)
+    fill(cal, torch.arange(args.calib_images, device=device), pool[take(args.calib_images)], "calibration")
+    raws, toks, ds = [], [], []
+    with torch.no_grad():
+        for i, d in pairs(args.calib_images, 2048):
+            with amp():
+                raws.append(prior.token_logprobs(cal.inputs(i, d, W)))
+            toks.append(cal.tok[i, d].long())
+            ds.append(d)
+    raw, tok, dd = torch.cat(raws), torch.cat(toks), torch.cat(ds)
+    del cal
+    copt = torch.optim.Adam([prior.temp, prior.bias], lr=0.02)
+    before = -prior.calibrate(raw, dd).gather(-1, tok[:, None]).mean().item()
+    for _ in range(args.calib_steps):
+        loss = -prior.calibrate(raw, dd).gather(-1, tok[:, None]).mean()
+        copt.zero_grad(set_to_none=True)
+        loss.backward()
+        copt.step()
+    log(f"calibrated on {args.calib_images} unseen images' tokens: {before * K / LN2:.2f} -> "
+        f"{loss.item() * K / LN2:.2f} bits per image; temperature by depth {prior.temp[:K].min().item():.2f} .. "
+        f"{prior.temp[:K].max().item():.2f}")
     torch.save(dict(config=prior.config, state_dict=prior.state_dict(), epoch=best[1], args=vars(args)),
                os.path.join(out, "prior.pt"))
     samples.update(qa.samples(prior, amp), epoch=best[1])
     final = {}
     for s in ("val", "test"):
-        b, _ = evaluate_bits(stores[s], stores[s].n, prior)
-        bi, _ = evaluate_bits(stores[s], stores[s].n, iso)
-        final[s] = dict(bits=b, isotropic=bi)
+        b, b_depth = evaluate_bits(stores[s], stores[s].n, prior, samples=args.final_samples)
+        braw, _ = evaluate_bits(stores[s], stores[s].n, prior, calibrated=False, samples=args.final_samples)
+        bi, _ = evaluate_bits(stores[s], stores[s].n, iso, calibrated=False, samples=args.final_samples)
+        final[s] = dict(bits=b, uncalibrated=braw, isotropic=bi)
+        if s == "val":
+            records["by_depth"] = dict(epoch=best[1], prior=b_depth, baseline=records["baseline"]["by_depth"])
     records["final"] = final
-    log(f"kept the prior of epoch {best[1]} (val nll {best[0]:.5f}): bits per image val {final['val']['bits']:.2f} "
-        f"(isotropic {final['val']['isotropic']:.2f}), test {final['test']['bits']:.2f} (isotropic "
-        f"{final['test']['isotropic']:.2f}); uniform {K * math.log2(V):.0f}")
+    log(f"kept the prior of epoch {best[1]} (val nll {best[0]:.5f}), {args.final_samples} samples per node: bits per "
+        f"image val {final['val']['bits']:.2f} (uncalibrated {final['val']['uncalibrated']:.2f}, isotropic "
+        f"{final['val']['isotropic']:.2f}), test {final['test']['bits']:.2f} (uncalibrated "
+        f"{final['test']['uncalibrated']:.2f}, isotropic {final['test']['isotropic']:.2f}); uniform "
+        f"{K * math.log2(V):.0f}")
     save()
     log(f"done in {(time.time() - began) / 60:.1f} min; {out}")
 
