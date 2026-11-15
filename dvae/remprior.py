@@ -93,8 +93,9 @@ class RemPrior(nn.Module):
         mu, logvar, L = self.dist(x)
         if L is None:
             return 0.5 * (logvar + (R - mu).square() / logvar.exp() + math.log(2 * math.pi)).mean(-1)
-        g = torch.distributions.LowRankMultivariateNormal(mu, L, logvar.exp())
-        return -g.log_prob(R) / self.D
+        with torch.autocast(mu.device.type, enabled=False):  # (its Cholesky factorization: float32 only)
+            g = torch.distributions.LowRankMultivariateNormal(mu.float(), L.float(), logvar.float().exp())
+            return -g.log_prob(R.float()) / self.D
 
     @torch.no_grad()
     def token_logprobs(self, x: NodeInputs, samples: int | None = None, chunk: int = 128) -> Tensor:
