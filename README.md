@@ -1,5 +1,9 @@
 # Decoupled VAE: delta trees
 
+For an independent single-L40S CIFAR-10 diffusion generation baseline, see
+[the baseline experiment guide](docs/diffusion-baseline.md). It includes resumable training, EMA samples,
+a 24-hour SCC submission, and an optional matched FID protocol for diffusion and tree samples.
+
 A compressor and generative model for images (CIFAR-10, MNIST, and ImageNet at 128 x 128) whose code is a path down a binary tree. Each
 token answers one yes/no question about the image: which side of a hyperplane it lies on. Every prefix of a code is
 a node, and a node decodes to a predicted mean image, so a code can be cut after any token and still decode.
